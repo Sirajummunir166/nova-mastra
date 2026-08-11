@@ -4,11 +4,39 @@ import { MastraServer } from "@mastra/express";
 import { mastra } from "./mastra/index.js";
 import { getStoreProfile } from "./lib/store.js";
 import { novaInstructions } from "./lib/context.js";
+import { eveRouter } from "./eve-compat/router.js";
 
 const app = express();
 const PORT = Number(process.env.PORT) || 2100;
 
+// CORS — mirrors nova-ai channels/eve.ts: origins from NOVA_CORS_ORIGINS
+// (comma-separated, * if unset), the client-context header allowed, the
+// session id exposed.
+const ORIGINS = (process.env.NOVA_CORS_ORIGINS ?? "*")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const allowed = ORIGINS.includes("*") ? (origin ?? "*") : origin && ORIGINS.includes(origin) ? origin : null;
+  if (allowed) {
+    res.setHeader("Access-Control-Allow-Origin", allowed);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Headers", "authorization, content-type, x-dakio-client-context");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Expose-Headers", "x-eve-session-id");
+  }
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
+  next();
+});
+
 app.use(express.json());
+
+// The eve protocol surface NovaChat speaks (novaAgentClient.js).
+app.use("/eve/v1", eveRouter);
 
 // Registers Mastra's own endpoints (/api/agents/nova/generate etc.).
 const server = new MastraServer({ app, mastra });
