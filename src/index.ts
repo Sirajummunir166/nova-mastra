@@ -84,6 +84,17 @@ app.use("/eve/v1", eveRouter);
 const server = new MastraServer({ app, mastra });
 await server.init();
 
+/**
+ * Root must answer 200: Studio decides whether a Mastra instance is reachable
+ * by fetching the bare origin, and treats a non-2xx as "no instance here" —
+ * which drops it onto the manual "Mastra instance URL" setup screen instead of
+ * auto-detecting. A 404 here is the difference between Studio just working and
+ * every operator typing the deployment URL by hand.
+ */
+app.get("/", (_req: Request, res: Response) => {
+  res.json({ ok: true, service: "nova-mastra", studio: "/studio", api: "/api" });
+});
+
 app.get("/health", (_req: Request, res: Response) => {
   res.json({ ok: true, service: "nova-mastra" });
 });
