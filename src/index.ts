@@ -5,13 +5,19 @@ import { mastra } from "./mastra/index.js";
 import { getStoreProfile } from "./lib/store.js";
 import { novaInstructions } from "./lib/context.js";
 import { eveRouter } from "./eve-compat/router.js";
+import { withGatewayRetry } from "./lib/gateway-retry.js";
 
 const app = express();
 const PORT = Number(process.env.PORT) || 2100;
 
 // CORS — mirrors nova-ai channels/eve.ts: origins from NOVA_CORS_ORIGINS
-// (comma-separated, * if unset), the client-context header allowed, the
-// session id exposed.
+// (comma-separated, * if unset), the session id exposed.
+//
+// Request headers are REFLECTED rather than allowlisted: Mastra Studio talks
+// to this server from its own origin and sends its own headers
+// (x-mastra-client-type and friends), which a fixed list silently breaks in
+// the browser. The real access decision is the origin check above plus the
+// API guard below — the header list was never the control.
 const ORIGINS = (process.env.NOVA_CORS_ORIGINS ?? "*")
   .split(",")
   .map((s) => s.trim())
@@ -22,12 +28,39 @@ app.use((req, res, next) => {
   if (allowed) {
     res.setHeader("Access-Control-Allow-Origin", allowed);
     res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Headers", "authorization, content-type, x-dakio-client-context");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      (req.headers["access-control-request-headers"] as string | undefined) ??
+        "authorization, content-type, x-dakio-client-context",
+    );
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
     res.setHeader("Access-Control-Expose-Headers", "x-eve-session-id");
   }
   if (req.method === "OPTIONS") {
     res.status(204).end();
+    return;
+  }
+  next();
+});
+
+/**
+ * Guard for the Mastra API surface (/api/*) and /chat.
+ *
+ * These routes run agents and workflows — the customer-turn workflow can
+ * CREATE REAL ORDERS in a real store — and unlike /eve/v1 they carry no
+ * auth of their own. Set NOVA_STUDIO_TOKEN in any deployed environment and
+ * pass it as `Authorization: Bearer <token>` (Mastra Studio: Settings →
+ * Custom headers). Unset = open, which is fine on loopback and dangerous
+ * anywhere else, so an unguarded non-local boot says so loudly.
+ */
+const STUDIO_TOKEN = process.env.NOVA_STUDIO_TOKEN?.trim();
+app.use((req, res, next) => {
+  if (!STUDIO_TOKEN) return next();
+  if (!req.path.startsWith("/api/") && req.path !== "/chat") return next();
+  const header = req.headers.authorization ?? "";
+  const presented = /^Bearer\s+(.+)$/i.exec(header.trim())?.[1] ?? (req.headers["x-nova-studio-token"] as string | undefined);
+  if (presented !== STUDIO_TOKEN) {
+    res.status(401).json({ ok: false, error: "NOVA_STUDIO_TOKEN required for this route" });
     return;
   }
   next();
@@ -73,9 +106,11 @@ app.post("/chat", async (req: Request, res: Response) => {
     }
 
     const agent = mastra.getAgent("nova");
-    const result = await agent.generate(message, {
-      instructions: novaInstructions(store),
-    });
+    const result = await withGatewayRetry(() =>
+      agent.generate(message, {
+        instructions: novaInstructions(store),
+      }),
+    );
 
     res.json({
       ok: true,
@@ -92,4 +127,10 @@ app.post("/chat", async (req: Request, res: Response) => {
 
 app.listen(PORT, () => {
   console.log(`nova-mastra listening on http://localhost:${PORT}`);
+  if (!STUDIO_TOKEN && process.env.RAILWAY_ENVIRONMENT) {
+    console.warn(
+      "[security] /api/* and /chat are UNAUTHENTICATED on a deployed instance — anyone with the URL can run agents " +
+        "and the customer-turn workflow can create real orders. Set NOVA_STUDIO_TOKEN.",
+    );
+  }
 });

@@ -6,6 +6,7 @@
  */
 
 import { serviceTokenFor } from "./service-token.js";
+import { dakioBaseUrl } from "./dakio-base.js";
 
 interface OrderItem {
   productName: string;
@@ -40,10 +41,8 @@ interface Cart {
 const SNAPSHOT_TIMEOUT_MS = 8000;
 
 async function apiGet<T>(storeId: string, path: string): Promise<T | null> {
-  const baseUrl = process.env.DAKIO_API_URL;
-  if (!baseUrl) throw new Error("DAKIO_API_URL is not set");
   try {
-    const res = await fetch(`${baseUrl}${path}`, {
+    const res = await fetch(`${dakioBaseUrl()}${path}`, {
       headers: { Authorization: `Bearer ${serviceTokenFor(storeId)}` },
       signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
     });

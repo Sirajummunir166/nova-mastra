@@ -9,13 +9,12 @@
  */
 
 import { serviceTokenFor } from "../lib/service-token.js";
+import { dakioBaseUrl } from "../lib/dakio-base.js";
 
 const TIMEOUT_MS = 10_000;
 
 async function api<T>(storeId: string, path: string, init: { method?: string; body?: unknown } = {}): Promise<T> {
-  const baseUrl = process.env.DAKIO_API_URL;
-  if (!baseUrl) throw new Error("DAKIO_API_URL is not set");
-  const res = await fetch(`${baseUrl}${path}`, {
+  const res = await fetch(`${dakioBaseUrl()}${path}`, {
     method: init.method ?? "GET",
     headers: {
       Authorization: `Bearer ${serviceTokenFor(storeId)}`,

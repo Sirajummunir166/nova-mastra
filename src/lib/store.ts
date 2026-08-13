@@ -6,6 +6,7 @@
  */
 
 import { serviceTokenFor } from "./service-token.js";
+import { dakioBaseUrl } from "./dakio-base.js";
 
 export interface StoreProfile {
   storeId: string;
@@ -31,10 +32,7 @@ export async function getStoreProfile(storeId: string): Promise<StoreProfile | n
   const cached = cache.get(storeId);
   if (cached && Date.now() - cached.fetchedAt < FRESH_TTL_MS) return cached.profile;
 
-  const baseUrl = process.env.DAKIO_API_URL;
-  if (!baseUrl) throw new Error("DAKIO_API_URL is not set");
-
-  const response = await fetch(`${baseUrl}/api/v1/store/profile`, {
+  const response = await fetch(`${dakioBaseUrl()}/api/v1/store/profile`, {
     headers: { Authorization: `Bearer ${serviceTokenFor(storeId)}` },
     signal: AbortSignal.timeout(PROFILE_TIMEOUT_MS),
   });

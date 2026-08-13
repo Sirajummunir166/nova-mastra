@@ -28,6 +28,7 @@ import { feeForZone, focusProduct, hydratePolicies, resolveProduct, variantIdFor
 import { listProducts, createChatOrder, type DakioProduct } from "./dakio.js";
 import { getStoreProfile } from "../lib/store.js";
 import { resolverAgent, resolverSchema, writerAgent, writerSystem } from "./agents.js";
+import { withGatewayRetry } from "../lib/gateway-retry.js";
 
 export interface TurnResult {
   reply: string;
@@ -47,25 +48,6 @@ export function runCustomerTurn(storeId: string, convId: string, message: string
   return withTurnLock(storeId, convId, () => executeTurn(storeId, convId, message));
 }
 
-/**
- * The zai provider on the gateway throws transient 503s ("Service temporarily
- * unavailable") with no configured fallbacks. Retry model calls a couple of
- * times before failing the turn.
- */
-async function withGatewayRetry<T>(call: () => Promise<T>, attempts = 3): Promise<T> {
-  let lastErr: unknown;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await call();
-    } catch (err) {
-      lastErr = err;
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!/temporarily unavailable|503|overloaded/i.test(msg)) throw err;
-      await new Promise((r) => setTimeout(r, 800 * (i + 1)));
-    }
-  }
-  throw lastErr;
-}
 
 async function executeTurn(storeId: string, convId: string, message: string): Promise<TurnResult> {
   const t0 = Date.now();
