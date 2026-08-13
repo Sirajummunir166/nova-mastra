@@ -25,6 +25,22 @@ Not yet ported (tracked for the real chatbox contract): Dakio JWT auth +
 `{userId, tenantId}` claim normalisation, NDJSON session/stream protocol the
 merchant app speaks, tools, autonomy gate, memory layers.
 
+## Studio
+
+Mastra Studio (agents, workflows, traces) is served by this app at **`/studio`** —
+locally `http://localhost:2100/studio`, and on any deployment the same path on
+its own domain. The SPA auto-detects its origin, so nothing is hardcoded.
+
+Access is gated by `NOVA_STUDIO_TOKEN`: the browser asks for HTTP Basic
+credentials — **any username, the token as the password** — then keeps a
+session cookie that also authorizes Studio's `/api` calls. Set that variable on
+every deployed environment: Studio can run the `customer-turn` workflow, which
+creates **real orders** in whatever store `DAKIO_API_URL` points at.
+
+`npm run studio` still runs the CLI's own dev Studio on :4111 against a local
+Mastra dev server; `npm run studio:prod` runs the Studio UI locally against the
+Railway API. Neither is needed now that `/studio` is hosted.
+
 ## Run
 
 ```bash

@@ -6,6 +6,7 @@ import { getStoreProfile } from "./lib/store.js";
 import { novaInstructions } from "./lib/context.js";
 import { eveRouter } from "./eve-compat/router.js";
 import { withGatewayRetry } from "./lib/gateway-retry.js";
+import { createStudioRouter, hasValidStudioCookie } from "./studio.js";
 
 const app = express();
 const PORT = Number(process.env.PORT) || 2100;
@@ -57,6 +58,9 @@ const STUDIO_TOKEN = process.env.NOVA_STUDIO_TOKEN?.trim();
 app.use((req, res, next) => {
   if (!STUDIO_TOKEN) return next();
   if (!req.path.startsWith("/api/") && req.path !== "/chat") return next();
+  // The hosted Studio at /studio signs in once and rides its session cookie,
+  // so its own API calls need no pasted headers; scripts use the bearer.
+  if (hasValidStudioCookie(req, STUDIO_TOKEN)) return next();
   const header = req.headers.authorization ?? "";
   const presented = /^Bearer\s+(.+)$/i.exec(header.trim())?.[1] ?? (req.headers["x-nova-studio-token"] as string | undefined);
   if (presented !== STUDIO_TOKEN) {
@@ -65,6 +69,11 @@ app.use((req, res, next) => {
   }
   next();
 });
+
+// Mastra Studio, same-origin at /studio (see studio.ts). Mounted before the
+// JSON body parser: it serves static files and needs no parsed body.
+const studioRouter = createStudioRouter(STUDIO_TOKEN);
+if (studioRouter) app.use("/studio", studioRouter);
 
 app.use(express.json());
 
@@ -127,10 +136,11 @@ app.post("/chat", async (req: Request, res: Response) => {
 
 app.listen(PORT, () => {
   console.log(`nova-mastra listening on http://localhost:${PORT}`);
+  console.log(studioRouter ? `Studio at /studio (${STUDIO_TOKEN ? "token required" : "OPEN"})` : "Studio not bundled — `mastra` package unavailable");
   if (!STUDIO_TOKEN && process.env.RAILWAY_ENVIRONMENT) {
     console.warn(
-      "[security] /api/* and /chat are UNAUTHENTICATED on a deployed instance — anyone with the URL can run agents " +
-        "and the customer-turn workflow can create real orders. Set NOVA_STUDIO_TOKEN.",
+      "[security] /studio, /api/* and /chat are UNAUTHENTICATED on a deployed instance — anyone with the URL can run " +
+        "agents, and the customer-turn workflow can create real orders. Set NOVA_STUDIO_TOKEN.",
     );
   }
 });
