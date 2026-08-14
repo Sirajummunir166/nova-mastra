@@ -1,6 +1,6 @@
 /**
- * The founder lane's tool surface — read tools over dakio-api's Nova store
- * endpoints.
+ * The founder lane's tool surface — read tools over the tenant's
+ * `StoreClient` (`storeFor`), which fronts dakio-api's Nova store endpoints.
  *
  * Two rules hold every tool here to the same discipline the snapshot follows:
  *
@@ -17,22 +17,11 @@
 
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
-import { serviceTokenFor } from "../lib/service-token.js";
-import { dakioBaseUrl } from "../lib/dakio-base.js";
-
-const TIMEOUT_MS = 8000;
+import { storeFor } from "../store/resolve.js";
+import type { AbandonedCart, Customer, OrderStatus } from "../store/types.js";
 
 /** Rows returned to the model per tool call. Above this, it gets a count. */
 const ROW_CAP = 15;
-
-async function read<T>(storeId: string, path: string): Promise<T> {
-  const res = await fetch(`${dakioBaseUrl()}${path}`, {
-    headers: { Authorization: `Bearer ${serviceTokenFor(storeId)}` },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
-  if (!res.ok) throw new Error(`dakio-api GET ${path} → ${res.status}`);
-  return (await res.json()) as T;
-}
 
 /** `{shown, of, rows}` — the model can see when a list was truncated. */
 function capped<T>(rows: T[]): { shown: number; of: number; rows: T[] } {
@@ -40,51 +29,20 @@ function capped<T>(rows: T[]): { shown: number; of: number; rows: T[] } {
 }
 
 /**
- * dakio-api `orderOut` (novaStore.js). Note what is NOT here: the merchant's
- * human `orderNumber` is dropped by that projection, so this surface can only
- * name an order by id. Keep the field names in sync with the mapper — an
+ * Rows arrive in dakio-api's `orderOut`/`productOut`/`customerOut` shapes
+ * (typed in `store/types.ts`). Note what is NOT there: the merchant's human
+ * `orderNumber` is dropped by `orderOut`, so this surface can only name an
+ * order by id. Keep the projected field names in sync with the mapper — an
  * assumed name silently becomes `undefined` and JSON.stringify drops it, so
  * the model just never sees the field. `scripts/smoke-tools.ts` is what
  * catches that.
  */
-interface ApiOrder {
-  id: string;
-  status: string;
-  total: number;
-  placedAt: string;
-  deliveredAt?: string | null;
-  region?: string | null;
-  items?: Array<{ productName: string; quantity: number }>;
-}
 
-interface ApiProduct {
-  id: string;
-  sku: string;
-  name: string;
-  category: string;
-  price: number;
-  stock: number;
-  reorderPoint: number;
-  status: string;
-}
-
-/** dakio-api `customerOut` — no phone on this surface, by design. */
-interface ApiCustomer {
-  id: string;
-  name?: string | null;
-  segment: string;
-  lifetimeValue: number;
-  ordersCount?: number;
-  lastOrderAt?: string | null;
-}
-
-interface ApiCart {
-  id: string;
-  value: number;
-  recoveryState: string;
-  customerName?: string | null;
-  createdAt?: string;
-}
+/**
+ * `cartOut` carries neither of these today — they project to null — but the
+ * output shape predates the StoreClient port and is kept stable for the model.
+ */
+type ApiCart = AbandonedCart & { customerName?: string | null; createdAt?: string };
 
 /**
  * Build the tool set for ONE store. Called per turn with the session's store
@@ -104,11 +62,14 @@ export function storeReadTools(storeId: string) {
         sinceDays: z.number().int().positive().max(365).default(30).describe("Look-back window in days"),
       }),
       execute: async ({ sinceDays, status }) => {
-        const params = new URLSearchParams({ sinceDays: String(sinceDays) });
-        if (status) params.set("status", status);
-        const { orders } = await read<{ orders: ApiOrder[] }>(storeId, `/api/v1/store/orders?${params}`);
+        // The tool's status vocabulary predates the typed OrderStatus; it is
+        // passed through verbatim, exactly as the query param always was.
+        const orders = await storeFor(storeId).listOrders({
+          sinceDays,
+          status: status as OrderStatus | undefined,
+        });
         const revenue = orders
-          .filter((o) => o.status !== "cancelled" && o.status !== "returned")
+          .filter((o) => o.status !== "cancelled" && (o.status as string) !== "returned")
           .reduce((sum, o) => sum + (o.total || 0), 0);
         return {
           ...capped(
@@ -135,7 +96,7 @@ export function storeReadTools(storeId: string) {
         search: z.string().optional().describe("Case-insensitive substring of the product name or SKU"),
       }),
       execute: async ({ lowStockOnly, search }) => {
-        const { products } = await read<{ products: ApiProduct[] }>(storeId, "/api/v1/store/products");
+        const products = await storeFor(storeId).listProducts();
         let rows = products;
         if (lowStockOnly) rows = rows.filter((p) => p.stock <= p.reorderPoint);
         if (search) {
@@ -163,10 +124,11 @@ export function storeReadTools(storeId: string) {
         segment: z.string().optional().describe("Filter to one segment (e.g. vip, repeat, new)"),
       }),
       execute: async ({ segment }) => {
-        const path = segment
-          ? `/api/v1/store/customers?segment=${encodeURIComponent(segment)}`
-          : "/api/v1/store/customers";
-        const { customers } = await read<{ customers: ApiCustomer[] }>(storeId, path);
+        // `customerOut` carries no phone on this surface, by design. Free-form
+        // segment strings pass through as the query param always did.
+        const customers = await storeFor(storeId).listCustomers(
+          segment ? { segment: segment as Customer["segment"] } : undefined,
+        );
         // Highest-value first: "who are my best customers" is the question
         // this tool is actually asked, and the cap should keep those.
         const sorted = [...customers].sort((a, b) => (b.lifetimeValue || 0) - (a.lifetimeValue || 0));
@@ -190,7 +152,7 @@ export function storeReadTools(storeId: string) {
       description: "Abandoned checkouts still open, with their recoverable value. Use for cart-recovery questions.",
       inputSchema: z.object({}),
       execute: async () => {
-        const { carts } = await read<{ carts: ApiCart[] }>(storeId, "/api/v1/store/carts");
+        const carts: ApiCart[] = await storeFor(storeId).listAbandonedCarts();
         const open = carts.filter((c) => c.recoveryState !== "recovered" && c.recoveryState !== "lost");
         return {
           ...capped(
@@ -211,7 +173,7 @@ export function storeReadTools(storeId: string) {
       description:
         "Cash, receivables, payables, stock value and month P&L from the ledger. Use for money questions. Returns ledgerActive=false when the store has not onboarded the ledger — say so rather than inferring the numbers from orders.",
       inputSchema: z.object({}),
-      execute: async () => read<Record<string, unknown>>(storeId, "/api/v1/store/finance/overview"),
+      execute: async () => storeFor(storeId).getFinanceOverview(),
     }),
   };
 }

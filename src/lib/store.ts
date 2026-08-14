@@ -1,12 +1,16 @@
 /**
- * Minimal store-profile client against dakio-api — the "connect with store"
- * seam. Mirrors nova-ai's `ensureTenant` contract (GET /api/v1/store/profile
- * with a per-tenant self-minted service token, storeId identity check, fail
- * closed on 401/403/404) without the stale-cache machinery yet.
+ * Minimal store-profile facade — the "connect with store" seam. Since the
+ * StoreClient port this delegates to the tenant registry's `ensureTenant`
+ * (`src/store/tenants.ts`), which owns the `GET /api/v1/store/profile` fetch
+ * and already covers the old inline fetch's contract: the same 5-minute fresh
+ * TTL, the same storeId identity check (a mis-scoped token returning ANOTHER
+ * tenant's profile is refused, never served), and fail-closed on 401/403/404.
+ * It adds what this module never had: stale-serving ≤24h on transient
+ * failures, refresh backoff, and a thundering-herd guard. In `demo` backend
+ * mode the registry answers from its seeded rows with zero network.
  */
 
-import { serviceTokenFor } from "./service-token.js";
-import { dakioBaseUrl } from "./dakio-base.js";
+import { ensureTenant } from "../store/tenants.js";
 
 export interface StoreProfile {
   storeId: string;
@@ -19,49 +23,17 @@ export interface StoreProfile {
   plan: string;
 }
 
-const FRESH_TTL_MS = 5 * 60 * 1000;
-const PROFILE_TIMEOUT_MS = 8000;
-
-const cache = new Map<string, { profile: StoreProfile; fetchedAt: number }>();
-
-function str(value: unknown, fallback: string): string {
-  return typeof value === "string" && value.trim().length > 0 ? value : fallback;
-}
-
 export async function getStoreProfile(storeId: string): Promise<StoreProfile | null> {
-  const cached = cache.get(storeId);
-  if (cached && Date.now() - cached.fetchedAt < FRESH_TTL_MS) return cached.profile;
-
-  const response = await fetch(`${dakioBaseUrl()}/api/v1/store/profile`, {
-    headers: { Authorization: `Bearer ${serviceTokenFor(storeId)}` },
-    signal: AbortSignal.timeout(PROFILE_TIMEOUT_MS),
-  });
-
-  if (!response.ok) {
-    console.warn(`[store] profile fetch for ${storeId} failed: HTTP ${response.status}`);
-    return null;
-  }
-
-  const p = (await response.json()) as Record<string, unknown>;
-
-  // Identity check: dakio-api derives the tenant from the TOKEN. A mis-scoped
-  // token returns ANOTHER tenant's profile — refuse rather than serve it.
-  if (typeof p.storeId === "string" && p.storeId.length > 0 && p.storeId !== storeId) {
-    console.warn(`[store] profile storeId mismatch for ${storeId} (got ${p.storeId}) — refusing.`);
-    return null;
-  }
-
-  const profile: StoreProfile = {
-    storeId,
-    name: str(p.name, storeId),
-    vertical: str(p.vertical, "general commerce"),
-    currency: str(p.currency, "BDT"),
-    locale: str(p.locale, "en-BD"),
-    timezone: str(p.timezone, "Asia/Dhaka"),
-    status: p.status === "active" ? "active" : "paused",
-    plan: str(p.plan, "starter"),
+  const record = await ensureTenant(storeId);
+  if (!record) return null;
+  return {
+    storeId: record.storeId,
+    name: record.name,
+    vertical: record.vertical,
+    currency: record.currency,
+    locale: record.locale,
+    timezone: record.timezone,
+    status: record.status,
+    plan: record.plan,
   };
-
-  cache.set(storeId, { profile, fetchedAt: Date.now() });
-  return profile;
 }

@@ -1,12 +1,15 @@
 /**
  * CEO snapshot — the numbers behind the hello turn. Pulls the store's live
- * data from dakio-api in parallel and compresses it into a small text block
- * (~300 tokens) for the per-turn instructions. This is the token discipline:
- * aggregate server-side, never hand the model raw row dumps.
+ * data in parallel through the tenant's `StoreClient` (`storeFor`) and
+ * compresses it into a small text block (~300 tokens) for the per-turn
+ * instructions. This is the token discipline: aggregate server-side, never
+ * hand the model raw row dumps.
  */
 
-import { serviceTokenFor } from "./service-token.js";
-import { dakioBaseUrl } from "./dakio-base.js";
+import { storeFor } from "../store/resolve.js";
+
+// Lite views of the client's return shapes — only the fields the snapshot
+// aggregates. The full `store/types.js` rows are structurally assignable.
 
 interface OrderItem {
   productName: string;
@@ -38,21 +41,15 @@ interface Cart {
   recoveryState: string;
 }
 
-const SNAPSHOT_TIMEOUT_MS = 8000;
-
-async function apiGet<T>(storeId: string, path: string): Promise<T | null> {
+/**
+ * One guarded client call. A failed source answers `null` so its section can
+ * degrade to "(unavailable)" instead of killing the whole snapshot.
+ */
+async function pull<T>(storeId: string, label: string, call: () => Promise<T>): Promise<T | null> {
   try {
-    const res = await fetch(`${dakioBaseUrl()}${path}`, {
-      headers: { Authorization: `Bearer ${serviceTokenFor(storeId)}` },
-      signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS),
-    });
-    if (!res.ok) {
-      console.warn(`[snapshot] ${path} for ${storeId}: HTTP ${res.status}`);
-      return null;
-    }
-    return (await res.json()) as T;
+    return await call();
   } catch (err) {
-    console.warn(`[snapshot] ${path} for ${storeId} failed:`, err instanceof Error ? err.message : err);
+    console.warn(`[snapshot] ${label} for ${storeId} failed:`, err instanceof Error ? err.message : err);
     return null;
   }
 }
@@ -66,20 +63,24 @@ function money(n: number, currency: string): string {
  * degrades to a "(unavailable)" line — the report must never block the turn.
  */
 export async function buildCeoSnapshot(storeId: string, currency: string): Promise<string> {
-  const [ordersRes, productsRes, customersRes, cartsRes, financeRes] = await Promise.all([
-    apiGet<{ orders: Order[] }>(storeId, "/api/v1/store/orders?sinceDays=30"),
-    apiGet<{ products: Product[] }>(storeId, "/api/v1/store/products"),
-    apiGet<{ customers: Customer[] }>(storeId, "/api/v1/store/customers"),
-    apiGet<{ carts: Cart[] }>(storeId, "/api/v1/store/carts"),
-    apiGet<Record<string, unknown>>(storeId, "/api/v1/store/finance/overview"),
+  const client = storeFor(storeId);
+  const [orders, products, customers, carts, finance] = await Promise.all([
+    pull<Order[]>(storeId, "orders", () => client.listOrders({ sinceDays: 30 })),
+    pull<Product[]>(storeId, "products", () => client.listProducts()),
+    pull<Customer[]>(storeId, "customers", () => client.listCustomers()),
+    pull<Cart[]>(storeId, "carts", () => client.listAbandonedCarts()),
+    pull<Record<string, unknown>>(
+      storeId,
+      "finance/overview",
+      async () => (await client.getFinanceOverview()) as unknown as Record<string, unknown>,
+    ),
   ]);
 
   const lines: string[] = ["## Live store snapshot (real data, just pulled)"];
   const now = Date.now();
   const DAY = 24 * 60 * 60 * 1000;
 
-  if (ordersRes?.orders) {
-    const orders = ordersRes.orders;
+  if (orders) {
     const last7 = orders.filter((o) => now - Date.parse(o.placedAt) <= 7 * DAY);
     const revenue = (list: Order[]) =>
       list.filter((o) => o.status !== "cancelled" && o.status !== "returned")
@@ -107,8 +108,7 @@ export async function buildCeoSnapshot(storeId: string, currency: string): Promi
     lines.push("- Orders: (unavailable)");
   }
 
-  if (productsRes?.products) {
-    const products = productsRes.products;
+  if (products) {
     const active = products.filter((p) => p.status === "active");
     const low = products.filter((p) => p.stock <= p.reorderPoint);
     lines.push(`- Catalog: ${products.length} products (${active.length} active)`);
@@ -121,16 +121,15 @@ export async function buildCeoSnapshot(storeId: string, currency: string): Promi
     lines.push("- Catalog: (unavailable)");
   }
 
-  if (customersRes?.customers) {
-    const customers = customersRes.customers;
+  if (customers) {
     const ltv = customers.reduce((sum, c) => sum + (c.lifetimeValue || 0), 0);
     lines.push(`- Customers: ${customers.length} on file · combined LTV ${money(ltv, currency)}`);
   } else {
     lines.push("- Customers: (unavailable)");
   }
 
-  if (cartsRes?.carts) {
-    const open = cartsRes.carts.filter((c) => c.recoveryState !== "recovered" && c.recoveryState !== "lost");
+  if (carts) {
+    const open = carts.filter((c) => c.recoveryState !== "recovered" && c.recoveryState !== "lost");
     if (open.length > 0) {
       lines.push(`- Abandoned carts: ${open.length} open, ${money(open.reduce((s, c) => s + (c.value || 0), 0), currency)} recoverable`);
     } else {
@@ -138,9 +137,9 @@ export async function buildCeoSnapshot(storeId: string, currency: string): Promi
     }
   }
 
-  if (financeRes && financeRes.ledgerActive === true) {
+  if (finance && finance.ledgerActive === true) {
     // Ledger is onboarded — surface whatever headline figures the overview carries.
-    const nums = Object.entries(financeRes)
+    const nums = Object.entries(finance)
       .filter(([k, v]) => typeof v === "number" && k !== "ledgerActive")
       .slice(0, 6)
       .map(([k, v]) => `${k} ${money(v as number, currency)}`);
