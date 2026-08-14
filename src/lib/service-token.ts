@@ -52,6 +52,39 @@ export function mintServiceToken(tenantId: string): string {
   return token;
 }
 
+/**
+ * The fleet-listing token — the one deliberately tenantless credential.
+ * Same secret, DIFFERENT `sub` (`nova-fleet`, no `tenantId`): dakio-api's
+ * `authenticateNovaFleet` accepts only this shape on `GET /store/fleet`, and
+ * its tenant-scoped routes refuse it (`sub !== 'nova'`), so the credential
+ * that can list stores can never read any store's data — and vice versa.
+ * Cached under a key no real tenant id can collide with (ids are cuids/slugs,
+ * never colons).
+ */
+const FLEET_CACHE_KEY = "::fleet::";
+
+export function mintFleetToken(): string {
+  const secret = process.env.NOVA_SERVICE_SECRET;
+  if (!secret) {
+    throw new Error("Fleet listing needs NOVA_SERVICE_SECRET (NOVA_STORE_BACKEND=dakio).");
+  }
+  const nowMs = Date.now();
+
+  const cached = cache.get(FLEET_CACHE_KEY);
+  if (cached && cached.expMs - REFRESH_SKEW_MS > nowMs) return cached.token;
+
+  const iat = Math.floor(nowMs / 1000);
+  const exp = iat + DEFAULT_TTL_SEC;
+  const header = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const payload = b64url(JSON.stringify({ type: "service", sub: "nova-fleet", iat, exp }));
+  const signingInput = `${header}.${payload}`;
+  const signature = b64url(createHmac("sha256", secret).update(signingInput).digest());
+  const token = `${signingInput}.${signature}`;
+
+  cache.set(FLEET_CACHE_KEY, { token, expMs: exp * 1000 });
+  return token;
+}
+
 let tokenMapCache: Record<string, string> | null = null;
 
 function tokenMap(): Record<string, string> {
