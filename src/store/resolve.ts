@@ -34,9 +34,16 @@ const SEEDERS: Record<string, (nowMs: number) => StoreSeed> = {
 /** Live per-store backends, created lazily on first access. */
 const instances = new Map<string, StoreClient>();
 
-/** Which backend `storeFor` builds. Defaults to the deterministic demo store. */
+/**
+ * Which backend `storeFor` builds. Deviation from nova-ai, on purpose: there
+ * the default was `demo` (an eve-dev affordance). In this service the worse
+ * failure is a deployment that forgets the env var and silently serves the
+ * seeded in-memory store as if it were the founder's real business — so the
+ * default is `dakio`, and the deterministic demo store is the explicit
+ * opt-in (`NOVA_STORE_BACKEND=demo`, which the eval suites set themselves).
+ */
 function backendMode(): "demo" | "dakio" {
-  return process.env.NOVA_STORE_BACKEND === "dakio" ? "dakio" : "demo";
+  return process.env.NOVA_STORE_BACKEND === "demo" ? "demo" : "dakio";
 }
 
 /* Token precedence (`NOVA_SERVICE_TOKENS` map → `NOVA_SERVICE_TOKEN` →
