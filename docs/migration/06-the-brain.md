@@ -129,6 +129,54 @@ Every piece of that paragraph exists in nova-ai today — the migration's job
 is to keep it true while making the checks cheap enough to run all the
 time, and every claim in it auditable on the board.
 
+## Scheduling: one clock, alarms as data (decided after spike 3)
+
+The brain needs exactly **one** scheduled trigger: a minute-level
+dispatcher tick — now a Mastra scheduled workflow (spike 3), so every
+heartbeat is a traced, watchable run in Studio. Everything else stays
+**data with a due time**, owned by dakio-api:
+
+- Cadenced jobs (morning report, pulse…) expand from **founder-editable
+  defs** in dakio-api — one source of truth, tenant timezone, DST handled.
+  Mastra never holds a second copy of a cadence.
+- Followups/promises are rows with `dueAt`; event jobs are minted when the
+  event happens. No crons for any of them.
+- Overlapping ticks are safe by construction: dakio-api's `SKIP LOCKED` +
+  lease tokens make double-claiming impossible — the safety lives in the
+  database, not in the scheduler.
+- Operational rule (spike 3's lesson): schedules fire only after
+  `startWorkers()`. The express server calls it; any worker-only process
+  must call it itself or the brain silently never wakes.
+
+**One resilience fix (phase E):** today the model-free server sweeps run
+only when Nova calls the claim endpoint — so a Nova outage also stops the
+order-confirm backstop and SLA updates, which message *customers*. Give
+dakio-api its own internal timer for its own sweeps (it already runs
+courierSync that way). A Nova outage must mean "the brain is asleep",
+never "customers stopped hearing back."
+
+**Do we need a queue system like BullMQ? No — but we should build what
+its dashboards give.** The `NovaJob` table already *is* a job queue:
+priorities, leases with fencing tokens, attempts with backoff, dedupe
+keys, `due | leased | done | failed | skipped`. Swapping it for
+BullMQ would add Redis, move the queue out of the founder-visible board,
+and re-buy machinery the evals already pin — for throughput Nova does not
+need (BullMQ shines at thousands of jobs/second; the brain runs dozens of
+jobs/minute across the whole fleet). What we *should* copy from BullMQ is
+its **management console**, as a thin admin view over the existing rows
+(dakio-admin, reading dakio-api):
+
+- queue depth + oldest due job, per tenant and per kind;
+- failed jobs with their stored error and a one-tap **retry** (re-due);
+- stuck leases (the watchdog already re-dues them — show it happening);
+- pause/resume a job kind per tenant (the `enabled` flag already exists);
+- a link from any job row to its Mastra Studio trace ("why did it fail"
+  in steps, not logs).
+
+Founders keep the simple schedule surface they already have (rename
+times, pause a duty); the console above is for **admins/ops** only —
+internal sweeps stay invisible to founders, as today.
+
 ## What ports, what we build
 
 - ♻️ **Port**: the dispatcher loop, job kinds and lease contract, the NBA
