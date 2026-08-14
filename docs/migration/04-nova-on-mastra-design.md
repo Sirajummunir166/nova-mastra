@@ -123,6 +123,52 @@ Departments: a job's output keeps its department signature (`sales`,
 9 subagent directories with copied tools do not come along — a department
 whose steps we can write down was always a workflow with a name tag.
 
+## Departments (cross-cutting) — no subagent per department
+
+Taken apart, an eve "department" is three separate things:
+
+1. **A signature** — the "— Sales" tag on a reply. dakio-api validates it as
+   a plain field (`NOVA_DEPARTMENTS`, `novaChat.js`); the UI renders it.
+   Stays as data.
+2. **A scoped set of reads** — marketing questions need campaign data. In
+   eve, giving a context *fewer* tools required a subagent — that was the
+   only scoping mechanism. In Mastra, **toolsets already scope per turn**,
+   so this reason for subagents disappears.
+3. **Procedures** — "evaluate the campaign", "plan the week". Known shape →
+   workflows.
+
+**A department question in the chatbox** ("Marketing kemon cholche? Ad
+spend beshi hoye jacche?"):
+
+- eve today: root agent (full ~26K register) → routing layer → `marketing`
+  subagent tool → a **fresh child session** re-reads its own full context
+  (subagents inherit nothing) → child agent-loops over 12 tools → returns →
+  root re-reads everything and wraps. **Two full agent contexts** for one
+  question.
+- Mastra: the **same one founder agent**, wearing marketing's hat for this
+  turn — rules attach the marketing read-toolset instead of the default
+  five, and the turn's instructions add one line: *answer as Marketing,
+  sign `— Marketing`*. One small context (~3–4K tokens). The founder sees
+  the same signed, grounded answer.
+
+**When the department must *do* something** (not just answer): a workflow is
+exposed to the agent **as a tool** — a tool's `execute` simply runs the
+workflow and returns its typed result. "Which campaigns should I kill?"
+becomes: agent calls `run_campaign_analysis` → workflow fetches + computes
+(code; nova-ai's reach math ports as-is) → one small judge call → agent
+words the result and signs it. The agent stays small; the heavy lifting
+runs at workflow prices.
+
+**Dept rooms and daily briefs in the merchant UI** never talked to a live
+department — they read rows jobs wrote into dakio-api. Those jobs become
+workflows writing the same rows; the UI does not notice.
+
+**The escape hatch:** if a future department genuinely needs open-ended
+multi-step reasoning a workflow cannot express, Mastra supports real
+sub-agents (and agent networks — doc 02's shelf). The rule: a department
+must **earn** a second model loop with evidence. In eve the default was the
+opposite — nine departments each got one whether they needed it or not.
+
 ## The approval gate (cross-cutting)
 
 One pattern everywhere a write is risky:
