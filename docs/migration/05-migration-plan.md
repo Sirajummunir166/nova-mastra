@@ -71,16 +71,23 @@ no price fields) port byte-for-byte.
 sale walked in Studio: confirm → suspend → approve → real order at server
 prices; idempotent under redelivery (`novaActionId` proven by test).
 
-## Phase E — Jobs
+## Phase E — The brain (doc 06)
 
-Dispatcher loop ported unchanged; claimed jobs run workflows per the doc-04
-table. Conversation-bound kinds (`inbox_reply`, `followup`, `case_update`)
-load the conversation state. Server sweeps untouched. Job runs audited as
-NovaRun rows, same as today.
+Not "port the jobs" — stand up the brain loop. Dispatcher ported unchanged;
+claimed jobs run workflows: the pulse (sense → delta → decide), the
+per-department check workflows writing the shared board, the CEO
+board-reader whose output is the morning report, followup rows as the
+brain's scheduled future check-ins. Conversation-bound kinds
+(`inbox_reply`, `followup`, `case_update`) load the conversation state.
+Server sweeps untouched. Job runs audited as NovaRun rows, same as today.
 
-**Gate:** `jobs` + `fleet` eval suites green (lease contract, tz/DST
-occurrences, per-tenant claiming); one week of staging cron traffic with
-zero orphaned leases; cost per job measured vs eve's job-lane numbers.
+**Gate:** `jobs` + `fleet` + `night` + `duties` eval suites green (lease
+contract, tz/DST occurrences, per-tenant claiming, report shape); one week
+of staging cron traffic with zero orphaned leases; **one simulated night on
+the demo store produces the full morning experience** — receipts, Decision
+cards, scheduled follow-ups, the report — with the night's total model-call
+count measured and small; cost per pulse measured vs eve's job-lane
+numbers.
 
 ## Phase F — Memory layers + reflection
 

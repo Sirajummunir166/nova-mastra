@@ -13,8 +13,8 @@ token math. This is the doc that has to convince you.
  dakio-api ── HMAC push ──▶  CUSTOMER LANE    the sale WORKFLOW         │
  (inbox events)            │  rules → hydrate → decide → write          │
                            ├──────────────────────────────────────────────┤
- dispatcher (1-min tick) ─▶  JOB LANE         one WORKFLOW per job kind │
-                           │  morning report · cart sweep · night ops…  │
+ dispatcher (1-min tick) ─▶  BRAIN LANE       the 24/7 proactive engine │
+                           │  pulse · departments · night ops (doc 06)  │
                            ├──────────────────────────────────────────────┤
                            │  SHARED FLOOR                               │
                            │  StoreClient (dakio-api, per-tenant tokens) │
@@ -104,10 +104,13 @@ small-model JSON call + one ~400-token writer call. eve customer baseline:
 Target: state-known reply well under 2s, live-lookup reply in the 2–4s a
 single writer call costs.
 
-## Lane 3 — Jobs (scheduled workflows)
+## Lane 3 — The brain (scheduled workflows)
 
-The dispatcher loop ports as-is (per-tenant claims, leases, backoff). What
-changes is only what a claimed job *runs*:
+This lane is Nova's actual job: working while nobody is chatting. Its full
+design — the pulse loop, department checks, the shared board, and why the
+brain becomes *more* active on Mastra — is **[doc 06](06-the-brain.md)**.
+Here, only the mechanics: the dispatcher loop ports as-is (per-tenant
+claims, leases, backoff), and what changes is what a claimed job *runs*:
 
 | Job kind | Was (eve) | Becomes |
 |---|---|---|

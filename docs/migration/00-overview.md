@@ -6,15 +6,21 @@
 
 ## What Nova is
 
-Nova is Dakio's AI Business Operator — one digital employee per commerce
-store. It talks to two kinds of people:
+**One founder, one employee, a successful business.** Nova is Dakio's AI
+Business Operator — a digital employee per commerce store whose job is not
+to talk, but to make the business succeed. It works 24/7: an hourly pulse
+checks how the business is doing; each department works out its best next
+move; Nova as CEO sets the top-level priorities; completed, pending and
+scheduled work all live on one shared board; and while the founder sleeps,
+Nova acts within its trust level, queues what needs the founder, and
+schedules its own future check-ins. That proactive brain is the product —
+designed in [doc 06](06-the-brain.md).
+
+The brain has two *doors* where conversations happen:
 
 - **The founder** (the store owner), in the merchant dashboard chatbox.
 - **The customer**, in the Messenger/Instagram inbox — answering prices,
   taking orders, handling complaints.
-
-It also works when nobody is chatting: morning reports, cart recovery,
-follow-ups, night-shift analysis.
 
 Today Nova runs on the **eve** framework (repo `nova-ai`). We are moving it
 to **Mastra** (repo `nova-mastra`). Same behavior outside. Much cheaper and
@@ -75,6 +81,7 @@ jobs, the reports — has a known shape.
 | [03 — The map: eve → Mastra](03-eve-to-mastra-map.md) | Every eve concept and its Mastra answer — native, build-ourselves, or drop |
 | [04 — Nova on Mastra: the design](04-nova-on-mastra-design.md) | The target architecture, lane by lane, with scenarios and token budgets |
 | [05 — The migration plan](05-migration-plan.md) | Phases, each with a "prove it" gate, plus the spikes we run first |
+| [06 — The brain](06-the-brain.md) | The 24/7 proactive engine — pulse, departments, the shared board — and why it gets *more* active on Mastra |
 
 ## What is already true on this branch
 
