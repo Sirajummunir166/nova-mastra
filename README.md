@@ -52,6 +52,24 @@ npm run dev            # tsx watch, port 2100
 Needs dakio-api reachable at `DAKIO_API_URL` (local: `npm run dev` in dakio-api,
 port 5001) with a matching `NOVA_SERVICE_SECRET`.
 
+### Local stack in one command
+
+`scripts/local-stack.sh` brings up everything Nova reads from — local Postgres,
+dakio-api's schema, a seeded demo store (8 products, 5 customers, 12 orders),
+dakio-api on :5001 — and writes the seeded store's id into `.env` as
+`NOVA_DEV_STORE_ID`. That id is a cuid minted at seed time, so it can't be
+hardcoded; the script discovers it. Re-running is safe.
+
+```bash
+./scripts/local-stack.sh                            # dakio-api assumed at ../dakio-api
+DAKIO_API_DIR=/path/to/dakio-api ./scripts/local-stack.sh
+npm run dev                                         # then Nova on :2100
+```
+
+The one thing it can't supply is a model credential — put `AI_GATEWAY_API_KEY`
+in `.env` before the first `/chat`, or the turn 401s at the gateway with the
+store context already assembled.
+
 ## Layout
 
 ```
