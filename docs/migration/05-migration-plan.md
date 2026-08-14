@@ -20,7 +20,11 @@ Small throwaway experiments, no production code:
    tick vs Mastra Schedules on evidence.
 4. **Model reality check**: with a real `AI_GATEWAY_API_KEY`, run the
    founder smoke test end-to-end; record tokens + latency per turn as our
-   first "after" datapoint.
+   first "after" datapoint. *The one spike we cannot run alone: it needs
+   the key from you — and if the cloud sandbox's network blocks the
+   gateway, this spike runs on your machine instead.*
+
+Spikes 1–3 need no credential and start immediately.
 
 **Gate:** a one-page findings note per spike, in this docs folder.
 
@@ -81,6 +85,14 @@ brain's scheduled future check-ins. Conversation-bound kinds
 (`inbox_reply`, `followup`, `case_update`) load the conversation state.
 Server sweeps untouched. Job runs audited as NovaRun rows, same as today.
 
+Phase E also carries the four fixes the job atlas (doc 07, Part B) found:
+**unify cart recovery** (one workflow, two delivery arms, one shared
+"already contacted" list), **link duties to workflows** (every brain
+workflow names the duty keys it serves), **wire the two never-run lanes**
+(courier_intervention triggered by journey "at risk", restock_check by the
+restock-wait case — no new sensing needed), and **port only the real
+night_shift** (dakio-api's grader; nova-ai's demo copy stays behind).
+
 **Gate:** `jobs` + `fleet` + `night` + `duties` eval suites green (lease
 contract, tz/DST occurrences, per-tenant claiming, report shape); one week
 of staging cron traffic with zero orphaned leases; **one simulated night on
@@ -115,8 +127,11 @@ and not worse on any eval.
 
 ## What we deliberately do NOT do
 
-- No behavior "improvements" during migration phases — parity first, ideas
-  later (they go on a list, not into the diff).
+- No behavior "improvements" during migration phases — parity first. The
+  improvement list already exists: doc 07 Part C. Tier 1 (owed by the PRD)
+  lands inside the phases above; Tier 2 (stockout money counter, RTO
+  defense, courier scorecard, winback surface, goal pace, margin review)
+  is the backlog that starts the day after the final gate holds.
 - No cross-tenant credentials, ever — the per-tenant claiming loop stays.
 - No model-chooses-tools for the customer lane — rules and workflow shape
   decide; the model words things and classifies at most.

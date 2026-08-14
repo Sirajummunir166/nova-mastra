@@ -82,6 +82,7 @@ jobs, the reports — has a known shape.
 | [04 — Nova on Mastra: the design](04-nova-on-mastra-design.md) | The target architecture, lane by lane, with scenarios and token budgets |
 | [05 — The migration plan](05-migration-plan.md) | Phases, each with a "prove it" gate, plus the spikes we run first |
 | [06 — The brain](06-the-brain.md) | The 24/7 proactive engine — pulse, departments, the shared board — and why it gets *more* active on Mastra |
+| [07 — The job atlas](07-job-atlas.md) | Every brain job explained and reviewed: what stays, what gets fixed, what's missing |
 
 ## What is already true on this branch
 
