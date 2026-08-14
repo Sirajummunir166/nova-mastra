@@ -4,16 +4,25 @@
  *
  * Event order per turn (the client settles on the last one):
  *   message.appended*  { messageDelta }        — token stream
+ *   actions.requested  { actions: [...] }      — a tool call started
+ *   action.result      { result, status }      — that tool call finished
  *   message.completed  { message }             — the authoritative block
  *   session.waiting    { continuationToken }   — turn settled, token rotated
  * On failure: turn.failed { message } instead of session.waiting — the token
  * is NOT rotated, so the client's existing token stays valid for a retry.
+ *
+ * The two action events are what NovaChat's WorkingNarration renders: one
+ * checklist row per tool call, checked off when its result lands. `callId` is
+ * the join between them, and the narration hangs on an unfinished row
+ * forever if a started call never reports — so a tool that ERRORS must still
+ * emit `action.result`, with status "failed".
  */
 
 import { mastra } from "../mastra/index.js";
 import { getStoreProfile } from "../lib/store.js";
 import { buildCeoSnapshot } from "../lib/snapshot.js";
 import { novaInstructions, type TurnContext } from "../lib/context.js";
+import { toolsForTurn } from "../tools/index.js";
 import { appendEvent, rotateToken, type EveSession } from "./sessions.js";
 
 export interface TurnInput {
@@ -51,16 +60,55 @@ export async function runTurn(session: EveSession, input: TurnInput): Promise<vo
     // Live numbers every turn — server-side aggregation keeps this ~300 tokens.
     const snapshot = await buildCeoSnapshot(session.storeId, store.currency);
 
+    // Rules pick the tools before the model sees anything — an opener gets
+    // none, since the snapshot above already answers it.
+    const { toolsets, selection } = toolsForTurn(session.storeId, userText);
+    console.log(`[eve-compat] ${session.id} tools=${selection.tools.join(",") || "none"} (${selection.reason})`);
+
     const agent = mastra.getAgent("nova");
     const stream = await agent.stream(session.history, {
       instructions: novaInstructions(store, { snapshot, clientContext: input.clientContext }),
+      ...(toolsets ? { toolsets } : {}),
     });
 
+    // fullStream rather than textStream: same text deltas, plus the tool-call
+    // chunks the narration needs. Anything not mapped here is ignored.
     let full = "";
-    for await (const delta of stream.textStream) {
-      if (!delta) continue;
-      full += delta;
-      appendEvent(session, { type: "message.appended", data: { messageDelta: delta } });
+    for await (const chunk of stream.fullStream) {
+      switch (chunk.type) {
+        case "text-delta": {
+          const delta = chunk.payload.text;
+          if (!delta) break;
+          full += delta;
+          appendEvent(session, { type: "message.appended", data: { messageDelta: delta } });
+          break;
+        }
+        case "tool-call":
+          appendEvent(session, {
+            type: "actions.requested",
+            data: {
+              actions: [{ callId: chunk.payload.toolCallId, kind: "tool-call", toolName: chunk.payload.toolName }],
+            },
+          });
+          break;
+        case "tool-result":
+          appendEvent(session, {
+            type: "action.result",
+            data: {
+              result: { callId: chunk.payload.toolCallId },
+              status: chunk.payload.isError ? "failed" : "completed",
+            },
+          });
+          break;
+        case "tool-error":
+          appendEvent(session, {
+            type: "action.result",
+            data: { result: { callId: chunk.payload.toolCallId }, status: "failed" },
+          });
+          break;
+        default:
+          break;
+      }
     }
 
     // Mastra swallows provider errors into the stream result instead of

@@ -4,6 +4,7 @@ import { MastraServer } from "@mastra/express";
 import { mastra } from "./mastra/index.js";
 import { getStoreProfile } from "./lib/store.js";
 import { novaInstructions } from "./lib/context.js";
+import { toolsForTurn } from "./tools/index.js";
 import { eveRouter } from "./eve-compat/router.js";
 import { withGatewayRetry } from "./lib/gateway-retry.js";
 import { createStudioRouter, hasValidStudioCookie } from "./studio.js";
@@ -126,9 +127,13 @@ app.post("/chat", async (req: Request, res: Response) => {
     }
 
     const agent = mastra.getAgent("nova");
+    // Same rules-first tool selection the eve lane uses — /chat must not be a
+    // second, quietly different Nova.
+    const { toolsets } = toolsForTurn(storeId, message);
     const result = await withGatewayRetry(() =>
       agent.generate(message, {
         instructions: novaInstructions(store),
+        ...(toolsets ? { toolsets } : {}),
       }),
     );
 

@@ -12,7 +12,8 @@
     "start": "tsx src/index.ts",
     "studio": "mastra dev",
     "studio:prod": "mastra studio --server-host nova-mastra-production.up.railway.app --server-protocol https --server-port 443 --server-api-prefix /api",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test"
   },
   "dependencies": {
     "@ai-sdk/gateway": "^4.0.49",

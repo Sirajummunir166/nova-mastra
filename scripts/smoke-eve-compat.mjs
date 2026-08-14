@@ -143,7 +143,25 @@ if (degraded) {
   assert(turn2.events.at(-1)?.type === "session.waiting", "turn 2 did not settle on session.waiting");
   const text2 = turnText(turn2.events);
   assert(text2.length > 0, "turn 2: empty reply");
-  console.log(`turn 2 OK — ${turn2.consumed} events, ${text2.length} chars`);
+
+  // Step events: a restock question selects get_products, so this turn should
+  // call a tool. NovaChat's WorkingNarration opens a checklist row per
+  // `actions.requested` and closes it on the matching `action.result` — an
+  // unmatched callId is a row that hangs on screen for the rest of the turn.
+  const started = turn2.events.filter((e) => e.type === "actions.requested").flatMap((e) => e.data?.actions ?? []);
+  const finished = turn2.events.filter((e) => e.type === "action.result");
+  assert(started.length > 0, "turn 2: no actions.requested — the tool was never offered or never called");
+  for (const action of started) {
+    assert(typeof action.callId === "string" && action.callId, "actions.requested: action without a callId");
+    assert(typeof action.toolName === "string" && action.toolName, "actions.requested: action without a toolName");
+    assert(
+      finished.some((e) => (e.data?.result?.callId ?? e.data?.callId) === action.callId),
+      `callId ${action.callId} (${action.toolName}) started but never reported a result — narration would hang`,
+    );
+  }
+  console.log(
+    `turn 2 OK — ${turn2.consumed} events, ${text2.length} chars, tools: ${started.map((a) => a.toolName).join(", ")}`,
+  );
   console.log(text2.slice(0, 400));
 }
 

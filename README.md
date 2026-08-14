@@ -21,9 +21,53 @@ POST /chat  { "message": "hello", "storeId": "<optional, defaults NOVA_DEV_STORE
 `GET /health` for probes. Mastra's own endpoints (`/api/agents/nova/generate`)
 are also mounted via `@mastra/express`.
 
-Not yet ported (tracked for the real chatbox contract): Dakio JWT auth +
-`{userId, tenantId}` claim normalisation, NDJSON session/stream protocol the
-merchant app speaks, tools, autonomy gate, memory layers.
+Not yet ported (tracked for the real chatbox contract): the autonomy gate
+(eve's `input.requested` parking — nothing here ever parks), durable memory
+(sessions are in-process and die with the server), and every WRITE tool. Nova
+can read this store; it cannot yet change it.
+
+## Tools (founder lane)
+
+The founder chatbox gets a small read surface over dakio-api — `get_orders`,
+`get_products`, `get_customers`, `get_abandoned_carts`,
+`get_finance_overview` — and which of them the model sees is decided **per
+turn, by rules, before the model is called** (`src/tools/select.ts`):
+
+| turn | tools attached |
+|---|---|
+| an opener ("hello", "how are we doing?") | **none** — `buildCeoSnapshot` already answered it |
+| a recognised topic ("what needs restocking?") | that topic's tool |
+| anything else | all five |
+
+That is the same discipline as the instruction assembly, applied to schemas:
+eve shipped 67 tool definitions on every call, including the openers that
+could never use one. Selection widens rather than narrows when it fails to
+parse a question — a starved turn is a wrong answer, five small schemas are a
+rounding error.
+
+Tools are attached per call via Mastra `toolsets`, so the agent itself stays
+tool-free and each turn's payload is its own decision. Every tool aggregates
+and caps its rows (`ROW_CAP`) instead of forwarding what dakio-api returns,
+and none takes a store id — tenancy is closed over from the session, never a
+model-supplied argument.
+
+Two things verify without a model credential:
+
+```bash
+npm test                                                   # selection rules
+node --env-file=.env --import tsx scripts/smoke-tools.ts   # every tool against the live API
+```
+
+The second one exists because the failure it catches is invisible: dakio-api's
+Nova projection renames fields (`region`, not `district`; `ordersCount`, not
+`orderCount`) and drops others entirely (an order has no `orderNumber` on this
+surface). A wrong name is `undefined`, `JSON.stringify` drops it, and the model
+simply never sees the field — no error anywhere.
+
+While the model is reachable, `scripts/smoke-eve-compat.mjs` additionally
+asserts that every `actions.requested` gets a matching `action.result`:
+NovaChat opens a narration row per tool call and closes it on that result, so
+an unmatched `callId` is a row that hangs on the founder's screen.
 
 ## Studio
 
@@ -79,4 +123,8 @@ src/mastra/agents/nova.ts  Nova agent (gateway model)
 src/lib/service-token.ts   per-tenant HS256 service token mint (port of nova-ai)
 src/lib/store.ts           GET /api/v1/store/profile client, identity-checked
 src/lib/context.ts         per-turn instruction assembly (the token-lean seam)
+src/lib/snapshot.ts        CEO snapshot — live store numbers, ~300 tokens
+src/tools/store-reads.ts   founder-lane read tools over dakio-api
+src/tools/select.ts        which tools this turn gets — rules, no model call
+src/eve-compat/            the eve/v1 protocol surface NovaChat speaks
 ```
