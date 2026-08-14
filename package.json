@@ -20,15 +20,18 @@
     "@mastra/core": "^1.57.0",
     "@mastra/express": "^1.4.14",
     "@mastra/observability": "^1.16.5",
+    "@mastra/pg": "^1.20.0",
     "dotenv": "^17.2.0",
     "express": "^5.2.1",
     "mastra": "^1.24.0",
+    "pg": "^8.23.0",
     "tsx": "^4.20.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/express": "^5.0.3",
     "@types/node": "^24.0.0",
+    "@types/pg": "^8.21.0",
     "typescript": "^5.9.0"
   }
 }

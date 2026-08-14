@@ -68,6 +68,8 @@ export async function runTurn(session: EveSession, input: TurnInput): Promise<vo
     const agent = mastra.getAgent("nova");
     const stream = await agent.stream(session.history, {
       instructions: novaInstructions(store, { snapshot, clientContext: input.clientContext }),
+      // Runaway fuse (doc 02): a turn may chain at most 8 model steps.
+      maxSteps: 8,
       ...(toolsets ? { toolsets } : {}),
     });
 
