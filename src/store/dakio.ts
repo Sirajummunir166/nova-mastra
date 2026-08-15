@@ -105,6 +105,7 @@ import type {
 } from "./types.js";
 import type {
   StoreClient,
+  FiledAction,
   RunStartInput,
   RunFinishInput,
   CatalogPhotoPending,
@@ -814,10 +815,21 @@ export class DakioStoreClient implements StoreClient {
     return row ? this.actionFromWire(row) : null;
   }
 
-  async addAction(record: Omit<ActionRecord, "id" | "createdAt">): Promise<ActionRecord> {
+  /**
+   * File an action. The response's `replayed` discriminator rides through
+   * UNTOUCHED when the server sends one, and is dropped entirely when it does
+   * not — see `FiledAction` in client.ts for why "the server did not say" must
+   * not collapse into `false`. Anything other than a real boolean is treated as
+   * "did not say": a truthy string from an older route would otherwise read as
+   * a replay and silently skip a side effect that never ran.
+   */
+  async addAction(record: Omit<ActionRecord, "id" | "createdAt">): Promise<FiledAction> {
     const body = { ...record, receipt: this.receiptToWire(record.receipt) };
     const row = await this.request<Record<string, unknown>>("/api/v1/agent-data/actions", { method: "POST", body });
-    return this.actionFromWire(row);
+    const filed = this.actionFromWire(row) as FiledAction;
+    if (typeof row.replayed === "boolean") return { ...filed, replayed: row.replayed };
+    delete filed.replayed;
+    return filed;
   }
 
   async updateAction(

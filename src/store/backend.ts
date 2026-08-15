@@ -96,6 +96,7 @@ import type {
 } from "./types.js";
 import type {
   StoreClient,
+  FiledAction,
   RunStartInput,
   RunFinishInput,
   CatalogPhotoPending,
@@ -1211,7 +1212,47 @@ export class DemoStore implements StoreClient {
     return this.data.actions.find((a) => a.id === id) ?? null;
   }
 
-  async addAction(record: Omit<ActionRecord, "id" | "createdAt">): Promise<ActionRecord> {
+  /**
+   * The at-most-once key a row is filed under — dakio-api's
+   * `NovaAction.dedupeKey`, which the customer lane fills from
+   * `payload.novaActionId` (see `src/front-office/actions.ts`).
+   *
+   * Rows filed without one — every founder-lane verb, the seed — carry NO key
+   * and are never deduped, exactly as a NULL column is never covered by a
+   * unique index. That asymmetry is the server's, not a convenience: it is why
+   * `create_campaign` can be filed twice and `create_order_from_chat` cannot.
+   */
+  private static dedupeKeyOf(record: Pick<ActionRecord, "payload">): string | null {
+    const key = (record.payload as Record<string, unknown> | null)?.novaActionId;
+    return typeof key === "string" && key.trim().length > 0 ? key : null;
+  }
+
+  /**
+   * File an action — modelling dakio-api's `@@unique([tenantId, type, dedupeKey])`.
+   *
+   * THE FLOOR THIS EXISTS TO MODEL. A second filing under a key this ledger
+   * already owns does NOT insert: it ANSWERS with the row that owns the key,
+   * at whatever status that row is in, and says `replayed: true` so the caller
+   * can tell that answer from a fresh insert. Until this modelled the server,
+   * every `replayed` assertion in the customer-lane suite was vacuous — the
+   * demo pushed a new row for every call, so a redelivery could never produce
+   * the server's answer and the whole class of double-execution defects was
+   * untestable. One store per tenant here, so `(type, dedupeKey)` is already
+   * the tenant-scoped key.
+   *
+   * ANY STATUS OWNS THE KEY, including `blocked`/`rejected`/`undone`. A unique
+   * index does not consult a status column, and a caller that assumes only
+   * live rows dedupe will file fresh, be handed a dead row back, and report it
+   * as the row it just wrote.
+   */
+  async addAction(record: Omit<ActionRecord, "id" | "createdAt">): Promise<FiledAction> {
+    const key = DemoStore.dedupeKeyOf(record);
+    if (key) {
+      const owner = this.data.actions.find((a) => a.type === record.type && DemoStore.dedupeKeyOf(a) === key);
+      // A COPY, never the stored row: `replayed` describes THIS answer, not the
+      // row, and must not end up persisted on it.
+      if (owner) return { ...owner, replayed: true };
+    }
     const created: ActionRecord = {
       ...record,
       id: this.nextId("action"),
@@ -1223,7 +1264,7 @@ export class DemoStore implements StoreClient {
       created.undoDeadline = new Date(Date.parse(created.executedAt) + 24 * 3600 * 1000).toISOString();
     }
     this.data.actions.push(created);
-    return created;
+    return { ...created, replayed: false };
   }
 
   async updateAction(

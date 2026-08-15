@@ -188,39 +188,10 @@ export async function performCreateOrder(
   const { payload, receipt } = request;
 
   // ── At-most-once: a redelivered key answers from the ledger. ─────────────
-  // Blocked rows deliberately do NOT dedupe — the founder may lift a lock or
-  // raise the dial, and a fresh attempt must be re-judged (nova-ai files a new
-  // blocked row per attempt for the same reason).
+  // At ANY status the owning row can be in — a blocked/rejected/undone row owns
+  // the key server-side just as hard as a live one (see `findByKey`).
   const existing = await findByKey(client, VERB, payload.novaActionId);
-  if (existing) {
-    // The key matched; the REQUEST still has to. A different payload under the
-    // same key is a caller bug, not a redelivery, and answering it from this
-    // row would report someone else's order as this customer's.
-    assertSameRequest(VERB, existing, payload as unknown as Record<string, unknown>);
-    if (existing.status === "executed") {
-      return {
-        status: "executed",
-        actionId: existing.id,
-        detail: existing.outcome ?? "Order already placed for this confirmation.",
-        order: orderFromRecord(existing),
-        replayed: true,
-      };
-    }
-    // A prepared row with no Decision is work the founder cannot see. The
-    // replay is the only moment anything looks again, so it heals it.
-    await healDecision(client, existing, {
-      tag: DEPARTMENT,
-      door: "orders",
-      paramsLine: maskPhonesIn(orderParamsLine(existing.payload as unknown as ChatOrderGatePayload)),
-    });
-    return {
-      status: "prepared",
-      actionId: existing.id,
-      detail: preparedDetail(),
-      rule: gateRuleOf(existing) ?? "replay",
-      replayed: true,
-    };
-  }
+  if (existing) return settleOrderRow(client, existing, payload);
 
   const authority = await evaluateAuthority(client, {
     type: VERB,
@@ -235,8 +206,9 @@ export async function performCreateOrder(
   // rule below stayed a hope on exactly the path that needed it to be a rule.
   // `orderTitle`/`orderParamsLine` compose from `customerCity`/`customerDistrict`,
   // which are customer-typed free text ("Savar, ring me on 01…"), not a
-  // catalog constant.
-  const title = maskPhonesIn(orderTitle(payload));
+  // catalog constant. (`fileRow` masks again on the way to the store; this call
+  // is what the local Decision is authored from.)
+  const title = founderFacing(orderTitle(payload));
   const gateEvidence: ReceiptEvidence = {
     source: "authority_gate",
     note: authority.explanation,
@@ -249,7 +221,7 @@ export async function performCreateOrder(
   if (authority.verdict === "refuse") {
     // A refusal is an explained, receipted event — its evidence is the rule
     // that fired (nova-ai performAction, PRD §13).
-    const record = await client.addAction({
+    const { record, replayed } = await fileRow(client, {
       type: VERB,
       department: DEPARTMENT,
       title,
@@ -270,6 +242,7 @@ export async function performCreateOrder(
       decidedAt: client.now(),
       executedAt: null,
     });
+    if (replayed) return settleOrderRow(client, record, payload);
     // Only escalation-flagged refusals become desk cards — ordinary guardrail
     // trims must not fill the desk with noise. Best-effort: the refusal is
     // already recorded and enforced.
@@ -283,7 +256,7 @@ export async function performCreateOrder(
     // The prepared row IS what dakio-api's approve executor reads — payload
     // field for field. The gate rule rides as evidence (nova-ai's 2026-08-10
     // lesson: prepared rows that don't name their rule cost a diagnosis hours).
-    const record = await client.addAction({
+    const { record, replayed } = await fileRow(client, {
       type: VERB,
       department: DEPARTMENT,
       title,
@@ -304,13 +277,18 @@ export async function performCreateOrder(
       decidedAt: null,
       executedAt: null,
     });
+    if (replayed) return settleOrderRow(client, record, payload);
     // The founder answers a Decision, not a raw prepared row. Best-effort: a
-    // desk-card failure must not lose the work Nova already did.
-    await client.addDecision(authorOrderDecision(client, record, authority)).catch(() => {});
+    // desk-card failure must not lose the work Nova already did — but the line
+    // the customer gets may not say the shop has it unless it does.
+    const delivered = await client
+      .addDecision(authorOrderDecision(client, record, authority))
+      .then(() => true)
+      .catch(() => false);
     return {
       status: "prepared",
       actionId: record.id,
-      detail: preparedDetail(),
+      detail: preparedDetail(delivered),
       rule: authority.rule,
       replayed: false,
     };
@@ -344,7 +322,7 @@ export async function performCreateOrder(
     (payload.couponCode ? `, coupon ${payload.couponCode}` : "") +
     `).`;
 
-  const record = await client.addAction({
+  const { record, replayed } = await fileRow(client, {
     type: VERB,
     department: DEPARTMENT,
     title,
@@ -379,25 +357,81 @@ export async function performCreateOrder(
     executedAt: client.now(),
   });
 
+  // ── The filing was answered from a row that already owned the key ────────
+  // Another delivery of this same decision got here first. `createChatOrder`
+  // keys on `novaActionId`, so the order above IS that attempt's order and no
+  // second parcel exists — but the ROW is theirs, and everything below counts
+  // work: the by:nova stamp, and an activity line that credits the WHOLE order
+  // total to `revenueInfluence`. Running them again bills one sale twice.
+  if (replayed) return settleOrderRow(client, record, payload);
+
   // Metadata, never authority — the order exists; neither the by:nova stamp
   // nor the activity line may fail an already-executed sale.
   await client.attributeDoorRecord(`order:${order.id}`, record.id).catch(() => {});
-  await client
-    .addActivity({
-      department: DEPARTMENT,
-      kind: "action",
-      title,
-      detail: outcome,
-      minutesSaved: 12, // MINUTES_BY_ACTION parity — same figure both surfaces write
-      revenueInfluence: order.total,
-      actionId: record.id,
-      relatedId: order.id,
-      revenueBasis: "estimated", // module 09: COD is not collected money; the sweep re-bases on delivery
-      revenueProvenance: `chat_order:${order.id}`,
-    })
-    .catch(() => {});
+  await fileActivity(client, {
+    department: DEPARTMENT,
+    kind: "action",
+    title,
+    detail: outcome,
+    minutesSaved: 12, // MINUTES_BY_ACTION parity — same figure both surfaces write
+    revenueInfluence: order.total,
+    actionId: record.id,
+    relatedId: order.id,
+    revenueBasis: "estimated", // module 09: COD is not collected money; the sweep re-bases on delivery
+    revenueProvenance: `chat_order:${order.id}`,
+  });
 
   return { status: "executed", actionId: record.id, detail: outcome, order, replayed: false };
+}
+
+/**
+ * The order row that owns the key → this verb's outcome, for every status.
+ *
+ * `gateOrFile`'s `settleOwningRow` for the one verb that does not go through
+ * it. Same two entry points and the same reason they must agree: the pre-flight
+ * lookup, and a filing the server answered with somebody else's row.
+ */
+async function settleOrderRow(
+  client: StoreClient,
+  row: ActionRecord,
+  payload: ChatOrderGatePayload,
+): Promise<OrderGateOutcome> {
+  // The key matched; the REQUEST still has to. A different payload under the
+  // same key is a caller bug, not a redelivery, and answering it from this row
+  // would report someone else's order as this customer's.
+  assertSameRequest(VERB, row, payload as unknown as Record<string, unknown>);
+  if (row.status === "executed") {
+    return {
+      status: "executed",
+      actionId: row.id,
+      detail: row.outcome ?? "Order already placed for this confirmation.",
+      order: orderFromRecord(row),
+      replayed: true,
+    };
+  }
+  if (row.status === "prepared") {
+    // A prepared row with no Decision is work the founder cannot see. The
+    // replay is the only moment anything looks again, so it heals it — and
+    // reports what looking found, because the line depends on it.
+    const delivered = await healDecision(client, row, {
+      tag: DEPARTMENT,
+      door: "orders",
+      paramsLine: orderParamsLine(row.payload as unknown as ChatOrderGatePayload),
+    });
+    return {
+      status: "prepared",
+      actionId: row.id,
+      detail: preparedDetail(delivered),
+      rule: gateRuleOf(row) ?? "replay",
+      replayed: true,
+    };
+  }
+  return {
+    status: "blocked",
+    actionId: row.id,
+    detail: settledDetail(row),
+    rule: gateRuleOf(row) ?? `replay:${row.status}`,
+  };
 }
 
 /* ── helpers ──────────────────────────────────────────────────────────────── */
@@ -413,6 +447,23 @@ export function orderTitle(payload: ChatOrderGatePayload): string {
   return `Chat order: ${units} item${units === 1 ? "" : "s"} to ${payload.customerCity}, ${payload.customerDistrict}`;
 }
 
+/* ── The prepared tier's one remaining claim, and when it is false ──────────
+ *
+ * All six prepared lines end with the same assertion: the request REACHED THE
+ * SHOP. It is the only determined fact on that tier and the customer is owed
+ * it — but it was being asserted unconditionally, and the thing that makes it
+ * true is `client.addDecision`, which every verb calls best-effort
+ * (`.catch(() => {})`) precisely so a desk-card failure cannot lose the work
+ * Nova already did. The two together mean: when the card does not land, the row
+ * exists, nobody can see it, and the customer is told it is on someone's desk.
+ *
+ * So the claim is now conditional on the card. Each line takes `delivered` and
+ * says the same thing about what was prepared either way; only the last clause
+ * moves. The replay path already knew how to find out (`healDecision` looks for
+ * the card and files the missing one) and now REPORTS what it found, so a
+ * redelivery that heals the card upgrades the sentence with it.
+ * ────────────────────────────────────────────────────────────────────────── */
+
 /**
  * FD-3 in one line — the normal flow, never an apology.
  *
@@ -422,10 +473,12 @@ export function orderTitle(payload: ChatOrderGatePayload): string {
  * approved" read as a promise Nova has no standing to make, and the customer
  * would have been told an order was coming that may never exist.
  */
-function preparedDetail(): string {
+function preparedDetail(delivered: boolean): string {
   return (
     "The order is going in — the shop confirms each chat order before dispatch. " +
-    "It is fully prepared and has gone to them for that confirmation."
+    (delivered
+      ? "It is fully prepared and has gone to them for that confirmation."
+      : "It is fully prepared, but it has not reached them yet.")
   );
 }
 
@@ -449,24 +502,154 @@ function buildReceipt(
   };
 }
 
-/**
- * Find the prepared/executed row this key already produced, if any.
+/* ── The founder-facing boundary ────────────────────────────────────────────
  *
- * BLOCKED rows deliberately never match: the founder may lift a lock or raise
- * the dial, and the next attempt must be re-judged rather than answered from a
- * refusal. Shared by every verb in this file — the dedupe rule is the same one
- * whatever is being written.
+ * The masker used to run on TWO strings — the row title and the card's params
+ * line — and the file said, in several places, that this was "the floor". It
+ * was not: the same free text reaches the founder through at least three more
+ * sinks, and the one that matters most is the line they actually read.
+ *
+ *   turn.ts composes the order receipt's `reason` out of `ctx.purchase.zone`,
+ *   which is L1-resolver output over the customer's own sentence ("Savar, ring
+ *   me on 01…"). `buildReceipt`/`justificationOf` store it raw, and
+ *   `authorGateDecision` copies it onto the Decision card as `why` — the
+ *   sentence under the title on the founder's desk. `expectedImpact` reaches
+ *   `impactLabel` the same way, and every verb's `outcome` line embeds customer
+ *   text too (the cancel reason verbatim, the discount reason, the order's
+ *   city/district).
+ *
+ * WHY NOT SANITIZE AT INGESTION INSTEAD. It was the tempting single fix — mask
+ * `e.zone`/`e.size` as the delta is applied and nothing downstream can leak.
+ * It is the wrong place, for a reason this file has already decided once: the
+ * raw words are LOAD-BEARING below this boundary. `ctx.purchase.zone` becomes
+ * `customerCity`/`customerDistrict` on the wire, where dakio-api prices the
+ * delivery and the courier reads the destination; a masked field there is a
+ * corrupted order. And the payload is deliberately the record of what the
+ * customer actually said — the cancel suite pins that `payload.reason` keeps
+ * the full number, "where the founder reads them in context". So the line is
+ * drawn by ROLE, not by field: a SUMMARY a human skims (title, params line,
+ * why, impact, outcome, activity) is masked; the RECORD (payload, receipt
+ * before/after snapshots, undoData) is kept verbatim.
+ *
+ * Everything this module hands the store for a human to read goes through
+ * `fileRow` / `authorGateDecision` / `activityFor`, and all three mask here.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+function founderFacing(text: string): string;
+function founderFacing(text: string | null): string | null;
+function founderFacing(text: string | null): string | null {
+  return text === null ? null : maskPhonesIn(text);
+}
+
+/** Receipt prose is founder-facing; the before/after snapshots are the record. */
+function maskReceipt(receipt: ActionReceipt): ActionReceipt {
+  return {
+    ...receipt,
+    reason: founderFacing(receipt.reason),
+    expectedImpact: founderFacing(receipt.expectedImpact),
+    evidence: (receipt.evidence ?? []).map((e) => ({ ...e, note: founderFacing(e.note) })),
+  };
+}
+
+/** What `client.addAction` accepts. */
+type ActionInput = Parameters<StoreClient["addAction"]>[0];
+
+/**
+ * The ONE place this module files a row.
+ *
+ * Two jobs, both of which had to be in one place or they would drift:
+ *
+ *  1. MASK. Title, outcome, justification and receipt prose are the founder's
+ *     reading surface (see the boundary block above).
+ *  2. REPORT THE REPLAY. dakio-api owns `(tenant, type, dedupeKey)` and answers
+ *     a second filing with the row that already owns the key. Without reading
+ *     that answer, every "and then…" after a filing runs a second time for one
+ *     action id: a second live coupon minted from codes no row names, a
+ *     `previousStatus` re-read after the winning attempt's write already landed
+ *     and stored as 'cancelled', a doubled activity line crediting the full
+ *     order total to `revenueInfluence` twice.
+ *
+ * `replayed` is false when the server does not report (see `FiledAction`) —
+ * i.e. today's behaviour against a dakio-api without the discriminator, which
+ * is the safe degradation: assuming a replay would skip a side effect that
+ * never ran.
+ */
+async function fileRow(client: StoreClient, input: ActionInput): Promise<{ record: ActionRecord; replayed: boolean }> {
+  const filed = await client.addAction({
+    ...input,
+    title: founderFacing(input.title),
+    outcome: founderFacing(input.outcome),
+    justification: {
+      ...input.justification,
+      reason: founderFacing(input.justification.reason),
+      expectedImpact: founderFacing(input.justification.expectedImpact),
+    },
+    receipt: maskReceipt(input.receipt),
+  });
+  return { record: filed, replayed: filed.replayed === true };
+}
+
+/** Activity lines are founder-facing too — same boundary, same masker. */
+async function fileActivity(
+  client: StoreClient,
+  entry: Parameters<StoreClient["addActivity"]>[0],
+): Promise<void> {
+  await client
+    .addActivity({ ...entry, title: founderFacing(entry.title), detail: founderFacing(entry.detail) })
+    .catch(() => {});
+}
+
+/**
+ * Find the row this key already owns, AT ANY STATUS.
+ *
+ * IT USED TO MATCH `prepared|executed` ONLY, on the argument that "the founder
+ * may lift a lock or raise the dial, and the next attempt must be re-judged
+ * rather than answered from a refusal". That argument describes a ledger with
+ * no unique index. dakio-api's `NovaAction` carries
+ * `@@unique([tenantId, type, dedupeKey])` and fills `dedupeKey` from
+ * `payload.novaActionId`, and a unique index does not consult a status column:
+ * a blocked, rejected or undone row OWNS the key just as hard as a live one.
+ *
+ * So the asymmetric lookup did not buy a re-judgement — it bought a blind spot.
+ * The re-attempt found nothing, ran the whole gate, reached its write, and only
+ * THEN filed; the server answered that filing with the dead row, and the verb
+ * reported the dead row's id as the row it had just written. On the order path
+ * that is a real parcel created against a ledger row that says `blocked`.
+ * Seeing the row BEFORE the write is the only place that can be caught.
+ *
+ * THE COST, NAMED RATHER THAN DISCOVERED LATER — and the follow-up it needs:
+ * the turn derives `nm:<conv>:order-<n>` from `orders + pendingOrders`, neither
+ * of which a blocked attempt advances. So once a lock blocks an order, the same
+ * conversation re-deriving the same key now replays the refusal instead of
+ * being re-judged, and a founder who lifts the lock cannot get that order in
+ * from this thread. THE KEY DERIVATION HAS TO CARRY THE ATTEMPT (or dakio-api
+ * has to leave `dedupeKey` null on blocked rows) — until one of those lands,
+ * the honest behaviour is to answer from the row that owns the key, because
+ * that is what the server will do anyway.
  */
 async function findByKey(client: StoreClient, type: string, novaActionId: string): Promise<ActionRecord | null> {
   const rows = await client.listActions();
   return (
     rows.find(
-      (r) =>
-        r.type === type &&
-        (r.status === "prepared" || r.status === "executed") &&
-        (r.payload as Record<string, unknown> | null)?.novaActionId === novaActionId,
+      (r) => r.type === type && (r.payload as Record<string, unknown> | null)?.novaActionId === novaActionId,
     ) ?? null
   );
+}
+
+/**
+ * A row that owns the key and can no longer move — blocked, rejected, undone.
+ *
+ * There is nothing to replay and nothing to file; the honest answer names the
+ * settled state. `blocked` rows already carry the authority explanation as
+ * their outcome; the other two never had one, so the line is a statement of
+ * what the ledger records and nothing more. Every caller treats this like any
+ * other block (the turn hands the thread to a person), which is the right move
+ * for all three.
+ */
+function settledDetail(record: ActionRecord): string {
+  if (record.status === "blocked") return record.outcome ?? "This was refused under the shop's own rules.";
+  if (record.status === "rejected") return "The shop looked at this request and did not put it through.";
+  return "This was done for this conversation and then reversed by the shop.";
 }
 
 /** The authority rule stamped on the row's receipt evidence, if present. */
@@ -584,9 +767,9 @@ function isClaimRow(record: ActionRecord): boolean {
  */
 async function fileClaim(
   client: StoreClient,
-  input: Omit<Parameters<StoreClient["addAction"]>[0], "status" | "outcome" | "executedAt" | "decidedAt">,
-): Promise<ActionRecord> {
-  return client.addAction({
+  input: Omit<ActionInput, "status" | "outcome" | "executedAt" | "decidedAt">,
+): Promise<{ record: ActionRecord; replayed: boolean }> {
+  return fileRow(client, {
     ...input,
     status: "prepared",
     outcome: null,
@@ -603,7 +786,9 @@ async function finalizeClaim(
 ): Promise<ActionRecord> {
   return client.updateAction(claim.id, {
     status: "executed",
-    outcome: patch.outcome,
+    // The outcome is a founder-facing line and this is the one write that
+    // reaches the ledger without passing through `fileRow`.
+    outcome: founderFacing(patch.outcome),
     undoable: patch.undoable,
     undoData: patch.undoData,
     executedAt: client.now(),
@@ -626,15 +811,19 @@ async function healDecision(
   client: StoreClient,
   record: ActionRecord,
   shape: { tag: NovaDepartment; door: string; paramsLine: string },
-): Promise<void> {
+): Promise<boolean> {
   const cards = await client.listDecisions().catch(() => null);
-  if (!cards) return;
-  if (cards.some((d) => d.actionId === record.id)) return;
-  // Blocked rows never reach a replay (`findByKey`), so a replayed row is
-  // always a draft/suggest one — `proposal`, never `escalation`.
-  await client
+  // Could not look: the honest answer is "I do not know that they can see it",
+  // and the prepared line must not claim they can.
+  if (!cards) return false;
+  if (cards.some((d) => d.actionId === record.id)) return true;
+  // Only draft/suggest rows reach here: `settleOwningRow` routes blocked,
+  // rejected and undone rows away before any healing — `proposal`, never
+  // `escalation`.
+  return client
     .addDecision(authorGateDecision(client, record, { verdict: "draft", riskClass: record.riskClass }, shape))
-    .catch(() => {});
+    .then(() => true)
+    .catch(() => false);
 }
 
 /* ── Conversation scoping — the guarantee, made structural ──────────────────
@@ -653,13 +842,34 @@ async function healDecision(
  *   - This lane's own state holds order NUMBERS (`ctx.orders[].no`) and
  *     prepared action ids, never dakio Order ids.
  *
- * So there is nothing here that can verify the claim, and a comment asserting
- * it would be exactly the kind of unenforced guarantee this file must not
- * carry. What IS enforced instead: the two mutating verbs will not accept a
- * bare string. They take a `ConversationOrderRef`, which can only be minted by
- * `conversationOrderRef()` — and that mint refuses any id the caller cannot
- * show among the ids THIS conversation owns. The proof obligation is moved to
- * the caller and made checkable by the compiler.
+ * So there is nothing here that can verify the claim from `getOrder`, and a
+ * comment asserting it would be exactly the kind of unenforced guarantee this
+ * file must not carry. What IS enforced instead: the verbs that name an order
+ * will not accept a bare string. They take a `ConversationOrderRef`, which only
+ * `conversationOrderRef()` can mint, and that mint checks the id against the
+ * order set it DERIVES ITSELF from this conversation.
+ *
+ * THE SET USED TO BE AN ARGUMENT, AND THAT MADE THE GUARD DECORATIVE. The mint
+ * took `conversationOrderIds` from the same caller that supplied the `orderId`,
+ * so `{orderId: x, conversationOrderIds: [x]}` satisfied it every time — the
+ * check compared a caller's claim against the same caller's claim. The set is
+ * now assembled inside this module from two sources it can actually stand
+ * behind, and the caller cannot widen it:
+ *
+ *   1. THIS LANE'S OWN LEDGER. Executed `create_order_from_chat` rows whose
+ *      payload names this conversation; the order id is on `undoData.orderId`
+ *      (the field dakio-api's UNDO map reads) or on `targetRef`. These are
+ *      orders Nova placed IN this thread — the strongest claim available, and
+ *      it needs no server support that does not already exist.
+ *   2. THE SERVER'S OWN 360 BLOCK for the thread
+ *      (`getInboxConversation(convId).customer`), which is Dakio's data about
+ *      the customer this thread is LINKED to — not a stranger's typing. Its
+ *      shape is deliberately open (module 03 owns the serializer), so the read
+ *      is defensive and, finding nothing it recognises, contributes nothing.
+ *
+ * Both are fail-CLOSED: an unlinked thread that has bought nothing through Nova
+ * has an EMPTY set, and no order can be scoped to it at all. That is the right
+ * failure — the alternative is a cancel on a stranger's parcel.
  * ────────────────────────────────────────────────────────────────────────── */
 
 /** Not exported: an object with this key cannot be written outside this module. */
@@ -679,25 +889,84 @@ export interface ConversationOrderRef {
 }
 
 /**
+ * Order ids the 360 block names, read defensively.
+ *
+ * `InboxThread.customer` is `Record<string, unknown>` on purpose — module 03
+ * owns `customer360Out` and its redaction boundary, and pinning a narrow
+ * interface here would make every server-side addition a lockstep deploy. So
+ * this reads the shapes that block plausibly uses and IGNORES everything else:
+ * an unrecognised block contributes no ids, which leaves the ledger source as
+ * the only one and the mint refusing. Never the other way round.
+ */
+function orderIdsIn360(block: Record<string, unknown> | null): string[] {
+  if (!block) return [];
+  const ids: string[] = [];
+  for (const key of ["orders", "recentOrders", "openOrders"]) {
+    const list = block[key];
+    if (!Array.isArray(list)) continue;
+    for (const row of list) {
+      if (typeof row === "string" && row.trim()) ids.push(row.trim());
+      else if (row && typeof row === "object") {
+        const id = (row as Record<string, unknown>).id ?? (row as Record<string, unknown>).orderId;
+        if (typeof id === "string" && id.trim()) ids.push(id.trim());
+      }
+    }
+  }
+  return ids;
+}
+
+/**
+ * The dakio Order ids THIS conversation can be shown to own.
+ *
+ * Derived, never accepted — see the scoping block above for the two sources and
+ * why the caller is not one of them. Exported so a caller can ask what a thread
+ * owns (and so the suite can pin an empty set for an unlinked thread); it is
+ * not the guard, `conversationOrderRef` is.
+ */
+export async function conversationOrderIds(storeId: string, conversationId: string): Promise<string[]> {
+  const client = storeFor(storeId);
+  const ids = new Set<string>();
+
+  // 1. Orders this lane placed in this thread, off its own executed rows.
+  const rows = await client.listActions().catch(() => [] as ActionRecord[]);
+  for (const row of rows) {
+    if (row.type !== VERB || row.status !== "executed") continue;
+    if ((row.payload as Record<string, unknown> | null)?.conversationId !== conversationId) continue;
+    const undoId = (row.undoData as Record<string, unknown> | null)?.orderId;
+    const id = typeof undoId === "string" ? undoId : (row.targetRef?.replace(/^order:/, "") ?? "");
+    if (id) ids.add(id);
+  }
+
+  // 2. The server's own customer block for this thread.
+  const thread = await client.getInboxConversation(conversationId).catch(() => null);
+  for (const id of orderIdsIn360(thread?.customer ?? null)) ids.add(id);
+
+  return [...ids];
+}
+
+/**
  * The ONLY way to make one.
  *
- * `conversationOrderIds` must be the dakio Order ids this conversation's own
- * state holds — from the 360 block of `getInboxConversation(convId)`, or from
- * orders this lane itself placed in this thread. It must NEVER be assembled
- * from the customer's message text ("cancel order 1234") or from model output;
- * dakio-api scopes the cancel by tenant alone, so an id from either source is
- * a stranger's parcel destroyed on the word of someone who never bought it.
+ * The order set is derived from `conversationOrderIds(storeId, conversationId)`
+ * and cannot be supplied. An id that is not in it — one parsed out of customer
+ * free text ("cancel order 1234"), one emitted by a model, one belonging to
+ * another buyer — never becomes a ref, and every verb that mutates or joins on
+ * an order takes only a ref. dakio-api scopes those writes by TENANT alone, so
+ * this mint is the whole of the scoping.
  */
-export function conversationOrderRef(input: {
+export async function conversationOrderRef(input: {
+  storeId: string;
   conversationId: string;
   orderId: string;
-  conversationOrderIds: readonly string[];
-}): ConversationOrderRef {
+}): Promise<ConversationOrderRef> {
+  const storeId = input.storeId?.trim() ?? "";
   const conversationId = input.conversationId?.trim() ?? "";
   const orderId = input.orderId?.trim() ?? "";
+  if (!storeId) throw new Error("conversationOrderRef: storeId is required");
   if (!conversationId) throw new Error("conversationOrderRef: conversationId is required");
   if (!orderId) throw new Error("conversationOrderRef: orderId is required");
-  if (!input.conversationOrderIds?.includes(orderId)) {
+  const owned = await conversationOrderIds(storeId, conversationId);
+  if (!owned.includes(orderId)) {
     throw new Error(
       `conversationOrderRef: order ${orderId} is not one of conversation ${conversationId}'s own orders — ` +
         "a chat write may only touch an order this thread is known to own",
@@ -845,13 +1114,17 @@ function authorGateDecision(
   const isEscalation = authority.verdict === "refuse";
   const impact = action.receipt?.expectedImpact?.trim() ?? "";
   const ttl = TTL_HOURS[authority.riskClass] ?? 72;
+  // Masked HERE as well as at the row — the four strings below are the card
+  // itself, and `why` is the sentence the founder actually reads. Rows filed
+  // before the boundary existed still carry raw prose, and this is the surface
+  // that would re-render it.
   return {
     tag: shape.tag,
     kind: isEscalation ? "escalation" : "proposal",
-    impactLabel: impact ? (impact.length > 90 ? `${impact.slice(0, 87)}…` : impact) : "Impact not quantified",
-    title: action.title,
-    paramsLine: shape.paramsLine,
-    why: action.receipt?.reason ?? "No reason recorded",
+    impactLabel: founderFacing(impact ? (impact.length > 90 ? `${impact.slice(0, 87)}…` : impact) : "Impact not quantified"),
+    title: founderFacing(action.title),
+    paramsLine: founderFacing(shape.paramsLine),
+    why: founderFacing(action.receipt?.reason ?? "No reason recorded"),
     actionId: action.id,
     priority: isEscalation || authority.riskClass === "high" ? 1 : 5,
     surfacedIn: ["desk", `room:${shape.tag}`, `door:${shape.door}`],
@@ -919,8 +1192,12 @@ interface GateSpec {
   paramsLine: string;
   payload: Record<string, unknown>;
   receipt: GateReceiptInput;
-  /** FD-3 wording for the prepared tier — the honest thing to tell a customer. */
-  preparedDetail: string;
+  /**
+   * FD-3 wording for the prepared tier — the honest thing to tell a customer.
+   * Takes `delivered`: whether the founder's Decision card actually landed (see
+   * the block above `preparedDetail`).
+   */
+  preparedDetail: (delivered: boolean) => string;
   /**
    * How this verb resolves ITS OWN unfinished claim row (see `fileClaim`).
    * Only verbs that file claims supply one; for everyone else a prepared row
@@ -939,7 +1216,76 @@ type GateStep =
       rowEvidence: ReceiptEvidence[];
       title: string;
       paramsLine: string;
+      /**
+       * Answer from the row that OWNS the key, whatever status it is in.
+       *
+       * The execute path files its row AFTER its write, so the server can
+       * answer that filing with somebody else's row (`replayed`). When it does,
+       * this invocation's locally-minted values — its reserved coupon codes,
+       * its freshly-read `previousStatus` — are not what the ledger records and
+       * must not be what the side effect runs on. Handing the winning row back
+       * through the same resolution the pre-flight uses is what closes that.
+       */
+      settle: (row: ActionRecord) => Promise<SettledGateOutcome>;
     };
+
+/**
+ * The row that owns the key → the outcome, for every status it can be in.
+ *
+ * ONE resolution, two entry points: the pre-flight `findByKey` (before any
+ * write) and a filing the server answered with an existing row (after one).
+ * They must agree, because they are answering the same question — "what does
+ * the ledger already say about this key?" — and the second one is reached
+ * precisely when the first one raced.
+ */
+async function settleOwningRow(client: StoreClient, spec: GateSpec, row: ActionRecord): Promise<SettledGateOutcome> {
+  // Same key is not yet the same request — check WHICH request it was.
+  assertSameRequest(spec.verb, row, spec.payload);
+  if (row.status === "executed") {
+    return {
+      status: "executed",
+      actionId: row.id,
+      detail: row.outcome ?? "This was already done for this conversation.",
+      replayed: true,
+      record: row,
+    };
+  }
+  if (row.status === "prepared") {
+    // A prepared row carrying the claim marker is NOT a founder ask — it is a
+    // previous attempt that filed its row and then did or did not complete its
+    // write. Only the verb knows how to find out which.
+    if (isClaimRow(row)) {
+      if (!spec.onClaimReplay) {
+        throw new Error(
+          `${spec.verb}: ${String(spec.payload.novaActionId)} has an unfinished claim row (${row.id}) and this verb ` +
+            "files no claims — refusing to guess whether its write landed",
+        );
+      }
+      return spec.onClaimReplay(row);
+    }
+    // A genuine prepared row: make sure the founder can actually see it, and
+    // say only what looking proved.
+    const delivered = await healDecision(client, row, {
+      tag: spec.department,
+      door: spec.door,
+      paramsLine: spec.paramsLine,
+    });
+    return {
+      status: "prepared",
+      actionId: row.id,
+      detail: spec.preparedDetail(delivered),
+      rule: gateRuleOf(row) ?? "replay",
+      replayed: true,
+    };
+  }
+  // blocked | rejected | undone — settled, and the key is spent (see `findByKey`).
+  return {
+    status: "blocked",
+    actionId: row.id,
+    detail: settledDetail(row),
+    rule: gateRuleOf(row) ?? `replay:${row.status}`,
+  };
+}
 
 /**
  * Dedupe, judge, and file everything that is NOT an execution.
@@ -959,52 +1305,9 @@ async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep
   const key = String(spec.payload.novaActionId ?? "");
   if (!key) throw new Error(`${spec.verb}: payload.novaActionId is required — it is the at-most-once key`);
 
-  // At-most-once. Blocked rows deliberately do NOT dedupe (see `findByKey`).
+  // At-most-once, at ANY status the owning row can be in (see `findByKey`).
   const existing = await findByKey(client, spec.verb, key);
-  if (existing) {
-    // Same key is not yet the same request — check WHICH request it was.
-    assertSameRequest(spec.verb, existing, spec.payload);
-    if (existing.status === "executed") {
-      return {
-        proceed: false,
-        outcome: {
-          status: "executed",
-          actionId: existing.id,
-          detail: existing.outcome ?? "This was already done for this conversation.",
-          replayed: true,
-          record: existing,
-        },
-      };
-    }
-    // A prepared row carrying the claim marker is NOT a founder ask — it is a
-    // previous attempt that filed its row and then did or did not complete its
-    // write. Only the verb knows how to find out which.
-    if (isClaimRow(existing)) {
-      if (!spec.onClaimReplay) {
-        throw new Error(
-          `${spec.verb}: ${key} has an unfinished claim row (${existing.id}) and this verb files no claims — ` +
-            "refusing to guess whether its write landed",
-        );
-      }
-      return { proceed: false, outcome: await spec.onClaimReplay(existing) };
-    }
-    // A genuine prepared row: make sure the founder can actually see it.
-    await healDecision(client, existing, {
-      tag: spec.department,
-      door: spec.door,
-      paramsLine: maskPhonesIn(spec.paramsLine),
-    });
-    return {
-      proceed: false,
-      outcome: {
-        status: "prepared",
-        actionId: existing.id,
-        detail: spec.preparedDetail,
-        rule: gateRuleOf(existing) ?? "replay",
-        replayed: true,
-      },
-    };
-  }
+  if (existing) return { proceed: false, outcome: await settleOwningRow(client, spec, existing) };
 
   const authority = await evaluateAuthority(client, {
     type: spec.verb,
@@ -1014,12 +1317,11 @@ async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep
   });
 
   // The title and the params line outlive the card and are re-rendered in logs
-  // nobody re-audits. In nova-ai these strings are model-authored inside a tool
-  // whose payload structurally cannot hold a phone; here the turn composes them
-  // from state, so the masker runs once, in the one place every verb passes
-  // through. It is a floor, not a licence to put PII in a title.
-  const title = maskPhonesIn(spec.title);
-  const paramsLine = maskPhonesIn(spec.paramsLine);
+  // nobody re-audits. `fileRow` masks everything on its way to the store; these
+  // two are masked here as well because the card is authored from the local
+  // strings, not re-read off the row.
+  const title = founderFacing(spec.title);
+  const paramsLine = founderFacing(spec.paramsLine);
   const rowEvidence: ReceiptEvidence[] = [
     {
       source: "authority_gate",
@@ -1031,7 +1333,7 @@ async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep
   ];
 
   if (authority.verdict === "refuse") {
-    const record = await client.addAction({
+    const { record, replayed } = await fileRow(client, {
       type: spec.verb,
       department: spec.department,
       title,
@@ -1052,6 +1354,8 @@ async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep
       decidedAt: client.now(),
       executedAt: null,
     });
+    // Another attempt filed under this key between the read and the write.
+    if (replayed) return { proceed: false, outcome: await settleOwningRow(client, spec, record) };
     // Only escalation-flagged refusals become desk cards; an ordinary guardrail
     // trim files its row and stops, or the desk fills with noise.
     if (authority.escalation) {
@@ -1066,7 +1370,7 @@ async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep
   }
 
   if (authority.verdict === "draft" || authority.verdict === "suggest") {
-    const record = await client.addAction({
+    const { record, replayed } = await fileRow(client, {
       type: spec.verb,
       department: spec.department,
       title,
@@ -1087,23 +1391,36 @@ async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep
       decidedAt: null,
       executedAt: null,
     });
-    // Best-effort: a desk-card failure must not lose the work already done.
-    await client
+    // A second card for one row is worse than a late one — the replay path
+    // heals rather than files.
+    if (replayed) return { proceed: false, outcome: await settleOwningRow(client, spec, record) };
+    // Best-effort: a desk-card failure must not lose the work already done. But
+    // the customer line may not claim the shop has it when it does not — so
+    // whether it landed is CARRIED, not assumed.
+    const delivered = await client
       .addDecision(authorGateDecision(client, record, authority, { tag: spec.department, door: spec.door, paramsLine }))
-      .catch(() => {});
+      .then(() => true)
+      .catch(() => false);
     return {
       proceed: false,
       outcome: {
         status: "prepared",
         actionId: record.id,
-        detail: spec.preparedDetail,
+        detail: spec.preparedDetail(delivered),
         rule: authority.rule,
         replayed: false,
       },
     };
   }
 
-  return { proceed: true, authority, rowEvidence, title, paramsLine };
+  return {
+    proceed: true,
+    authority,
+    rowEvidence,
+    title,
+    paramsLine,
+    settle: (row) => settleOwningRow(client, spec, row),
+  };
 }
 
 /** Read a field back off a replayed executed row's `receipt.after`. */
@@ -1286,9 +1603,11 @@ export function discountParamsLine(p: ChatDiscountGatePayload): string {
 }
 
 /** FD-3 for a discount: being confirmed, never already theirs, and no code. */
-function discountPreparedDetail(): string {
+function discountPreparedDetail(delivered: boolean): string {
   return (
-    "The offer is with the shop to confirm — the owner signs off on every discount given in chat. " +
+    (delivered
+      ? "The offer is with the shop to confirm — the owner signs off on every discount given in chat. "
+      : "The owner signs off on every discount given in chat, and this offer has not reached them yet. ") +
     "There is no code yet; it is issued when they confirm."
   );
 }
@@ -1349,7 +1668,7 @@ export async function performOfferDiscount(
   // asks the store which of them exists (`resolveDiscountClaim`) instead of
   // guessing whether the write landed.
   const reservedCodes = Array.from({ length: CODE_MINT_ATTEMPTS }, () => mintChatDiscountCode());
-  const claim = await fileClaim(client, {
+  const { record: claim, replayed } = await fileClaim(client, {
     type: DISCOUNT_VERB,
     department: DISCOUNT_DEPARTMENT,
     title: step.title,
@@ -1396,6 +1715,24 @@ export async function performOfferDiscount(
     undoDeadline: null,
     undoneAt: null,
   });
+
+  // ── The claim was answered from a row that already owned the key ─────────
+  // TWO CONCURRENT REDELIVERIES ARE THE WHOLE REASON THIS BRANCH EXISTS. Both
+  // pass `findByKey` (neither row exists yet), both reserve their own three
+  // codes, and only one row lands. Minting from the LOSER's reserved codes
+  // creates a second live, single-use coupon for one negotiation that no ledger
+  // row names — its codes are not on the winning row's `undoData.codes`, so no
+  // replay can ever find it, and the server's once-per-N-days frequency guard
+  // does not catch it either (the winner minted first, and dakio-api's
+  // `createDiscount` sends a FRESH uuid Idempotency-Key per POST). The winning
+  // row's codes are the only ones this key is allowed to use, so resolve from
+  // it — exactly as the lost-finalize path does.
+  if (replayed) {
+    const settled = await step.settle(claim);
+    return settled.status === "executed"
+      ? executedDiscountOutcome(settled.actionId, settled.detail, settled.record, payload, true)
+      : settled;
+  }
 
   const discount = await mintReservedCoupon(client, payload, {
     codes: reservedCodes,
@@ -1539,22 +1876,20 @@ async function finalizeDiscount(
   });
 
   await client.attributeDoorRecord(`coupon:${discount.id}`, record.id).catch(() => {});
-  await client
-    .addActivity({
-      department: DISCOUNT_DEPARTMENT,
-      kind: "action",
-      title: record.title,
-      detail: outcome,
-      minutesSaved: 10,
-      // A coupon sells nothing by existing. The order it may help close claims
-      // its own revenue through `create_order_from_chat`; crediting both would
-      // count one sale twice.
-      revenueInfluence: 0,
-      actionId: record.id,
-      relatedId: payload.conversationId,
-      revenueBasis: "estimated",
-    })
-    .catch(() => {});
+  await fileActivity(client, {
+    department: DISCOUNT_DEPARTMENT,
+    kind: "action",
+    title: record.title,
+    detail: outcome,
+    minutesSaved: 10,
+    // A coupon sells nothing by existing. The order it may help close claims
+    // its own revenue through `create_order_from_chat`; crediting both would
+    // count one sale twice.
+    revenueInfluence: 0,
+    actionId: record.id,
+    relatedId: payload.conversationId,
+    revenueBasis: "estimated",
+  });
 
   return {
     status: "executed",
@@ -1744,9 +2079,11 @@ export function cancelParamsLine(p: CancelOrderGatePayload): string {
  *    unanswered Decision expires on its TTL. What is determined is that the
  *    request reached them; what they do with it is not.
  */
-function cancelPreparedDetail(): string {
+function cancelPreparedDetail(delivered: boolean): string {
   return (
-    "The cancellation request has gone to the shop for confirmation. " +
+    (delivered
+      ? "The cancellation request has gone to the shop for confirmation. "
+      : "The cancellation request is written down but has not reached the shop yet. ") +
     "The order is not cancelled yet, so it may still move until they answer."
   );
 }
@@ -1810,10 +2147,17 @@ export async function performCancelOrder(
   // row left the world at `cancelled`, and the next attempt read THAT as the
   // state to restore — an undo that restores 'cancelled' is an undo that does
   // nothing, and the founder's one way back was gone.
+  //
+  // THE READ ALONE IS NOT THE GUARANTEE — THE ROW IS. This value is read before
+  // `fileClaim`, and `fileClaim` can be answered by ANOTHER attempt's row whose
+  // write already landed; at that moment this local `previousStatus` says
+  // 'cancelled' and is exactly the corrupted snapshot the claim exists to
+  // prevent. So it is used only on the branch that actually filed this row —
+  // the replay branch below reads the winner's persisted `receipt.before`.
   const before = await client.getOrder(order.orderId);
   const previousStatus: OrderStatus = before?.status ?? "placed";
 
-  const claim = await fileClaim(client, {
+  const { record: claim, replayed } = await fileClaim(client, {
     type: CANCEL_VERB,
     department: CANCEL_DEPARTMENT,
     title: step.title,
@@ -1838,6 +2182,19 @@ export async function performCancelOrder(
     undoDeadline: null,
     undoneAt: null,
   });
+
+  // ── The claim was answered from a row that already owned the key ─────────
+  // BEFORE the write, deliberately. The winning row carries the status IT read
+  // before ITS write, on `receipt.before.status`; `resolveCancelClaim` restores
+  // from that and cancels only if the order is not already cancelled. Falling
+  // through to the write with the local `previousStatus` is precisely how a
+  // 'cancelled' snapshot gets stored as the state to restore.
+  if (replayed) {
+    const settled = await step.settle(claim);
+    return settled.status === "executed"
+      ? executedCancelOutcome(settled.actionId, settled.detail, settled.record, order.orderId, true)
+      : settled;
+  }
 
   await client.updateOrderDelivery(order.orderId, { status: "cancelled" });
   return finalizeCancel(client, claim, order, payload.reason, previousStatus);
@@ -1867,25 +2224,23 @@ async function finalizeCancel(
   });
 
   await client.attributeDoorRecord(`order:${order.orderId}`, record.id).catch(() => {});
-  await client
-    .addActivity({
-      // KNOWN, DELIBERATE ASYMMETRY, left as found: the ledger row's department
-      // is `sales`, while dakio-api's approve path files its ACTIVITY under
-      // `support`. The direct path writes the action's own department, so
-      // `sales` here keeps symmetry with `performCreateOrder` — the divergence
-      // is recorded rather than silently aligned.
-      department: CANCEL_DEPARTMENT,
-      kind: "action",
-      title: record.title,
-      detail: outcome,
-      minutesSaved: 6,
-      // A cancellation influences no revenue. Do NOT record the lost order
-      // total as negative revenue.
-      revenueInfluence: 0,
-      actionId: record.id,
-      relatedId: order.conversationId,
-    })
-    .catch(() => {});
+  await fileActivity(client, {
+    // KNOWN, DELIBERATE ASYMMETRY, left as found: the ledger row's department
+    // is `sales`, while dakio-api's approve path files its ACTIVITY under
+    // `support`. The direct path writes the action's own department, so
+    // `sales` here keeps symmetry with `performCreateOrder` — the divergence
+    // is recorded rather than silently aligned.
+    department: CANCEL_DEPARTMENT,
+    kind: "action",
+    title: record.title,
+    detail: outcome,
+    minutesSaved: 6,
+    // A cancellation influences no revenue. Do NOT record the lost order
+    // total as negative revenue.
+    revenueInfluence: 0,
+    actionId: record.id,
+    relatedId: order.conversationId,
+  });
 
   return {
     status: "executed",
@@ -2054,10 +2409,12 @@ export function contactParamsLine(p: UpdateContactGatePayload): string {
  * What is determined: the correction reached them, and if the area changed the
  * amount due at the door moves with it.
  */
-function contactPreparedDetail(): string {
+function contactPreparedDetail(delivered: boolean): string {
   return (
-    "The corrected delivery details have gone to the shop to confirm. " +
-    "Until they answer, the order still carries the old ones — and if the area changed, the amount due at the door changes with it."
+    (delivered
+      ? "The corrected delivery details have gone to the shop to confirm. Until they answer, "
+      : "The corrected delivery details are written down but have not reached the shop yet. Until they have them, ") +
+    "the order still carries the old ones — and if the area changed, the amount due at the door changes with it."
   );
 }
 
@@ -2137,7 +2494,7 @@ export async function performUpdateContact(
     (payload.district ? " The district changed, so the delivery charge and total were recalculated." : "") +
     " The confirmation was reset — re-confirm with the customer before it ships.";
 
-  const record = await client.addAction({
+  const { record, replayed } = await fileRow(client, {
     type: CONTACT_VERB,
     department: CONTACT_DEPARTMENT,
     title: step.title,
@@ -2166,19 +2523,32 @@ export async function performUpdateContact(
     executedAt: client.now(),
   });
 
+  // Another delivery owns the row; its own attribution and activity line have
+  // already been counted for this action id.
+  if (replayed) {
+    const settled = await step.settle(record);
+    if (settled.status !== "executed") return settled;
+    const after = afterOf(settled.record);
+    return {
+      status: "executed",
+      actionId: settled.actionId,
+      detail: settled.detail,
+      changed: Array.isArray(after.changed) ? (after.changed as ContactField[]) : changed,
+      replayed: true,
+    };
+  }
+
   await client.attributeDoorRecord(`order:${order.orderId}`, record.id).catch(() => {});
-  await client
-    .addActivity({
-      department: CONTACT_DEPARTMENT,
-      kind: "action",
-      title: step.title,
-      detail: `Changed ${changed.join(", ")}.`,
-      minutesSaved: 5,
-      revenueInfluence: 0,
-      actionId: record.id,
-      relatedId: order.conversationId,
-    })
-    .catch(() => {});
+  await fileActivity(client, {
+    department: CONTACT_DEPARTMENT,
+    kind: "action",
+    title: step.title,
+    detail: `Changed ${changed.join(", ")}.`,
+    minutesSaved: 5,
+    revenueInfluence: 0,
+    actionId: record.id,
+    relatedId: order.conversationId,
+  });
 
   return { status: "executed", actionId: record.id, detail: outcome, changed, replayed: false };
 }
@@ -2299,8 +2669,10 @@ export function caseParamsLine(p: OpenCaseGatePayload): string {
  * the executed tier is the only one that may speak about a room having it
  * (`joined` is server truth, and it exists only after the write returns).
  */
-function casePreparedDetail(): string {
-  return "The problem is written down and it has gone to the shop.";
+function casePreparedDetail(delivered: boolean): string {
+  return delivered
+    ? "The problem is written down and it has gone to the shop."
+    : "The problem is written down, but it has not reached the shop yet.";
 }
 
 export async function performOpenCase(
@@ -2559,8 +2931,10 @@ export function handoverParamsLine(p: HandoverGatePayload): string {
  * being handed to the shop" described a transfer in progress that had not
  * started.
  */
-function handoverPreparedDetail(): string {
-  return "The request to hand this thread over is waiting on the shop; it has not moved yet.";
+function handoverPreparedDetail(delivered: boolean): string {
+  return delivered
+    ? "The request to hand this thread over is waiting on the shop; it has not moved yet."
+    : "The request to hand this thread over has not reached the shop yet; nothing has moved.";
 }
 
 /**
@@ -2576,6 +2950,11 @@ function handoverPreparedDetail(): string {
  * The handover's line is reachable only through this table today (NEVER_GATED
  * means its prepared tier never fires), which is exactly why it is here: an
  * unreachable string is the one most likely to rot.
+ *
+ * Each takes `delivered` — whether the founder's Decision card actually landed
+ * — because the one claim every line makes is that the request reached the
+ * shop, and `addDecision` is best-effort. Both halves of each line are subject
+ * to the rule, and the suite runs the table over both.
  */
 export const PREPARED_DETAIL_BY_VERB = {
   create_order_from_chat: preparedDetail,
@@ -2584,7 +2963,7 @@ export const PREPARED_DETAIL_BY_VERB = {
   update_order_contact: contactPreparedDetail,
   open_case: casePreparedDetail,
   escalate_conversation: handoverPreparedDetail,
-} as const satisfies Record<string, () => string>;
+} as const satisfies Record<string, (delivered: boolean) => string>;
 
 export async function performFlagHandover(
   storeId: string,
