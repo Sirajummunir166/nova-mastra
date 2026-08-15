@@ -291,6 +291,18 @@ export type RouteOutcome =
       platform: string;
       instruction: TurnInstruction;
     }
+  /**
+   * Founder-plane work whose lane IS built: run `workflow`. The dispatcher owns
+   * the runner table — this file decides lanes and never runs one.
+   */
+  | {
+      lane: "founder_plane";
+      kind: JobKind;
+      department: NovaDepartment | null;
+      workflow: string;
+      /** Why a conversation-bound kind ended up here, when it did. */
+      fellThrough?: FounderPlanePlan["fellThrough"];
+    }
   /** Founder-plane work whose lane is not built yet — NOT a success. */
   | { lane: "not_built"; kind: JobKind; department: NovaDepartment | null; detail: string }
   /** There was genuinely nothing to do, and nothing went wrong. */
@@ -307,6 +319,24 @@ export async function routeJob(storeId: string, job: NovaJob): Promise<RouteOutc
   const plan = planJob(job);
 
   if (plan.lane === "founder_plane") {
+    // ── A BUILT LANE ROUTES ──────────────────────────────────────────────────
+    //
+    // The registry's `workflow` id is what says a lane exists (phase E unit 2
+    // gave `pulse` one). Routing it here does not RUN it: the dispatcher holds
+    // the runner table, so this file stays a pure decision that a test can
+    // assert on. A workflow id with no runner is still a loud failure — the
+    // dispatcher throws `lane_not_wired`, which is a different sentence aimed
+    // at whoever just built the lane.
+    if (plan.workflow) {
+      return {
+        lane: "founder_plane",
+        kind: plan.kind,
+        department: plan.department,
+        workflow: plan.workflow,
+        ...(plan.fellThrough ? { fellThrough: plan.fellThrough } : {}),
+      };
+    }
+
     // Deliberately NOT a fake success. A job that "succeeds" without doing
     // anything is worse than one that releases: the row goes `done`, the
     // founder's board says the pulse ran, and nobody ever finds out. Releasing
@@ -317,15 +347,11 @@ export async function routeJob(storeId: string, job: NovaJob): Promise<RouteOutc
         ? "case has no conversation (a webhook can open one on an order never discussed), so it is founder-plane work"
         : "follow-up carries neither a conversation nor a promise — malformed producer"
       : "cadenced/event lane, arrives in a later phase E unit";
-    // A registry lane that HAS a workflow id gets a different sentence, aimed
-    // at the person who just built it: the missing piece is the founder-plane
-    // runner here, not their lane. Without this they would read "not built"
-    // about a workflow they can see in the registry and go looking in the
-    // wrong file.
-    const detail = plan.workflow
-      ? `lane_not_wired:${plan.kind} — the registry declares workflow "${plan.workflow}", but this dispatcher ` +
-        `has no founder-plane runner yet; wire it into performJob (dispatcher.ts), the one run path`
-      : `lane_not_built:${plan.kind} — ${why}`;
+    // No workflow id in the registry, so there is nothing to route to. (The
+    // sibling case — a workflow id the dispatcher has no RUNNER for — is
+    // reported by the dispatcher as `lane_not_wired`, because from here the
+    // lane looks built and the missing half is over there.)
+    const detail = `lane_not_built:${plan.kind} — ${why}`;
     return { lane: "not_built", kind: plan.kind, department: plan.department, detail };
   }
 

@@ -217,17 +217,29 @@ test("case_update: a missing caseId throws, a missing conversation does NOT", ()
   assert.equal(threaded.mode, "case_update");
 });
 
-test("every founder-plane kind routes to a typed NOT-BUILT outcome naming the kind — never a fake success", async () => {
-  const founderKinds = BRAIN_LANES.map((l) => l.kind).filter(
-    (k) => k !== "inbox_reply" && k !== "followup" && k !== "case_update",
+test("every UNBUILT founder-plane kind routes to a typed NOT-BUILT outcome naming the kind — never a fake success", async () => {
+  const founderKinds = BRAIN_LANES.filter(
+    (l) => l.kind !== "inbox_reply" && l.kind !== "followup" && l.kind !== "case_update",
   );
   assert.ok(founderKinds.length >= 9, "the cadenced six plus the event lanes");
-  for (const kind of founderKinds) {
-    const outcome = await routeJob(STORE, job(kind));
-    assert.equal(outcome.lane, "not_built", `${kind} must not claim to have run`);
-    assert.ok(outcome.lane === "not_built" && outcome.detail.includes(kind), "the outcome names the kind");
+  // A lane with no `workflow` id in the registry is one nobody has built.
+  const unbuilt = founderKinds.filter((l) => !l.workflow);
+  assert.ok(unbuilt.length >= 8, "phase E has only built the pulse so far");
+  for (const lane of unbuilt) {
+    const outcome = await routeJob(STORE, job(lane.kind));
+    assert.equal(outcome.lane, "not_built", `${lane.kind} must not claim to have run`);
+    assert.ok(outcome.lane === "not_built" && outcome.detail.includes(lane.kind), "the outcome names the kind");
     assert.ok(outcome.lane === "not_built" && outcome.detail.startsWith("lane_not_built:"), "and says so in one grep-able token");
   }
+});
+
+test("a BUILT founder-plane lane routes to its workflow — the registry's id is what says it exists", async () => {
+  const outcome = await routeJob(STORE, job("pulse"));
+  assert.equal(outcome.lane, "founder_plane", "the pulse lane shipped in phase E unit 2");
+  assert.equal(outcome.lane === "founder_plane" && outcome.workflow, "brain-pulse");
+  assert.equal(outcome.lane === "founder_plane" && outcome.department, "ceo");
+  // Routing is a DECISION, not a run: nothing above touched the store or a
+  // model. The dispatcher owns the runner table.
 });
 
 // ---------------------------------------------------------------------------

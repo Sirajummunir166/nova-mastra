@@ -16,9 +16,10 @@
  *      waiting. Assert both rows were CLAIMED WITH A LEASE TOKEN (captured off
  *      the complete/release calls: the token, not the id, is the fence), and
  *      that each was settled TRUTHFULLY:
- *        · pulse        → RELEASED with `lane_not_built:pulse` (the lane arrives
- *                         in a later unit; a job that silently "succeeded" would
- *                         be worse than one that releases)
+ *        · pulse        → COMPLETED through the founder-plane runner (phase E
+ *                         unit 2 built the lane). The drill reads the model-call
+ *                         count off the tick report: on a store the pulse has
+ *                         seen before, a quiet hour is ZERO.
  *        · inbox_reply  → COMPLETED if a model credential is present, RELEASED
  *                         with the writer's own error if not. Both are honest;
  *                         a completed job whose turn produced nothing is not.
@@ -44,20 +45,13 @@ import pg from "pg";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-// ---- self-bootstrap under tsx (the src imports below are TypeScript) -------
-if (!process.env.SMOKE_DISPATCH_TSX) {
-  const probe = await import("../src/brain/dispatcher.js").catch(() => null);
-  if (!probe) {
-    const r = spawnSync(process.execPath, ["--import", "tsx", fileURLToPath(import.meta.url)], {
-      stdio: "inherit",
-      cwd: ROOT,
-      env: { ...process.env, SMOKE_DISPATCH_TSX: "1" },
-    });
-    process.exit(r.status ?? 1);
-  }
-}
-
-// ---- env (BEFORE importing src modules) ------------------------------------
+// ---- env FIRST, then the tsx bootstrap ------------------------------------
+//
+// ORDER MATTERS AND IT BIT US: several src modules capture `NOVA_PG_URL` at
+// MODULE LOAD (`brain/pulse-state.ts`, `front-office/context-store.ts`). The
+// bootstrap probe below imports src code, so a probe that ran before `.env` was
+// loaded would freeze those modules on the FILE backend — the drill would pass
+// while silently exercising the wrong half of the persistence seam.
 function loadEnv() {
   try {
     for (const line of readFileSync(join(ROOT, ".env"), "utf8").split("\n")) {
@@ -71,6 +65,20 @@ function loadEnv() {
 loadEnv();
 // The whole point of this drill: the REAL backend, the REAL lease contract.
 process.env.NOVA_STORE_BACKEND = "dakio";
+
+// ---- self-bootstrap under tsx (the src imports below are TypeScript) -------
+// Probes a module with NO env capture, so nothing is frozen before `loadEnv`.
+if (!process.env.SMOKE_DISPATCH_TSX) {
+  const probe = await import("../src/store/duties.js").catch(() => null);
+  if (!probe) {
+    const r = spawnSync(process.execPath, ["--import", "tsx", fileURLToPath(import.meta.url)], {
+      stdio: "inherit",
+      cwd: ROOT,
+      env: { ...process.env, SMOKE_DISPATCH_TSX: "1" },
+    });
+    process.exit(r.status ?? 1);
+  }
+}
 
 const STORE_ID = process.env.NOVA_DEV_STORE_ID;
 const DAKIO_URL = process.env.DAKIO_API_URL ?? "http://localhost:5001";
@@ -95,6 +103,7 @@ if (!STORE_ID) fail("NOVA_DEV_STORE_ID missing (run scripts/local-stack.sh first
 const { storeFor } = await import("../src/store/resolve.js");
 const { runDispatchTick } = await import("../src/brain/dispatcher.js");
 const { serviceTokenFor } = await import("../src/lib/service-token.js");
+const { resetPulseState } = await import("../src/brain/pulse-state.js");
 
 const STAMP = Date.now();
 const CONV_ID = `nova-dispatch-smoke-${STAMP}`;
@@ -161,6 +170,21 @@ async function cleanup() {
   await db.query(`DELETE FROM "InboxMessage" WHERE "conversationId" = $1`, [CONV_ID]).catch(() => {});
   await db.query(`DELETE FROM "InboxConversation" WHERE id = $1`, [CONV_ID]).catch(() => {});
   await db.query(`DELETE FROM "NovaRun" WHERE "tenantId" = $1 AND "sessionId" LIKE 'job:%' AND "startedAt" > now() - interval '10 minutes'`, [STORE_ID]).catch(() => {});
+  // The pulse lane now really runs during this drill, so its two side effects
+  // are cleaned up here too: the report it may file, and the delta-store row it
+  // writes (owned by nova-mastra, not dakio-api — see brain/pulse-state.ts).
+  await db.query(`DELETE FROM "NovaReport" WHERE "tenantId" = $1 AND kind = 'pulse' AND "createdAt" > now() - interval '10 minutes'`, [STORE_ID]).catch(() => {});
+  // The pulse drains unprocessed inbox events as plain bookkeeping (that is the
+  // point — it used to be model steps). Put back the ones this drill's pulse
+  // consumed, so a dev database is not quietly emptied by running a smoke test.
+  await db
+    .query(
+      `UPDATE "NovaInbox" SET "processedAt" = NULL
+        WHERE "tenantId" = $1 AND "processedAt" > now() - interval '10 minutes' AND "dedupeKey" <> $2`,
+      [STORE_ID, EVENT_DEDUPE],
+    )
+    .catch(() => {});
+  await resetPulseState(STORE_ID).catch(() => {});
 }
 
 try {
@@ -258,9 +282,13 @@ try {
 
   const pulse = tick1.jobs.find((j) => j.kind === "pulse");
   assert(pulse, "the pulse row was claimed");
-  assert(pulse.settled === "released", `the unbuilt pulse lane must RELEASE, not complete (got ${pulse.settled})`);
-  assert(/^lane_not_built:pulse/.test(pulse.error ?? ""), `and say so on the row: ${pulse.error}`);
-  ok("founder-plane pulse: released as lane_not_built — no lane, no fake success");
+  assert(pulse.lane === "founder_plane", `the pulse routes to the founder plane (got ${pulse.lane})`);
+  assert(
+    pulse.settled === "completed",
+    `the pulse lane is BUILT (phase E unit 2), so it runs and completes (got ${pulse.settled}: ${pulse.error})`,
+  );
+  assert(typeof pulse.modelCalls === "number", "and the tick report carries what it cost");
+  ok(`founder-plane pulse: ran through the lane runner and completed — ${pulse.modelCalls} model call(s)`);
 
   const reply = tick1.jobs.find((j) => j.kind === "inbox_reply");
   assert(reply, "the drain minted an inbox_reply row and the dispatcher claimed it");
@@ -287,9 +315,8 @@ try {
   // The rows agree with the report.
   const rows1 = await jobRows();
   const pulseRow = rows1.find((r) => r.id === pulse.jobId);
-  assert(pulseRow.status === "due" && pulseRow.attempts === 1, `released pulse is re-dued with one attempt spent (${pulseRow.status}/${pulseRow.attempts})`);
-  assert(new Date(pulseRow.dueAt).getTime() > Date.now(), "and it backs off rather than spinning");
-  ok("dakio-api's own row agrees: status due, attempts 1, dueAt backed off, lastError recorded");
+  assert(pulseRow.status === "done", `the completed pulse row is done (${pulseRow.status}/${pulseRow.attempts})`);
+  ok("dakio-api's own row agrees: the pulse job is done, not re-dued");
 
   const replyRow = rows1.find((r) => r.id === reply.jobId);
   assert(replyRow.payload?.conversationId === CONV_ID, "the server's drain wrote the conversationId the router keyed on (ids only)");

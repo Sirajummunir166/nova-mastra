@@ -111,6 +111,15 @@ const LANES: Record<JobKind, BrainLane | null> = {
       "inventory.stock_monitoring",
       "inventory.low_stock_alerts",
     ],
+    // Built in phase E unit 2 — `src/brain/pulse.ts`. Every one of the four
+    // duties above is a WATCHING duty, and that is not an accident of drafting:
+    // the pulse notices and reports, and every REMEDY it can propose (reorder,
+    // clearance, reprice, switch supplier, cart recovery) belongs to a duty
+    // this lane does not hold. Those surface as capability gaps on the result
+    // and in the report rather than being acted on. See the remedy table's
+    // header in pulse.ts, which cross-references each one to its lane or to
+    // its UNCLAIMED entry below.
+    workflow: "brain-pulse",
   },
 
   /** The face: ≤120 words on the founder's phone — what happened, what needs you, today's one move. */

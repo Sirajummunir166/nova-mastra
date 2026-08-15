@@ -24,6 +24,8 @@ import { runDispatchTick, turnCommittedAWrite } from "./dispatcher.js";
 import { storeFor, resetStores } from "../store/resolve.js";
 import { resetContext } from "../front-office/context-store.js";
 import { writerAgent } from "../front-office/agents.js";
+import { pulseJudgeAgent } from "./pulse.js";
+import { resetPulseState } from "./pulse-state.js";
 import type { JobKind, NovaJob, StoreSeed } from "../store/types.js";
 
 process.env.NOVA_STORE_BACKEND = "demo";
@@ -139,8 +141,11 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 test("a tenant's claim only ever sees its OWN jobs — one claim per tenant, per credential", async () => {
-  const a = enqueue(A, "pulse");
-  const b = enqueue(B, "pulse");
+  // `morning_report`: an UNBUILT lane, deliberately. This case is about which
+  // rows a claim can see, and an unbuilt lane settles without running anything
+  // — so the assertion cannot be coloured by what a built lane does.
+  const a = enqueue(A, "morning_report");
+  const b = enqueue(B, "morning_report");
 
   const report = await runDispatchTick(BOTH);
 
@@ -159,7 +164,7 @@ test("a thrown claim for one tenant never blocks another tenant's tick", async (
   const client = storeFor(A) as unknown as { claimDueJobs: () => Promise<NovaJob[]> };
   const saved = client.claimDueJobs;
   client.claimDueJobs = () => Promise.reject(new Error("dakio-api 503"));
-  const b = enqueue(B, "pulse");
+  const b = enqueue(B, "morning_report");
   try {
     const report = await runDispatchTick(BOTH);
     assert.equal(report.claimFailures, 1, "A's failure is counted, not thrown");
@@ -332,12 +337,44 @@ test("a server sweep that reaches the dispatcher is refused loudly — and WITHO
 });
 
 test("an unbuilt founder-plane lane releases, naming the kind — it never completes as if it ran", async () => {
-  const id = enqueue(A, "pulse");
+  // `morning_report`, not `pulse`: the pulse lane shipped in phase E unit 2 and
+  // now has a runner. The property under test is about lanes nobody has built,
+  // so it needs one of those.
+  const id = enqueue(A, "morning_report");
   const report = await runDispatchTick({ tenantIds: [A] });
 
   assert.equal(report.completed, 0, "a job that silently 'succeeds' without doing anything is worse than one that releases");
   assert.equal(report.jobs[0]!.lane, "not_built");
-  assert.match(row(A, id).lastError!, /^lane_not_built:pulse/);
+  assert.match(row(A, id).lastError!, /^lane_not_built:morning_report/);
+});
+
+test("a BUILT founder-plane lane runs and completes — and reports what it cost", async () => {
+  await resetPulseState(A); // no memory of a previous case's pulse
+  // The judge is stubbed for the same reason the writer is: this suite asserts
+  // what the DISPATCHER does with the outcome, not whether a model credential
+  // happens to be present.
+  const judge = pulseJudgeAgent as unknown as { generate: (...a: unknown[]) => unknown };
+  const savedJudge = judge.generate;
+  judge.generate = async () => ({
+    object: { worthWaking: true, headline: "Stock cover slipped", note: "Reorder the two that will run out." },
+  });
+  const id = enqueue(A, "pulse");
+  let report;
+  try {
+    report = await runDispatchTick({ tenantIds: [A] });
+  } finally {
+    judge.generate = savedJudge;
+  }
+
+  const job = report.jobs.find((j) => j.jobId === id);
+  assert.equal(job?.lane, "founder_plane");
+  assert.equal(job?.settled, "completed");
+  assert.equal(row(A, id).status, "done");
+  // The number phase E exists to move, carried on the tick report so it is an
+  // observed production fact rather than a claim in a doc. The demo store's
+  // first pulse has real findings, so this one is not zero — the ZERO case is
+  // pinned in pulse.eval.test.ts, which owns the pulse's own contract.
+  assert.equal(typeof job?.modelCalls, "number");
 });
 
 test("a guard-rail violation releases with the fault on the row", async () => {

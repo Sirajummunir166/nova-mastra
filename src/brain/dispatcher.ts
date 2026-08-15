@@ -87,6 +87,7 @@ import { customerPrincipal, tenantAppPrincipal, type NovaSessionContext } from "
 import { turnRunRecorder } from "./runs.js";
 import { planJob, routeJob, ServerSweepError, type JobPlan } from "./router.js";
 import { runInstructedTurn } from "../front-office/turn.js";
+import { runPulse } from "./pulse.js";
 
 /** Same as nova-ai. The server caps a claim at 50; 10 keeps a tick bounded. */
 export const JOBS_PER_TENANT_PER_TICK = 10;
@@ -165,7 +166,15 @@ export interface JobReport {
   jobId: string;
   kind: JobKind;
   /** `unleased`: nothing was planned at all, because the row arrived without its fence. */
-  lane: "customer_turn" | "not_built" | "none" | "routing_fault" | "unleased";
+  lane: "customer_turn" | "founder_plane" | "not_built" | "none" | "routing_fault" | "unleased";
+  /** Founder-plane lanes report what their run cost. 0 on a quiet pulse. */
+  modelCalls?: number;
+  /**
+   * A founder-plane lane that found nothing worth saying. Distinct from
+   * `silent` (the customer nudge contract) because they are different claims:
+   * one is "no message was owed", this one is "the business is fine".
+   */
+  quiet?: boolean;
   settled:
     | "completed"
     /** The work happened; the server said our lease had already been recovered. NOT a success. */
@@ -255,6 +264,53 @@ function sessionContextFor(
 }
 
 /**
+ * WHAT A FOUNDER-PLANE LANE REPORTS BACK.
+ *
+ * Deliberately tiny: the dispatcher settles job rows, it does not summarise
+ * business findings. `modelCalls` rides along because it is the number phase E
+ * exists to move, and a tick report that carries it makes "a quiet pulse costs
+ * nothing" an OBSERVED fact in production rather than a claim in a doc.
+ */
+interface FounderPlaneRun {
+  modelCalls: number;
+  /** Nothing worth telling the founder. The pulse's designed success. */
+  quiet: boolean;
+}
+
+/**
+ * The founder-plane runner table, keyed by the registry's workflow id.
+ *
+ * THE ONE RUN PATH for founder-plane work, exactly as `runInstructedTurn` is
+ * the one run path for customer work. A lane that is in `registry.ts` with a
+ * `workflow` id but absent here is a LOUD failure (`lane_not_wired`), never a
+ * quiet success — a job that completes without running is a row on the
+ * founder's board saying the pulse ran.
+ *
+ * The runners are called directly rather than through
+ * `mastra.getWorkflow(id).createRunAsync()`, for two reasons: the workflow
+ * module registry imports this file (a cycle), and the customer lane already
+ * sets the precedent — the workflow is the Studio surface over the function,
+ * and both call the same code.
+ *
+ * ⚠️ THE TEN-MINUTE LEASE APPLIES HERE TOO. A founder-plane lane that fans out
+ * past `LEASE_MINUTES` gets its complete silently no-op'd while the watchdog
+ * re-dues the row and another dispatcher re-runs it. The pulse is built to stay
+ * far inside that (one round of reads, one small model call per moved
+ * department); a lane that cannot be must bring its own re-lease story.
+ */
+const FOUNDER_PLANE_RUNNERS: Record<string, (storeId: string, job: NovaJob) => Promise<FounderPlaneRun>> = {
+  "brain-pulse": async (storeId, job) => {
+    const result = await runPulse(storeId, {
+      // The job row's dedupe key travels so a re-leased rerun re-files the SAME
+      // report row instead of a second one on the founder's dashboard.
+      dedupeKey: job.dedupeKey,
+      jobId: job.id,
+    });
+    return { modelCalls: result.modelCalls, quiet: result.quiet };
+  },
+};
+
+/**
  * Do one claimed job. Resolves with what happened; REJECTS when the job did not
  * happen, which is what the dispatcher's release arm keys on.
  *
@@ -313,6 +369,40 @@ async function performJob(
       // row with an error naming the missing lane; completing would put "done"
       // on a job nobody did, and the founder's board would say the pulse ran.
       throw new LaneNotBuiltError(outcome.kind, outcome.detail);
+    }
+
+    if (outcome.lane === "founder_plane") {
+      const run = FOUNDER_PLANE_RUNNERS[outcome.workflow];
+      if (!run) {
+        // The registry says this lane exists and the dispatcher cannot run it.
+        // Same settlement as an unbuilt lane (release, spend an attempt, put the
+        // reason on the row), different sentence: the missing half is HERE.
+        throw new LaneNotBuiltError(
+          outcome.kind,
+          `lane_not_wired:${outcome.kind} — the registry declares workflow "${outcome.workflow}", but this ` +
+            `dispatcher has no runner for it; add it to FOUNDER_PLANE_RUNNERS (dispatcher.ts), the one run path`,
+        );
+      }
+      // A throw here releases the row with the reason on it, which is right:
+      // founder-plane work writes through the same authority gate as everything
+      // else, so a lane that failed mid-run has either filed its rows or not —
+      // and every row it files is keyed at-most-once, so a retry re-files
+      // nothing. (The customer lane's `TurnCommittedError` problem does not
+      // arise: nothing here sends a message to a person.)
+      const founder = await run(storeId, job);
+      runs.completed({ turnId }, ctx);
+      return {
+        sessionId,
+        audit,
+        report: {
+          storeId,
+          jobId: job.id,
+          kind: job.kind,
+          lane: "founder_plane",
+          modelCalls: founder.modelCalls,
+          ...(founder.quiet ? { quiet: true } : {}),
+        },
+      };
     }
 
     if (outcome.lane === "none") {

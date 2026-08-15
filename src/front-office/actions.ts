@@ -1139,7 +1139,7 @@ const DOOR_BY_DEPARTMENT: Partial<Record<NovaDepartment, string>> = {
   marketing: "campaigns", // inferred — no ported verb lands here yet
 };
 
-function doorFor(department: NovaDepartment): string {
+export function doorFor(department: NovaDepartment): string {
   return DOOR_BY_DEPARTMENT[department] ?? "inbox";
 }
 
@@ -1229,10 +1229,19 @@ export type SettledGateOutcome =
   | { status: "prepared"; actionId: string; detail: string; rule: string; replayed: boolean }
   | { status: "blocked"; actionId: string; detail: string; rule: string };
 
-interface GateSpec {
+export interface GateSpec {
   verb: ActionRecord["type"];
   department: NovaDepartment;
   dutyRef: string;
+  /**
+   * Where this action was decided: `"chat"` (the default, and every verb in
+   * this file), `"job"` for a brain lane, `"founder"` for a founder-initiated
+   * one. RECORDED, NEVER TRUSTED FOR PERMISSION — `evaluateAuthority` takes it
+   * as an audit field and decides on level × mode × guardrails × duty, so a
+   * lane cannot widen its own authority by naming a different origin. It is
+   * parameterised only so a job-driven action does not file itself as chat.
+   */
+  origin?: string;
   /** Decision-card door, WITHOUT the `door:` prefix. */
   door: string;
   /** Founder-facing row + card title. Phones are masked before it is stored. */
@@ -1256,7 +1265,7 @@ interface GateSpec {
   onClaimReplay?: (claim: ActionRecord) => Promise<SettledGateOutcome>;
 }
 
-type GateStep =
+export type GateStep =
   | { proceed: false; outcome: SettledGateOutcome }
   | {
       proceed: true;
@@ -1355,7 +1364,7 @@ async function settleOwningRow(client: StoreClient, spec: GateSpec, row: ActionR
  * name their rule as `authority_gate` evidence, because 102 prepared rows that
  * did not cost a production diagnosis hours.
  */
-async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep> {
+export async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep> {
   const key = String(spec.payload.novaActionId ?? "");
   if (!key) throw new Error(`${spec.verb}: payload.novaActionId is required — it is the at-most-once key`);
 
@@ -1367,7 +1376,7 @@ async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep
     type: spec.verb,
     payload: spec.payload,
     dutyKey: spec.dutyRef,
-    origin: "chat",
+    origin: spec.origin ?? "chat",
   });
 
   // The title and the params line outlive the card and are re-rendered in logs
