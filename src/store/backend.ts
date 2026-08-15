@@ -96,6 +96,7 @@ import type {
 } from "./types.js";
 import type {
   StoreClient,
+  FiledAction,
   RunStartInput,
   RunFinishInput,
   CatalogPhotoPending,
@@ -368,6 +369,23 @@ export class DemoStore implements StoreClient {
    * read-back would be modelling the layer that does not hold.
    */
   private readonly chatOrders = new Map<string, ChatOrderResult>();
+
+  /**
+   * The IN-FLIGHT half of the same read-back.
+   *
+   * `chatOrders` is written after the order exists, so on its own it only
+   * dedupes calls that do not overlap — and the pricing/settings read in the
+   * middle of `createChatOrder` is an await, so two concurrent redeliveries
+   * both cleared the completed-map check and both created a parcel. dakio-api
+   * does its read-back on an INDEXED `Order.novaActionId` inside the same
+   * transaction that inserts, so the real server is at-most-once even under
+   * overlap; a demo that was not would let a redelivery race pass CI.
+   *
+   * Claimed SYNCHRONOUSLY (before the first await), and released on failure —
+   * a refused order was never created, so a later retry must be re-judged
+   * against live stock rather than handed the old refusal.
+   */
+  private readonly chatOrdersInFlight = new Map<string, Promise<ChatOrderResult>>();
 
   /**
    * NovaRun mirror (per-turn run audit) — keyed `${sessionId}|${turnId}`,
@@ -1211,7 +1229,47 @@ export class DemoStore implements StoreClient {
     return this.data.actions.find((a) => a.id === id) ?? null;
   }
 
-  async addAction(record: Omit<ActionRecord, "id" | "createdAt">): Promise<ActionRecord> {
+  /**
+   * The at-most-once key a row is filed under — dakio-api's
+   * `NovaAction.dedupeKey`, which the customer lane fills from
+   * `payload.novaActionId` (see `src/front-office/actions.ts`).
+   *
+   * Rows filed without one — every founder-lane verb, the seed — carry NO key
+   * and are never deduped, exactly as a NULL column is never covered by a
+   * unique index. That asymmetry is the server's, not a convenience: it is why
+   * `create_campaign` can be filed twice and `create_order_from_chat` cannot.
+   */
+  private static dedupeKeyOf(record: Pick<ActionRecord, "payload">): string | null {
+    const key = (record.payload as Record<string, unknown> | null)?.novaActionId;
+    return typeof key === "string" && key.trim().length > 0 ? key : null;
+  }
+
+  /**
+   * File an action — modelling dakio-api's `@@unique([tenantId, type, dedupeKey])`.
+   *
+   * THE FLOOR THIS EXISTS TO MODEL. A second filing under a key this ledger
+   * already owns does NOT insert: it ANSWERS with the row that owns the key,
+   * at whatever status that row is in, and says `replayed: true` so the caller
+   * can tell that answer from a fresh insert. Until this modelled the server,
+   * every `replayed` assertion in the customer-lane suite was vacuous — the
+   * demo pushed a new row for every call, so a redelivery could never produce
+   * the server's answer and the whole class of double-execution defects was
+   * untestable. One store per tenant here, so `(type, dedupeKey)` is already
+   * the tenant-scoped key.
+   *
+   * ANY STATUS OWNS THE KEY, including `blocked`/`rejected`/`undone`. A unique
+   * index does not consult a status column, and a caller that assumes only
+   * live rows dedupe will file fresh, be handed a dead row back, and report it
+   * as the row it just wrote.
+   */
+  async addAction(record: Omit<ActionRecord, "id" | "createdAt">): Promise<FiledAction> {
+    const key = DemoStore.dedupeKeyOf(record);
+    if (key) {
+      const owner = this.data.actions.find((a) => a.type === record.type && DemoStore.dedupeKeyOf(a) === key);
+      // A COPY, never the stored row: `replayed` describes THIS answer, not the
+      // row, and must not end up persisted on it.
+      if (owner) return { ...owner, replayed: true };
+    }
     const created: ActionRecord = {
       ...record,
       id: this.nextId("action"),
@@ -1223,7 +1281,7 @@ export class DemoStore implements StoreClient {
       created.undoDeadline = new Date(Date.parse(created.executedAt) + 24 * 3600 * 1000).toISOString();
     }
     this.data.actions.push(created);
-    return created;
+    return { ...created, replayed: false };
   }
 
   async updateAction(
@@ -2202,13 +2260,29 @@ export class DemoStore implements StoreClient {
     };
   }
 
-  async createChatOrder(input: ChatOrderRequest): Promise<ChatOrderResult> {
+  /**
+   * ONE ORDER, EVER, per novaActionId — the claim, taken before anything can
+   * yield. A redelivery that overlaps the first attempt joins it and is handed
+   * the SAME order; the customer holds one order number either way.
+   */
+  createChatOrder(input: ChatOrderRequest): Promise<ChatOrderResult> {
+    const done = this.chatOrders.get(input.novaActionId);
+    if (done) return Promise.resolve(done);
+    const inFlight = this.chatOrdersInFlight.get(input.novaActionId);
+    if (inFlight) return inFlight;
+    const run = this.placeChatOrder(input);
+    this.chatOrdersInFlight.set(input.novaActionId, run);
+    // A refusal (stock-out, coupon that does not hold) created nothing, so the
+    // key must not stay claimed by it.
+    run.catch(() => this.chatOrdersInFlight.delete(input.novaActionId));
+    return run;
+  }
+
+  private async placeChatOrder(input: ChatOrderRequest): Promise<ChatOrderResult> {
     const thread = this.inbox.get(input.sourceConversationId);
     if (!thread) throw new Error(`Conversation not found: ${input.sourceConversationId}`);
 
-    // ONE ORDER, EVER, per novaActionId — the read-back, before anything is
-    // priced. Replaying a decision must return the SAME order, not a second
-    // parcel: the customer is holding an order number from the first attempt.
+    // The completed read-back, re-checked inside the claim.
     const replay = this.chatOrders.get(input.novaActionId);
     if (replay) return replay;
 

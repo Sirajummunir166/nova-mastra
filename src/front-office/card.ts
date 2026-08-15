@@ -63,13 +63,29 @@ export function renderStateCard(ctx: NovaLiveContext, now = Date.now()): string 
   const missing = computeMissing(ctx);
   lines.push(`MISSING ${missing.length ? missing.join(", ") : "nothing"}`);
 
-  if (ctx.orders.length) {
-    lines.push(`ORDERS ${ctx.orders.map((o) => `#${o.no} ৳${o.total}`).join(" · ")}`);
-  }
+  // Placed orders, and the pending ones the shop has since CONFIRMED — the
+  // second list has an order number (when the row named one) but never a total:
+  // the approve path prices server-side and this card may not guess.
+  const confirmed = (ctx.pendingOrders ?? []).filter((o) => o.state === "placed");
+  const placed = [
+    ...ctx.orders.map((o) => `#${o.no} ৳${o.total}`),
+    ...confirmed.map((o) => (o.no ? `#${o.no} ${o.title}` : `${o.title} (confirmed, number pending)`)),
+  ];
+  if (placed.length) lines.push(`ORDERS ${placed.join(" · ")}`);
   // No number and no total on purpose — no order exists yet (FD-3: the shop
   // confirms each chat order; the card must not let a later turn invent one).
-  if (ctx.pendingOrders?.length) {
-    lines.push(`PENDING SHOP CONFIRM ${ctx.pendingOrders.map((o) => o.title).join(" · ")}`);
+  //
+  // ONLY THE ENTRIES STILL WAITING. The array is append-only by design (its
+  // length feeds the order key), so it also holds settled entries; rendering
+  // those here told the writer an answered card was still on the desk, which is
+  // exactly the sentence `ANSWER_ORDER_STATUS` then produced.
+  const waiting = (ctx.pendingOrders ?? []).filter((o) => (o.state ?? "pending") === "pending");
+  if (waiting.length) {
+    lines.push(`PENDING SHOP CONFIRM ${waiting.map((o) => o.title).join(" · ")}`);
+  }
+  const closed = (ctx.pendingOrders ?? []).filter((o) => o.state === "closed");
+  if (closed.length) {
+    lines.push(`CLOSED WITHOUT AN ORDER ${closed.map((o) => o.title).join(" · ")}`);
   }
   if (ctx.conversation.summary) lines.push(`MEMO ${ctx.conversation.summary}`);
 

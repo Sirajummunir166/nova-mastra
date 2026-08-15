@@ -172,8 +172,23 @@ export interface NovaLiveContext {
    * grow it), so old rows load byte-identically. The length also feeds the
    * `nm:<conv>:order-<n>` idempotency key so a SECOND product sold while the
    * first awaits approval mints a fresh key instead of deduping into the first.
+   *
+   * `state` is what the FOUNDER did with the card, reconciled from the action
+   * row on read (`reconcilePendingOrders` in turn.ts) — absent means the same
+   * as `pending`, so persisted rows written before this field load unchanged.
+   * Entries are never REMOVED once settled, and that is deliberate on two
+   * counts: this array's length is part of the order key (dropping a settled
+   * entry would re-mint a key the ledger already owns and replay it), and a
+   * rejected order is a fact about the conversation worth keeping.
    */
-  pendingOrders?: Array<{ actionId: string; title: string }>;
+  pendingOrders?: Array<{
+    actionId: string;
+    title: string;
+    /** `placed` = the shop approved it; `closed` = rejected, blocked or undone. */
+    state?: "pending" | "placed" | "closed";
+    /** The order number, once one exists. Only ever set alongside `placed`. */
+    no?: string;
+  }>;
 
   /** Observation cache backing store — raw payloads, timestamped. */
   toolLedger: ToolLedgerEntry[];

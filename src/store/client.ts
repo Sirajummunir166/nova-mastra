@@ -131,6 +131,30 @@ export class InboxSendRefused extends Error {
   }
 }
 
+/**
+ * What FILING an action answers with: the row that now owns the at-most-once
+ * key, plus whether the store answered from a row that ALREADY owned it instead
+ * of inserting the one just handed to it.
+ *
+ * dakio-api's `NovaAction` carries `@@unique([tenantId, type, dedupeKey])` and
+ * fills `dedupeKey` from `payload.novaActionId`, so a second POST under a key
+ * the tenant's ledger already owns returns that row rather than a second one.
+ * Without a discriminator the caller cannot tell that answer from a fresh
+ * insert, and every "and then do the side effect" that follows a filing runs
+ * twice on the same action id — a second live coupon, a doubled activity line,
+ * a `previousStatus` snapshot re-read after another attempt's write already
+ * landed.
+ *
+ * `replayed` is OPTIONAL on purpose. A dakio-api that predates the
+ * discriminator simply does not send the key, and "this server does not report
+ * replays" has to stay distinguishable from "this filing was a fresh insert" —
+ * the first is a server without the floor, the second is a fact. Callers
+ * therefore branch on `=== true` and read `undefined` as "not known to be a
+ * replay", which is the pre-discriminator behaviour: assuming a replay would
+ * SKIP a side effect that never happened, which is the worse of the two errors.
+ */
+export type FiledAction = ActionRecord & { replayed?: boolean };
+
 export interface StoreClient {
   /** Local clock read, ISO 8601. Not a request — safe to call without awaiting. */
   now(): string;
@@ -371,7 +395,7 @@ export interface StoreClient {
 
   listActions(status?: ActionStatus): Promise<ActionRecord[]>;
   getAction(id: string): Promise<ActionRecord | null>;
-  addAction(record: Omit<ActionRecord, "id" | "createdAt">): Promise<ActionRecord>;
+  addAction(record: Omit<ActionRecord, "id" | "createdAt">): Promise<FiledAction>;
   updateAction(
     id: string,
     patch: Partial<

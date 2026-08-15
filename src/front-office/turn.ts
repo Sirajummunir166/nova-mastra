@@ -35,6 +35,7 @@ import {
   type HandoverDepartment,
 } from "./actions.js";
 import { getStoreProfile } from "../lib/store.js";
+import { storeFor } from "../store/resolve.js";
 import { resolverAgent, resolverSchema, writerAgent, writerSystem } from "./agents.js";
 import { withGatewayRetry } from "../lib/gateway-retry.js";
 
@@ -112,11 +113,70 @@ export interface TurnResult {
  * a second time, because `nm:<conv>:handover` was constant for the life of the
  * conversation. The suffix is omitted at epoch 0, mirroring `fileFor()` in the
  * context store, so keys already in ledgers keep matching.
+ *
+ * ── ONE EPOCH, AND NO WAY TO PASS A SECOND ────────────────────────────────
+ *
+ * The first version of this fix moved both halves onto one helper and left the
+ * divergence where it started: `executeTurn` held TWO values that mean the same
+ * thing — its `epoch` parameter (the ingress's, used for the storage partition
+ * and reported on the result) and `ctx.epoch` (used to mint every key) — and
+ * nothing ever compared them. On top of that the helper read `ctx.epoch ?? 0`,
+ * so a context that reached a key function without the field minted the
+ * EPOCH-0 key in silence: the exact collision the epoch was added to prevent,
+ * on a rolled thread, replaying the previous session's row.
+ *
+ * Both holes are closed the same way. The key functions take the CONTEXT and
+ * nothing else — there is no overload, and no argument, through which a caller
+ * could offer a different epoch — and `epochOf` refuses a context that has no
+ * usable one rather than defaulting. `executeTurn` stamps the ingress epoch
+ * onto the context once, before any key can be minted, and reads `ctx.epoch`
+ * everywhere after that, so the function no longer holds a second copy.
  * ────────────────────────────────────────────────────────────────────────── */
 
+/**
+ * THE epoch a key is minted under. One field, one reader, no default.
+ *
+ * A context with no usable epoch is a storage bug, and the two ways of coping
+ * with it are not equal: minting the epoch-0 key REPLAYS another session's row
+ * (a customer who cannot order, a thread that can never reach a human twice),
+ * while refusing is one loud failed turn. It refuses.
+ */
+function epochOf(ctx: NovaLiveContext): number {
+  const epoch = ctx.epoch;
+  if (!Number.isInteger(epoch) || epoch < 0) {
+    throw new Error(
+      `nova key: conversation ${ctx.convId} has no usable session epoch (${String(epoch)}) — ` +
+        "an at-most-once key minted without one silently replays another session's row",
+    );
+  }
+  return epoch;
+}
+
 function epochSuffix(ctx: NovaLiveContext): string {
-  const epoch = ctx.epoch ?? 0;
+  const epoch = epochOf(ctx);
   return epoch > 0 ? `:e${epoch}` : "";
+}
+
+/**
+ * Bind the context to the epoch the ingress asked for, before any key exists.
+ *
+ * The epoch is part of the context store's PRIMARY KEY, so a context loaded for
+ * partition N is partition N's by construction and this is an assertion made
+ * true rather than a value chosen. A context that disagrees came from somewhere
+ * that cannot be reasoned about, and minting keys under either value would be a
+ * guess — so that is the one case that throws.
+ */
+function bindEpoch(ctx: NovaLiveContext, epoch: number): void {
+  if (ctx.epoch === undefined || ctx.epoch === null) {
+    ctx.epoch = epoch;
+    return;
+  }
+  if (ctx.epoch !== epoch) {
+    throw new Error(
+      `nova turn: conversation ${ctx.convId} was loaded for epoch ${epoch} but its state carries epoch ` +
+        `${String(ctx.epoch)} — the context store returned the wrong session partition`,
+    );
+  }
 }
 
 /**
@@ -168,11 +228,19 @@ async function executeTurn(
 
   await primeContext(storeId, convId, epoch);
   const ctx = loadContext(storeId, convId, "chat", epoch);
+  // From here on `ctx.epoch` is THE epoch — the parameter is not read again, so
+  // the two halves of the turn cannot mint keys under different ones.
+  bindEpoch(ctx, epoch);
   timings.stateLoadedMs = Date.now() - t0;
 
   const store = await getStoreProfile(storeId);
   if (!store) throw new Error(`store ${storeId} unavailable from dakio-api`);
   if (store.status !== "active") throw new Error(`store ${storeId} is not active`);
+
+  // Before anything reads the state: an order card the founder answered days
+  // ago is not "awaiting confirmation" any more, and this is the only moment
+  // anything looks (see `reconcilePendingOrders`).
+  await reconcilePendingOrders(ctx);
 
   pushMessage(ctx, { role: "customer", text: message, at: t0 });
 
@@ -210,7 +278,9 @@ async function executeTurn(
       cacheHits: ctx.toolLedger.length,
       version: ctx.version,
       mode,
-      epoch,
+      // `ctx.epoch`, not the parameter: one epoch per turn, and it is the one
+      // every key was minted under.
+      epoch: ctx.epoch,
       modelCalls,
     };
   }
@@ -344,7 +414,12 @@ async function executeTurn(
       if (gate.ok) {
         if (gate.orderNumber !== undefined && gate.total !== undefined) {
           order = { orderNumber: gate.orderNumber, total: gate.total };
-          facts = `Order #${gate.orderNumber} created — total ৳${gate.total} COD (product ৳${gate.subtotal} + delivery ৳${gate.shipping}).`;
+          facts = ORDER_FACTS.created({
+            orderNumber: gate.orderNumber,
+            total: gate.total,
+            subtotal: gate.subtotal,
+            shipping: gate.shipping,
+          });
         } else {
           // Replayed execution whose row predates the snapshot: the ledger's
           // own outcome line still names the order and the total.
@@ -440,11 +515,29 @@ async function executeTurn(
   }
 
   // ---- Reducer-derived stage + NBA persistence ------------------------------
+  //
+  // `escalated` IS THE HANDOVER LOCK, and only an executed handover may set it.
+  // The stage is read at the top of the next turn and returns an EMPTY reply
+  // for the rest of the epoch — correct when a person really has the thread,
+  // and a double failure otherwise. It used to be set for EVERY ESCALATE,
+  // including one the gate BLOCKED: the turn wrote down the exact claim its own
+  // wording carefully refuses to make ("the hand-off did not go through,
+  // promise NO person"), and then muted Nova for a customer nobody was handed —
+  // no card, no holding line, no answer, on a thread Nova was still supposed to
+  // be answering. Shadow lands here too, and for the same reason: a shadow turn
+  // hands nothing over, so a shadow thread that fell silent afterwards would
+  // record a conversation live never has.
   if (action === ("ORDER_CONFIRMED" as never) || action === ("ORDER_PENDING_APPROVAL" as never)) {
     ctx.conversation.stage = "ordered";
-  } else if (action === "ESCALATE") {
+  } else if (action === "ESCALATE" && handoverOutcome === "executed") {
     ctx.conversation.stage = "escalated";
     addMemo(ctx, `escalated: ${classified.intent}`);
+  } else if (action === "ESCALATE" && handoverOutcome === "blocked") {
+    // Nova still owns the thread and still owes an answer. The stage falls
+    // through to whatever the state supports, and the memo records that the
+    // hand-off was refused — never that it happened.
+    addMemo(ctx, `hand-off refused (${classified.intent}); Nova still on the thread`);
+    ctx.conversation.stage = computeStage(ctx);
   } else {
     if (ctx.conversation.stage === "ordered" || ctx.conversation.stage === "post_order") {
       // A new product interest re-opens the funnel.
@@ -507,11 +600,74 @@ async function executeTurn(
     cacheHits,
     version: ctx.version,
     mode,
-    epoch,
+    epoch: ctx.epoch,
     modelCalls,
     ...(wouldHaveDone ? { wouldHaveDone } : {}),
     ...(modelFailure ? { modelFailure } : {}),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Pending orders — reconciled against the ledger, never assumed
+// ---------------------------------------------------------------------------
+
+/**
+ * What the shop actually did with the cards this thread is waiting on.
+ *
+ * `ctx.pendingOrders` was APPEND-ONLY: `hardValidateAndCreate` pushed an entry
+ * when it filed a prepared row and nothing ever took one out or moved one on.
+ * The two readers both treat every entry as still awaiting the founder — the
+ * state card renders `PENDING SHOP CONFIRM`, and `ANSWER_ORDER_STATUS` tells
+ * the customer their order "is with the shop for confirmation" — so a card the
+ * founder REJECTED three days ago, or one that expired on its TTL, is reported
+ * as pending forever, and every later "where is my order?" gets the same false
+ * answer. The customer waits for an order that is never coming.
+ *
+ * A read is the only way to know, and this is the only place that reads. It is
+ * best-effort in the safe direction: an unreadable row stays pending (a
+ * transient store failure must not delete a real ask), and only a row that
+ * actually says otherwise moves an entry.
+ */
+async function reconcilePendingOrders(ctx: NovaLiveContext): Promise<void> {
+  const pending = ctx.pendingOrders;
+  if (!pending?.length) return;
+  const client = storeFor(ctx.storeId);
+  for (const entry of pending) {
+    if ((entry.state ?? "pending") !== "pending") continue;
+    const row = await client.getAction(entry.actionId).catch(() => null);
+    if (!row || row.status === "prepared") continue; // still on the desk, or unreadable
+    if (row.status === "executed") {
+      entry.state = "placed";
+      // The number if the row names one — direct-path rows carry it on
+      // `receipt.after`, approve-path rows on the undo payload. No total: the
+      // approve path prices server-side and nothing here may guess one.
+      const after = (row.receipt?.after ?? {}) as Record<string, unknown>;
+      const undo = (row.undoData ?? {}) as Record<string, unknown>;
+      const no = after.orderNumber ?? undo.orderNumber;
+      if (typeof no === "string" && no) entry.no = no;
+      addMemo(ctx, `shop confirmed: ${entry.title}${entry.no ? ` (${entry.no})` : ""}`);
+    } else {
+      // blocked | rejected | undone — whatever the reason, it is not waiting on
+      // anyone and no order stands from it.
+      entry.state = "closed";
+      addMemo(ctx, `order request closed without an order: ${entry.title}`);
+    }
+  }
+}
+
+/** Entries still genuinely awaiting the founder. */
+export function awaitingShopConfirm(ctx: NovaLiveContext): Array<{ actionId: string; title: string }> {
+  return (ctx.pendingOrders ?? []).filter((o) => (o.state ?? "pending") === "pending");
+}
+
+/** Entries the shop approved — real orders, named by number when one is known. */
+export function confirmedPendingOrders(ctx: NovaLiveContext): Array<{ title: string; no?: string }> {
+  return (ctx.pendingOrders ?? []).filter((o) => o.state === "placed");
+}
+
+/** Entries that ended without an order — rejected, blocked or undone. */
+export function closedPendingOrders(ctx: NovaLiveContext): Array<{ title: string }> {
+  return (ctx.pendingOrders ?? []).filter((o) => o.state === "closed");
 }
 
 // ---------------------------------------------------------------------------
@@ -623,7 +779,7 @@ async function hardValidateAndCreate(ctx: NovaLiveContext): Promise<GateResult> 
     // Founder-facing rule stays on the ledger row; the customer never hears it
     // (register discipline — locks and dials are the shop's own business).
     ctx.toolLedger.push({ tool: "create_order_from_chat", args: { productId: product.id, qty, gate: "blocked", rule: gate.rule }, raw: gate.detail, calledAt: Date.now(), ok: false });
-    return { ok: false, actionId: gate.actionId, reason: "the shop needs to handle this order directly", fallback: "ESCALATE" };
+    return { ok: false, actionId: gate.actionId, reason: ORDER_FACTS.blocked(), fallback: "ESCALATE" };
   }
 
   if (gate.status === "prepared") {
@@ -641,7 +797,7 @@ async function hardValidateAndCreate(ctx: NovaLiveContext): Promise<GateResult> 
       ok: false,
       pending: true,
       actionId: gate.actionId,
-      reason: `order request recorded (${product.name}${variant ? ` ${variant}` : ""} × ${qty}, COD ≈৳${estimate}) — the shop confirms it before dispatch`,
+      reason: ORDER_FACTS.pending({ productName: product.name, variant, qty, estimate }),
       fallback: "PRESENT_SUMMARY",
     };
   }
@@ -783,6 +939,42 @@ function factsCheckedFrom(ctx: NovaLiveContext): Array<{ source: string; note: s
 // ---------------------------------------------------------------------------
 
 /**
+ * The `facts` half of the writer instruction, in ONE table.
+ *
+ * These three strings are composed on the order path and handed to
+ * `buildActionLine`, which joins them into the prompt the writer words the
+ * customer's reply from — the same destination as every `ACTION:` line and
+ * every prepared-tier `detail`. They were composed inline, which meant the
+ * honesty suite could not see them: it ran over `PREPARED_DETAIL_BY_VERB` and
+ * `buildActionLine`, and the sentences that actually reach the writer alongside
+ * them were not enumerable anywhere. Same rule, same table, same test.
+ */
+export const ORDER_FACTS = {
+  /** Auto tier: the order exists and the server priced it. Figures are real. */
+  created(o: { orderNumber: string; total: number; subtotal?: number; shipping?: number }): string {
+    return `Order #${o.orderNumber} created — total ৳${o.total} COD (product ৳${o.subtotal} + delivery ৳${o.shipping}).`;
+  },
+  /**
+   * Approval tier. NO order number and NO final total — neither exists yet —
+   * and the estimate is named as one. "the shop confirms it before dispatch" is
+   * the determined fact; nothing here says they will.
+   */
+  pending(o: { productName: string; variant?: string; qty: number; estimate: number }): string {
+    return (
+      `order request recorded (${o.productName}${o.variant ? ` ${o.variant}` : ""} × ${o.qty}, ` +
+      `COD ≈৳${o.estimate}) — the shop confirms it before dispatch`
+    );
+  },
+  /**
+   * Gate BLOCK. The rule that fired is the shop's own business and stays on the
+   * ledger row; the customer hears only that a person is taking it.
+   */
+  blocked(): string {
+    return "the shop needs to handle this order directly";
+  },
+} as const;
+
+/**
  * The instruction the writer words the reply from — i.e. the last place this
  * lane decides what a customer is going to be told.
  *
@@ -884,12 +1076,32 @@ export function buildActionLine(
       bits.push("ask for delivery details in ONE natural ask: name if unknown, phone, full address with thana/district");
       break;
     case "ANSWER_ORDER_STATUS": {
-      const pending = ctx.pendingOrders ?? [];
-      if (ctx.orders.length) {
-        bits.push(`orders on file: ${ctx.orders.map((o) => `#${o.no}`).join(", ")} — status lookup not wired yet, be honest`);
-      } else if (pending.length) {
-        bits.push(`order (${pending.map((o) => o.title).join(", ")}) is with the shop for confirmation — normal flow, no order number yet, be honest`);
-      } else {
+      // Every branch reads the RECONCILED lists (`reconcilePendingOrders`).
+      // "is with the shop for confirmation" is a claim about a card that may
+      // have been answered days ago, and it used to be made for every entry
+      // this array had ever held.
+      const waiting = awaitingShopConfirm(ctx);
+      const confirmed = confirmedPendingOrders(ctx);
+      const closed = closedPendingOrders(ctx);
+      const placed = [
+        ...ctx.orders.map((o) => `#${o.no}`),
+        ...confirmed.map((o) => (o.no ? `#${o.no}` : o.title)),
+      ];
+      if (placed.length) {
+        bits.push(`orders on file: ${placed.join(", ")} — status lookup not wired yet, be honest`);
+      }
+      if (waiting.length) {
+        bits.push(
+          `order (${waiting.map((o) => o.title).join(", ")}) is with the shop for confirmation — normal flow, no order number yet, be honest`,
+        );
+      }
+      if (closed.length && !placed.length && !waiting.length) {
+        bits.push(
+          `the earlier request (${closed.map((o) => o.title).join(", ")}) is no longer with the shop and no order stands from it — ` +
+            "say that plainly, do not guess why, and offer to place it again",
+        );
+      }
+      if (!placed.length && !waiting.length && !closed.length) {
         bits.push("no order found in this conversation — ask for the order number");
       }
       break;
