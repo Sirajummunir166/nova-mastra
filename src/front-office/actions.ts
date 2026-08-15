@@ -62,9 +62,12 @@ import type {
   AuthorityDecision,
   ChatOrderResult,
   DecisionRecord,
+  NovaDepartment,
+  OrderStatus,
   ReceiptEvidence,
   RiskClass,
 } from "../store/types.js";
+import { maskPhonesIn } from "./state.js";
 
 /** The verb, the department and the duty are constants — a chat order is the
  *  sales room's work whatever the thread was about a turn ago. */
@@ -146,7 +149,7 @@ export async function performCreateOrder(
   // Blocked rows deliberately do NOT dedupe — the founder may lift a lock or
   // raise the dial, and a fresh attempt must be re-judged (nova-ai files a new
   // blocked row per attempt for the same reason).
-  const existing = await findByKey(client, payload.novaActionId);
+  const existing = await findByKey(client, VERB, payload.novaActionId);
   if (existing) {
     if (existing.status === "executed") {
       return {
@@ -376,13 +379,20 @@ function buildReceipt(
   };
 }
 
-/** Find the prepared/executed row this key already produced, if any. */
-async function findByKey(client: StoreClient, novaActionId: string): Promise<ActionRecord | null> {
+/**
+ * Find the prepared/executed row this key already produced, if any.
+ *
+ * BLOCKED rows deliberately never match: the founder may lift a lock or raise
+ * the dial, and the next attempt must be re-judged rather than answered from a
+ * refusal. Shared by every verb in this file — the dedupe rule is the same one
+ * whatever is being written.
+ */
+async function findByKey(client: StoreClient, type: string, novaActionId: string): Promise<ActionRecord | null> {
   const rows = await client.listActions();
   return (
     rows.find(
       (r) =>
-        r.type === VERB &&
+        r.type === type &&
         (r.status === "prepared" || r.status === "executed") &&
         (r.payload as Record<string, unknown> | null)?.novaActionId === novaActionId,
     ) ?? null
@@ -462,24 +472,286 @@ export function orderParamsLine(payload: ChatOrderGatePayload): string {
 function authorOrderDecision(
   client: StoreClient,
   action: ActionRecord,
-  authority: Pick<AuthorityDecision, "verdict" | "riskClass">,
-): Omit<
+  authority: GateVerdict,
+): DecisionInput {
+  return authorGateDecision(client, action, authority, {
+    tag: DEPARTMENT,
+    // The per-verb OVERRIDE nova-ai's `DOOR_BY_ACTION_TYPE` carries for exactly
+    // one verb. Every other verb in this file takes its door from the
+    // department (`DOOR_BY_DEPARTMENT`) — do not copy this line.
+    door: "orders",
+    paramsLine: orderParamsLine(action.payload as unknown as ChatOrderGatePayload),
+  });
+}
+
+/** What `client.addDecision` accepts — the store owns queue position and status. */
+type DecisionInput = Omit<
   DecisionRecord,
   "id" | "createdAt" | "queuePos" | "status" | "decidedBy" | "decidedAt" | "bundleRef" | "frozenByLock"
-> {
+>;
+
+/** The half of an `AuthorityDecision` the card is shaped from. */
+type GateVerdict = Pick<AuthorityDecision, "verdict" | "riskClass">;
+
+/**
+ * Department → door, nova-ai `DOOR_BY_DEPARTMENT`. Only the five rows the
+ * ported verbs can reach are pinned here; `marketing → campaigns` is inferred
+ * from the door registry (`duties.ts DOORS`) rather than copied, and is marked
+ * as such because no ported verb routes there today.
+ */
+const DOOR_BY_DEPARTMENT: Partial<Record<NovaDepartment, string>> = {
+  sales: "coupons",
+  support: "inbox",
+  shipping: "courier",
+  finance: "accounts",
+  inventory: "products",
+  marketing: "campaigns", // inferred — no ported verb lands here yet
+};
+
+function doorFor(department: NovaDepartment): string {
+  return DOOR_BY_DEPARTMENT[department] ?? "inbox";
+}
+
+/**
+ * Project a gated action into the Decision the founder answers.
+ *
+ * `kind` follows the VERDICT (a flagged refusal is an escalation, a draft is a
+ * proposal); the door is the department's unless the verb earned an override;
+ * the TTL is the risk class's. The impact label is the only field clipped —
+ * a params line is a verb's own business (a cancellation's reason, for one, is
+ * deliberately unabridged).
+ */
+function authorGateDecision(
+  client: StoreClient,
+  action: ActionRecord,
+  authority: GateVerdict,
+  shape: { tag: NovaDepartment; door: string; paramsLine: string },
+): DecisionInput {
   const isEscalation = authority.verdict === "refuse";
   const impact = action.receipt?.expectedImpact?.trim() ?? "";
   const ttl = TTL_HOURS[authority.riskClass] ?? 72;
   return {
-    tag: DEPARTMENT,
+    tag: shape.tag,
     kind: isEscalation ? "escalation" : "proposal",
     impactLabel: impact ? (impact.length > 90 ? `${impact.slice(0, 87)}…` : impact) : "Impact not quantified",
     title: action.title,
-    paramsLine: orderParamsLine(action.payload as unknown as ChatOrderGatePayload),
+    paramsLine: shape.paramsLine,
     why: action.receipt?.reason ?? "No reason recorded",
     actionId: action.id,
     priority: isEscalation || authority.riskClass === "high" ? 1 : 5,
-    surfacedIn: ["desk", `room:${DEPARTMENT}`, "door:orders"],
+    surfacedIn: ["desk", `room:${shape.tag}`, `door:${shape.door}`],
     expiresAt: new Date(Date.parse(client.now()) + ttl * 3600 * 1000).toISOString(),
   };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * The remaining customer-lane write verbs
+ *
+ * Five more verbs, each a lane-appropriate port of its nova-ai tool +
+ * executor pair, and each built on exactly the shape `performCreateOrder`
+ * established above: dedupe on the action key → `evaluateAuthority` → execute /
+ * prepare-with-a-Decision / block-with-an-escalation, every row receipted with
+ * `authority_gate` evidence naming the rule that decided it.
+ *
+ * ── What is DELIBERATELY absent, so nobody adds it back by reflex ──────────
+ *
+ *  - `defineTool` / `inputSchema` / `ctx`. nova-ai's customer plane is a
+ *    tool-calling agent; this lane is a deterministic pipeline (classify →
+ *    hydrate → NBA → gate → writer). There is no tool for the model to choose,
+ *    so every rule that lived in a tool DESCRIPTION ("decline first", "reach
+ *    for free delivery", "say the admin is confirming it") has to be a
+ *    precondition in `nba.ts`/`turn.ts` or a writer instruction — never a
+ *    comment claiming the model was told something.
+ *  - `scopedConversationId(ctx, …)`. nova-ai pins the thread off an eve
+ *    customer-session principal so a crafted `conversationId` cannot reach
+ *    another buyer's parcel or coupon. That seam was NOT ported (see
+ *    `src/store/inboxIntents.ts`), and faking it with a no-op would read as a
+ *    guard being present. The equivalent guarantee here is structural:
+ *    `conversationId` MUST be `ctx.convId` — supplied by the HMAC-verified
+ *    ingress as an argument of `runCustomerTurn(storeId, convId, …)` — and an
+ *    `orderId` MUST come from this conversation's own state, never from
+ *    customer free text and never from model output.
+ *  - `ExecutionContext.approvedActionId`. Nothing in this repo approves an
+ *    action (the founder approves inside dakio-api), so the direct path keys
+ *    every write on the deterministic `nm:<conv>:<verb>-<n>` id and says so
+ *    rather than modelling an approve lane that does not exist.
+ *  - An undo registry. There is no `undoers` map and no `performUndo` here;
+ *    `undoData` is filed as a WIRE payload for dakio-api's kind-keyed `UNDO`
+ *    map, and `undoDeadline` is left null for the backend to stamp.
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+/** Same shape for every verb: the turn authors the E-8 receipt, not a model. */
+export type GateReceiptInput = OrderReceiptInput;
+
+/** What a gated verb answers with once the gate has settled it. */
+export type SettledGateOutcome =
+  | { status: "executed"; actionId: string; detail: string; replayed: true; record: ActionRecord }
+  | { status: "prepared"; actionId: string; detail: string; rule: string; replayed: boolean }
+  | { status: "blocked"; actionId: string; detail: string; rule: string };
+
+interface GateSpec {
+  verb: ActionRecord["type"];
+  department: NovaDepartment;
+  dutyRef: string;
+  /** Decision-card door, WITHOUT the `door:` prefix. */
+  door: string;
+  /** Founder-facing row + card title. Phones are masked before it is stored. */
+  title: string;
+  /** The card's scannable line. Masked for the same reason. */
+  paramsLine: string;
+  payload: Record<string, unknown>;
+  receipt: GateReceiptInput;
+  /** FD-3 wording for the prepared tier — the honest thing to tell a customer. */
+  preparedDetail: string;
+}
+
+type GateStep =
+  | { proceed: false; outcome: SettledGateOutcome }
+  | { proceed: true; authority: AuthorityDecision; gateEvidence: ReceiptEvidence; title: string; paramsLine: string };
+
+/**
+ * Dedupe, judge, and file everything that is NOT an execution.
+ *
+ * The two non-executing branches are byte-for-byte the same argument for every
+ * verb — a refusal is a receipted event whose evidence is the rule that fired;
+ * a draft is the payload dakio-api's approve executor will read field by field
+ * — so they live here once instead of in five drifting copies. Each verb keeps
+ * what is genuinely its own: the title rule, the params line, the door, the
+ * duty, the department, and the whole execute path.
+ *
+ * The 2026-08-10 lesson is honoured on every branch: prepared and blocked rows
+ * name their rule as `authority_gate` evidence, because 102 prepared rows that
+ * did not cost a production diagnosis hours.
+ */
+async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep> {
+  const key = String(spec.payload.novaActionId ?? "");
+  if (!key) throw new Error(`${spec.verb}: payload.novaActionId is required — it is the at-most-once key`);
+
+  // At-most-once. Blocked rows deliberately do NOT dedupe (see `findByKey`).
+  const existing = await findByKey(client, spec.verb, key);
+  if (existing) {
+    if (existing.status === "executed") {
+      return {
+        proceed: false,
+        outcome: {
+          status: "executed",
+          actionId: existing.id,
+          detail: existing.outcome ?? "This was already done for this conversation.",
+          replayed: true,
+          record: existing,
+        },
+      };
+    }
+    return {
+      proceed: false,
+      outcome: {
+        status: "prepared",
+        actionId: existing.id,
+        detail: spec.preparedDetail,
+        rule: gateRuleOf(existing) ?? "replay",
+        replayed: true,
+      },
+    };
+  }
+
+  const authority = await evaluateAuthority(client, {
+    type: spec.verb,
+    payload: spec.payload,
+    dutyKey: spec.dutyRef,
+    origin: "chat",
+  });
+
+  // The title and the params line outlive the card and are re-rendered in logs
+  // nobody re-audits. In nova-ai these strings are model-authored inside a tool
+  // whose payload structurally cannot hold a phone; here the turn composes them
+  // from state, so the masker runs once, in the one place every verb passes
+  // through. It is a floor, not a licence to put PII in a title.
+  const title = maskPhonesIn(spec.title);
+  const paramsLine = maskPhonesIn(spec.paramsLine);
+  const gateEvidence: ReceiptEvidence = {
+    source: "authority_gate",
+    note: authority.explanation,
+    metric: "rule",
+    value: authority.rule,
+  };
+
+  if (authority.verdict === "refuse") {
+    const record = await client.addAction({
+      type: spec.verb,
+      department: spec.department,
+      title,
+      payload: spec.payload,
+      justification: justificationOf(spec.receipt),
+      receipt: buildReceipt(spec.receipt, null, null, [gateEvidence]),
+      riskClass: authority.riskClass,
+      status: "blocked",
+      outcome: authority.explanation,
+      undoable: false,
+      undoData: null,
+      actor: "nova",
+      targetRef: null,
+      agentId: null,
+      dutyRef: spec.dutyRef,
+      undoDeadline: null,
+      undoneAt: null,
+      decidedAt: client.now(),
+      executedAt: null,
+    });
+    // Only escalation-flagged refusals become desk cards; an ordinary guardrail
+    // trim files its row and stops, or the desk fills with noise.
+    if (authority.escalation) {
+      await client
+        .addDecision(authorGateDecision(client, record, authority, { tag: spec.department, door: spec.door, paramsLine }))
+        .catch(() => {});
+    }
+    return {
+      proceed: false,
+      outcome: { status: "blocked", actionId: record.id, detail: authority.explanation, rule: authority.rule },
+    };
+  }
+
+  if (authority.verdict === "draft" || authority.verdict === "suggest") {
+    const record = await client.addAction({
+      type: spec.verb,
+      department: spec.department,
+      title,
+      payload: spec.payload,
+      justification: justificationOf(spec.receipt),
+      receipt: buildReceipt(spec.receipt, null, null, [gateEvidence]),
+      riskClass: authority.riskClass,
+      status: "prepared",
+      outcome: authority.verdict === "suggest" ? "suggestion" : null,
+      undoable: false,
+      undoData: null,
+      actor: "nova",
+      targetRef: null,
+      agentId: null,
+      dutyRef: spec.dutyRef,
+      undoDeadline: null,
+      undoneAt: null,
+      decidedAt: null,
+      executedAt: null,
+    });
+    // Best-effort: a desk-card failure must not lose the work already done.
+    await client
+      .addDecision(authorGateDecision(client, record, authority, { tag: spec.department, door: spec.door, paramsLine }))
+      .catch(() => {});
+    return {
+      proceed: false,
+      outcome: {
+        status: "prepared",
+        actionId: record.id,
+        detail: spec.preparedDetail,
+        rule: authority.rule,
+        replayed: false,
+      },
+    };
+  }
+
+  return { proceed: true, authority, gateEvidence, title, paramsLine };
+}
+
+/** Read a field back off a replayed executed row's `receipt.after`. */
+function afterOf(record: ActionRecord): Record<string, unknown> {
+  return (record.receipt?.after ?? {}) as Record<string, unknown>;
 }
