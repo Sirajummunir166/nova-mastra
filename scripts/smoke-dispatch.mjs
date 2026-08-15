@@ -136,7 +136,7 @@ function watchSettles() {
 async function jobRows() {
   const { rows } = await db.query(
     `SELECT id, kind, status, attempts, "lastError", "dueAt", "leaseToken", "sessionId", payload
-       FROM "NovaJob" WHERE "tenantId" = $1 AND kind IN ('pulse', 'inbox_reply', 'followup')
+       FROM "NovaJob" WHERE "tenantId" = $1 AND kind IN ('pulse', 'inbox_reply', 'followup', 'restock_check')
       ORDER BY "createdAt" DESC LIMIT 20`,
     [STORE_ID],
   );
@@ -150,7 +150,18 @@ async function jobRows() {
  */
 let priorPulseDef = null;
 
+/** The `restock_wait` case this drill opens, so cleanup can remove it. */
+let restockCaseId = null;
+
 async function cleanup() {
+  // The event-lane drill's own rows: the job, the report the lane may have
+  // filed (keyed by the job's dedupeKey, which is how a re-leased rerun re-files
+  // the same row), and the case itself.
+  await db.query(`DELETE FROM "NovaJob" WHERE "tenantId" = $1 AND kind = 'restock_check' AND "dedupeKey" = $2`, [STORE_ID, `restock_check:${restockCaseId}`]).catch(() => {});
+  await db.query(`DELETE FROM "NovaReport" WHERE "tenantId" = $1 AND "dedupeKey" = $2`, [STORE_ID, `restock_check:${restockCaseId}`]).catch(() => {});
+  if (restockCaseId) {
+    await db.query(`DELETE FROM "NovaCase" WHERE "tenantId" = $1 AND id = $2`, [STORE_ID, restockCaseId]).catch(() => {});
+  }
   // The `* * * * *` def first — it is the one thing here that would keep
   // producing work after the drill exits.
   if (priorPulseDef) {
@@ -262,6 +273,55 @@ try {
   );
   ok("seeded a promise-backed follow-up whose promise was never on the ledger");
 
+  // (d) ONE OF THE TWO EVENT LANES, END TO END — `restock_check`.
+  //
+  //     The case is opened through the REAL service surface (the same
+  //     `POST /api/v1/inbox/cases` the front office calls), so the lane reads a
+  //     row dakio-api actually wrote — kind, department and the join key
+  //     included.
+  //
+  //     The JOB row is inserted directly, and that is not a shortcut around a
+  //     route: `mintRestockCheckJob` is the only producer and it is behind
+  //     `NOVA_RESTOCK_CHECK_PRODUCER`, which ships OFF and stays off until this
+  //     lane is proven — which is what this drill is for. The row below is
+  //     byte-shaped like the one that producer writes (same kind, priority,
+  //     dedupeKey and payload), so what runs here is what will run when the
+  //     flag flips.
+  // Stock lives on ProductVariant/Inventory in dakio-api, not on Product — the
+  // lane reads it through the store client, so the drill only needs an id.
+  const { rows: productRows } = await db.query(
+    `SELECT id, name FROM "Product" WHERE "tenantId" = $1 ORDER BY "createdAt" ASC LIMIT 1`,
+    [STORE_ID],
+  );
+  const product = productRows[0] ?? null;
+  const store = storeFor(STORE_ID);
+  const opened = await store.openCase({
+    kind: "restock_wait",
+    conversationId: CONV_ID,
+    ...(product ? { productId: product.id } : {}),
+    title: `Waiting for ${product?.name ?? "a product"} to come back`,
+    factsNote: "Dispatch smoke: customer asked when this comes back in stock.",
+  });
+  restockCaseId = opened.case.id;
+  await db.query(
+    `INSERT INTO "NovaJob" (id, "tenantId", kind, payload, "dueAt", priority, status, "dedupeKey", department)
+     VALUES ($1, $2, 'restock_check', $3::jsonb, now() - interval '1 minute', 5, 'due', $4, 'inventory')
+     ON CONFLICT ("tenantId", "dedupeKey") DO NOTHING`,
+    [
+      `job-restock-${STAMP}`,
+      STORE_ID,
+      JSON.stringify({
+        caseId: restockCaseId,
+        productId: product?.id ?? null,
+        conversationId: CONV_ID,
+        customerId: null,
+        triggeredBy: "case.opened",
+      }),
+      `restock_check:${restockCaseId}`,
+    ],
+  );
+  ok(`seeded a restock_wait case (${restockCaseId}) and the restock_check row its producer would mint`);
+
   // ---- 1. ONE tick --------------------------------------------------------
 
   watchSettles();
@@ -269,7 +329,10 @@ try {
   console.log(`\ntick 1 → ${JSON.stringify({ ...tick1, jobs: undefined })}`);
   for (const j of tick1.jobs) console.log(`   ${j.kind.padEnd(12)} ${j.lane.padEnd(14)} ${j.settled}${j.error ? ` — ${j.error.slice(0, 120)}` : ""}`);
 
-  assert(tick1.claimed >= 3, `expected the pulse, the inbox_reply and the follow-up to be claimed, got ${tick1.claimed}`);
+  assert(
+    tick1.claimed >= 4,
+    `expected the pulse, the inbox_reply, the follow-up and the restock_check to be claimed, got ${tick1.claimed}`,
+  );
   ok(`one tick claimed ${tick1.claimed} job(s) for one tenant, through that tenant's own service token`);
 
   // THE FENCE. Every settle call carried the token minted for THAT lease.
@@ -311,6 +374,35 @@ try {
       `; if this store holds 50+ open promises the pre-check deliberately fails safe to "still open")`,
   );
   ok("promise-backed follow-up with a settled debt: no turn at all, completed truthfully");
+
+  // ── The event lane, against the real stack ────────────────────────────────
+  //
+  // This is the half the two dark lanes never had: a row of one of their kinds,
+  // claimed and RUN, instead of released as `lane_not_built`. What it proves is
+  // narrow and load-bearing — the router sends the kind to a runner, the runner
+  // reads real dakio-api rows through the service token, and the answer lands
+  // where the customer's reply is composed from (the case), at zero model cost.
+  const restock = tick1.jobs.find((j) => j.kind === "restock_check");
+  assert(restock, "the restock_check row was claimed");
+  assert(
+    restock.lane === "founder_plane",
+    `restock_check routes to a BUILT founder-plane lane, not lane_not_built (got ${restock.lane}: ${restock.error})`,
+  );
+  assert(restock.settled === "completed", `and it completed (got ${restock.settled}: ${restock.error})`);
+  assert(restock.modelCalls === 0, `an honest supply answer costs nothing (got ${restock.modelCalls} model calls)`);
+  ok(`founder-plane restock_check: ran through the lane runner and completed — ${restock.modelCalls} model calls`);
+
+  // The answer is ON THE CASE, in facts, where `case_update` composes from.
+  const caseRow = await store.getCase(restockCaseId);
+  const supplyFacts = (caseRow?.facts ?? []).filter((f) => f.source === "nova:restock_check");
+  assert(supplyFacts.length === 1, `the supply position was written onto the case once (got ${supplyFacts.length})`);
+  const note = supplyFacts[0].note;
+  const onOrder = /units are on order/.test(note);
+  assert(
+    onOrder || !/\d{4}-\d{2}-\d{2}|next week/i.test(note),
+    `THE HONESTY FORK: nothing on order means NO date — got "${note}"`,
+  );
+  ok(`the supply position is on the case, and it ${onOrder ? "quotes a real purchase order" : "gives no date it could not check"}: "${note.slice(0, 110)}"`);
 
   // The rows agree with the report.
   const rows1 = await jobRows();

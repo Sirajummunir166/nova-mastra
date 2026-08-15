@@ -253,23 +253,42 @@ const LANES: Record<JobKind, BrainLane | null> = {
     duties: ["shipping.delivery_cases", "support.inbox_replies"],
   },
 
-  // ── Delivery & inventory: the two dark lanes (no producer today, doc 07 D) ──
+  // ── Delivery & inventory: the two event lanes, BUILT, producers still off ──
+  //
+  // Both were "dark" — a good prompt in nova-ai and nothing that could mint a
+  // row. dakio-api's `lib/novaLaneProducers.js` is the missing producer half,
+  // behind two flags that ship OFF precisely because these lanes did not exist.
+  // The lanes exist now (`brain/lanes/*`); flipping the flags is a separate,
+  // deliberate step, and until it happens these two entries describe machinery
+  // that is built and idle rather than promised and absent.
 
   /**
    * The founder's homework on a stuck parcel: last scan, dwell time, what the
    * customer was told, and THE ONE QUESTION to ask the courier — honest that
    * Dakio itself cannot reschedule a parcel.
    *
-   * DARK: nothing in either repo mints this row yet (spec §D wires it to
-   * `novaJourney.js`'s stagnation edge). It reads what `courierSync` already
-   * wrote; it does not re-poll — which is also why it claims `delay_chasing`
-   * (chasing what is late) and not `delay_prediction` (forecasting what will
-   * be).
+   * Minted on `novaJourney.js`'s stagnation EDGE (the night a parcel BECAME
+   * at_risk, once). It reads what `courierSync` already wrote; it does not
+   * re-poll — which is also why it claims `delay_chasing` (chasing what is
+   * late) and not `delay_prediction` (forecasting what will be).
+   *
+   * ⚠️ IT NO LONGER CLAIMS `shipping.delivery_cases`, and the removal is the
+   * honest half of building it. That claim was written when the lane was a
+   * sketch; the lane that shipped READS a case (its facts are half the
+   * homework) and writes to none. nova-ai's own executor patches the case when
+   * the founder APPROVES — dakio-api owns that half — and writing the flag onto
+   * a case at PROPOSE time would leave a fact saying Nova flagged it on a case
+   * whose card the founder then rejected, on a row whose facts get quoted back
+   * to customers. A duty claimed for work a lane does not do is the false
+   * promise this registry exists to prevent, so what is left is the one verb it
+   * files: `flag_courier_issue`, which `VERB_DUTIES` lets `shipping.delay_chasing`
+   * govern.
    */
   courier_intervention: {
     kind: "courier_intervention",
     department: "shipping",
-    duties: ["shipping.delay_chasing", "shipping.delivery_cases"],
+    duties: ["shipping.delay_chasing"],
+    workflow: "brain-courier-intervention",
   },
 
   /**
@@ -277,15 +296,27 @@ const LANES: Record<JobKind, BrainLane | null> = {
    * on order means "soon, and I'll tell you the moment it lands" — *"a date you
    * made up is a second disappointment."*
    *
-   * DARK: customers open `restock_wait` cases today and nothing listens (spec
-   * §D hooks it at `novaCase.js:487`). It READS stock and answers; the
-   * "three customers waiting = a restock decision" it raises is a decision
-   * card, not a drafted PO, so `inventory.reorder_drafts` stays with `night_ops`.
+   * Minted when a NEW `restock_wait` case opens (never on a join: one case is
+   * one restock question however many people ask). It READS stock and open
+   * purchase orders, writes that position onto the case in FACTS, and raises
+   * "three customers waiting = a restock decision" for the founder — a decision,
+   * not a drafted PO, so `inventory.reorder_drafts` stays with `night_ops` and
+   * appears on every such run as a capability gap.
+   *
+   * ⚠️ IT NO LONGER CLAIMS `support.inbox_replies`, for the reason the
+   * `inbox_reply` lane's comment gives from the other side: a lane that names a
+   * duty it never exercises hands the founder a toggle that LOOKS live and does
+   * nothing. This lane sends no message — telling the waiting customer is
+   * `case_update`'s work, on the customer's own thread, through the send gate
+   * where that duty really does apply. Its one write (the case fact) has no verb
+   * in `ActionType` and no duty on the roster at all, and the lane surfaces that
+   * as a `no_verb` capability gap every run rather than borrowing a neighbour.
    */
   restock_check: {
     kind: "restock_check",
     department: "inventory",
-    duties: ["inventory.stock_monitoring", "support.inbox_replies"],
+    duties: ["inventory.stock_monitoring"],
+    workflow: "brain-restock-check",
   },
 
   /**
