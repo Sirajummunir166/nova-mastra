@@ -379,7 +379,13 @@ export async function gatherParcel(
   const order = orderRead.ok ? orderRead.value : null;
   const status = statusRead.ok ? statusRead.value : null;
 
-  const courierId = status?.courierProvider ?? order?.courierId ?? null;
+  // THE BOOKING FIRST, THE GUESS SECOND. `bookedCourierType` comes off the
+  // consignment — the row that records who this parcel was actually handed to.
+  // `courierProvider` is a best-effort fallback (the dropship fulfillment's
+  // courier, else the tenant's DEFAULT courier), so on a store that recently
+  // switched couriers it names a company that never touched this parcel. Fine
+  // for a rough label; wrong on a card that tells a founder who to telephone.
+  const courierId = status?.bookedCourierType ?? status?.courierProvider ?? order?.courierId ?? null;
   const courierRead = courierId ? await readOr(() => client.getCourier(courierId)) : null;
   if (courierRead && !courierRead.ok) {
     blindSpots.push({ key: "read:courier", detail: `the courier row did not answer (${courierRead.reason})` });
@@ -426,11 +432,21 @@ export async function gatherParcel(
     }
   }
 
-  const trackingId = trim(status?.trackingCode ?? null, 64);
+  // THE COURIER'S ID, NOT THE CUSTOMER'S. `trackingCode` is derived from the
+  // order number so the customer's own tracking link shows it; the courier has
+  // never seen it. This card's reader is a founder dialling the courier, so the
+  // only id worth putting in front of them is the one on the consignment — and
+  // when there is no consignment the honest output is "none stored", not a
+  // confident string that wastes the call. (Found by the first live drill:
+  // the card said "read this out on the call" over `NOVA-STUCK-DRILL-MSUJR3VM`.)
+  const trackingId = trim(status?.courierTrackingId ?? null, 64);
   if (!trackingId) {
     blindSpots.push({
       key: "field:tracking",
-      detail: "no tracking id is stored for this parcel — the owner has nothing to read out on the call",
+      detail: status?.trackingCode
+        ? `no courier consignment is booked for this parcel — the owner has no courier tracking id to read out ` +
+          `(the customer-facing code ${status.trackingCode} is a Dakio order number and means nothing to the courier)`
+        : "no tracking id is stored for this parcel — the owner has nothing to read out on the call",
     });
   }
 
@@ -481,6 +497,10 @@ export async function gatherParcel(
     courier,
     openCase,
     told: readThread(thread),
+    // `courierId` already prefers the booking (see above), so `courier.name`
+    // here is the display name of the courier this parcel was actually given
+    // to. The chain then degrades from a name, to whatever identifier we have,
+    // to the honest floor — never to a courier we merely guessed.
     courierName: courier?.name ?? courierId ?? "the courier",
     trackingId,
     lastScan,

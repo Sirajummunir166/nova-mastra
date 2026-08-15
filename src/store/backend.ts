@@ -1954,6 +1954,12 @@ export class DemoStore implements StoreClient {
       confirmed: false,
       stuck: false,
       trackingCode: String(order.id).replace(/^#/, "").toUpperCase(),
+      // The demo store books no real consignments, so it has no courier-side
+      // id and no booked courier. Null is the truthful answer and it exercises
+      // the caller's null path — echoing `trackingCode` here would hide from
+      // every demo-backed test exactly the confusion that shipped once.
+      courierTrackingId: null,
+      bookedCourierType: null,
       openCase: openCase
         ? {
             id: openCase.id,

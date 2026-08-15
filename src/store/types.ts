@@ -1955,7 +1955,32 @@ export interface OrderStatusView {
   confirmed: boolean;
   /** The SERVER's verdict, off the same rule the nightly sweep uses. */
   stuck: boolean;
+  /**
+   * What the CUSTOMER tracks with — derived from the order number, the same
+   * transform the public tracking page applies, so Nova quotes a code the
+   * customer's own link actually shows. Always present.
+   *
+   * NOT the courier's id. See {@link OrderStatusView.courierTrackingId}.
+   */
   trackingCode: string;
+  /**
+   * What the COURIER knows the parcel by, from its consignment — `null` until
+   * one is booked, and `null` is a real answer that callers must handle.
+   *
+   * The distinction is not academic: `courier_intervention` once built a
+   * founder a card reading "read this out on the call" over `trackingCode`,
+   * i.e. over a Dakio order number that Steadfast has never seen. A caller
+   * whose reader is the courier wants this field; a caller whose reader is the
+   * customer wants the other one.
+   */
+  courierTrackingId: string | null;
+  /**
+   * The courier the parcel was actually booked with, from the consignment.
+   * `courierProvider` above is a best-effort guess (dropship fulfillment, else
+   * the tenant's default courier) and can name a courier this parcel was never
+   * given to; this one is what the booking says. `null` when unbooked.
+   */
+  bookedCourierType: string | null;
   openCase: { id: string; kind: string; status: string; latestFact: string | null } | null;
 }
 

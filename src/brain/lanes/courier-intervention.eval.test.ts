@@ -122,7 +122,15 @@ function stuckParcel(
     lastMovedAt: new Date(now - 5 * 24 * HOUR).toISOString(),
     confirmed: true,
     stuck: true,
-    trackingCode: "MER-7781-XZ",
+    // The two ids are DIFFERENT on purpose. `trackingCode` is the Dakio order
+    // number the customer's own tracking link shows; `courierTrackingId` is
+    // what Meridian knows the parcel by. Every assertion below that says "the
+    // owner reads this out" must land on the COURIER's one — the fixture used
+    // to carry only `trackingCode`, which is how the live card ended up telling
+    // a founder to read a Dakio order number to a courier.
+    trackingCode: "DAKIO-ORDER-4471",
+    courierTrackingId: "MER-7781-XZ",
+    bookedCourierType: "cour-meridian",
     openCase: null,
     ...overrides,
   };
