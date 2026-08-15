@@ -108,6 +108,8 @@ import { createHash } from "node:crypto";
 
 import { storeFor } from "../store/resolve.js";
 import { evaluateAuthority } from "../store/authority.js";
+import { dutyGovernsVerb, governingDuties, UNGOVERNED_VERBS } from "../store/duties.js";
+import { assertDutyInLane } from "../brain/registry.js";
 import type { StoreClient } from "../store/client.js";
 import type {
   ActionReceipt,
@@ -115,6 +117,7 @@ import type {
   AuthorityDecision,
   ChatOrderResult,
   DecisionRecord,
+  JobKind,
   NovaDepartment,
   OrderStatus,
   ReceiptEvidence,
@@ -127,6 +130,8 @@ import { maskPhonesIn } from "./state.js";
 const VERB = "create_order_from_chat" as const;
 const DEPARTMENT = "sales" as const;
 const DUTY_REF = "sales.inbox_orders" as const;
+/** A chat order is decided in a conversation, always. Recorded on every row. */
+const ORDER_ORIGIN = "chat" as const;
 
 /**
  * Byte-compatible with nova-ai's `createOrderFromChatPayload` (schemas.ts):
@@ -198,6 +203,14 @@ export async function performCreateOrder(
   const client = storeFor(storeId);
   const { payload, receipt } = request;
 
+  // THIS VERB DOES NOT GO THROUGH `gateOrFile` (it keeps its own copy of that
+  // seam, for the reasons in the block above `performCreateOrder`), so it makes
+  // the seam's own assertion itself. Without this line the one bound every lane
+  // is supposed to pass would have a hole in exactly the verb that spends a
+  // customer's money.
+  const gateSpec = { verb: VERB, dutyRef: DUTY_REF, lane: "front_office" } as const;
+  assertDutyBinding(gateSpec);
+
   // ── At-most-once: a redelivered key answers from the ledger. ─────────────
   // At ANY status the owning row can be in — a blocked/rejected/undone row owns
   // the key server-side just as hard as a live one (see `findByKey`).
@@ -208,7 +221,7 @@ export async function performCreateOrder(
     type: VERB,
     payload: payload as unknown as Record<string, unknown>,
     dutyKey: DUTY_REF,
-    origin: "chat",
+    origin: ORDER_ORIGIN,
   });
 
   // THE MASKER RUNS HERE TOO. The other five verbs get it from `gateOrFile`;
@@ -228,6 +241,9 @@ export async function performCreateOrder(
   };
   // The other half of at-most-once: WHICH request this key stands for.
   const keyEvidence = fingerprintEvidence(payload as unknown as Record<string, unknown>);
+  // And WHO decided it — recorded on the row, exactly as `gateOrFile` records
+  // it for the other five (see `originEvidence`).
+  const whoEvidence = originEvidence({ origin: ORDER_ORIGIN, lane: gateSpec.lane });
 
   if (authority.verdict === "refuse") {
     // A refusal is an explained, receipted event — its evidence is the rule
@@ -238,7 +254,7 @@ export async function performCreateOrder(
       title,
       payload: payload as unknown as Record<string, unknown>,
       justification: justificationOf(receipt),
-      receipt: buildReceipt(receipt, null, null, [gateEvidence, keyEvidence]),
+      receipt: buildReceipt(receipt, null, null, [gateEvidence, keyEvidence, whoEvidence]),
       riskClass: authority.riskClass,
       status: "blocked",
       outcome: authority.explanation,
@@ -273,7 +289,7 @@ export async function performCreateOrder(
       title,
       payload: payload as unknown as Record<string, unknown>,
       justification: justificationOf(receipt),
-      receipt: buildReceipt(receipt, null, null, [gateEvidence, keyEvidence]),
+      receipt: buildReceipt(receipt, null, null, [gateEvidence, keyEvidence, whoEvidence]),
       riskClass: authority.riskClass,
       status: "prepared",
       outcome: authority.verdict === "suggest" ? "suggestion" : null,
@@ -351,7 +367,7 @@ export async function performCreateOrder(
         customerId: order.customerId,
         trackingUrl: order.trackingUrl,
       },
-      [gateEvidence, keyEvidence],
+      [gateEvidence, keyEvidence, whoEvidence],
     ),
     riskClass: authority.riskClass,
     status: "executed",
@@ -714,6 +730,35 @@ function fingerprintEvidence(payload: Record<string, unknown>): ReceiptEvidence 
     note: "fingerprint of the payload this at-most-once key was filed for",
     metric: "payload_fingerprint",
     value: payloadFingerprint(payload),
+  };
+}
+
+/**
+ * WHO DECIDED THIS, on the row, in the founder's own receipt.
+ *
+ * `ActionRecord` has no `origin` column and this repo does not own the ledger
+ * schema, so the origin is recorded where every other cross-cutting fact about
+ * a filing already lives: as receipt evidence. It costs one line, it survives
+ * `maskReceipt` (there is nothing to mask), and it is the difference between
+ * "Nova did this while a customer was typing" and "Nova did this at 03:00 on
+ * its own clock" — which is the first question anyone asks of a row they did
+ * not expect. `originOf` reads it back.
+ *
+ * If dakio-api ever grows a real `origin` column, this evidence line is what
+ * backfills it; until then it is the record, and the comment that used to
+ * promise one without writing anything is gone.
+ */
+function originEvidence(spec: Pick<GateSpec, "origin" | "lane">): ReceiptEvidence {
+  return {
+    source: ORIGIN_SOURCE,
+    note:
+      spec.origin === "job"
+        ? `decided by the "${spec.lane}" job lane on Nova's own clock, not in a conversation`
+        : spec.origin === "founder"
+          ? "decided by the founder, and performed on their behalf"
+          : `decided in a customer conversation (lane "${spec.lane}")`,
+    metric: ORIGIN_SOURCE,
+    value: spec.origin,
   };
 }
 
@@ -1223,6 +1268,85 @@ function authorGateDecision(
 /** Same shape for every verb: the turn authors the E-8 receipt, not a model. */
 export type GateReceiptInput = OrderReceiptInput;
 
+/**
+ * Where an action was decided. Three places, and the ledger records which.
+ *
+ * `chat` — a customer turn. `job` — a brain lane on the clock. `founder` — the
+ * founder asked for it themselves.
+ */
+export type ActionOrigin = "chat" | "job" | "founder";
+
+/** The receipt-evidence `source` under which the origin is recorded. */
+export const ORIGIN_SOURCE = "origin";
+
+/** The origin recorded on a row, or null if the row predates the stamp. */
+export function originOf(record: ActionRecord): string | null {
+  const hit = record.receipt?.evidence?.find((e) => e.source === ORIGIN_SOURCE && e.metric === ORIGIN_SOURCE);
+  return typeof hit?.value === "string" ? hit.value : null;
+}
+
+/**
+ * Thrown when a filing presents a duty that does not govern its verb, or a duty
+ * outside the filing lane's own remit.
+ *
+ * A THROW rather than a filed refusal, and the distinction is deliberate. Every
+ * other refusal in this system is a judgement about a tenant's state — a level,
+ * a mode, a lock, a paused duty — and the founder is told which rule fired. This
+ * one is not reachable by any tenant configuration: it means the CODE presented
+ * a pair that does not exist in the roster's own vocabulary. Filing it as a
+ * blocked row would put a sentence on the founder's ledger about an act Nova was
+ * never coherently asked to perform, and would let a wiring bug go on shipping
+ * quietly at one row per hour. Same reasoning `registry.ts` gives for
+ * `assertDutyInLane` throwing: "a programming error at the seam between a
+ * workflow and the gate, not a runtime condition to branch on".
+ *
+ * What it shares with `evaluateAuthority`'s `duty:unknown` refusal is the thing
+ * that matters: it fires 100% of the time, at every tier, before anything is
+ * judged, spent or written.
+ */
+export class DutyBindingError extends Error {
+  constructor(
+    readonly verb: string,
+    readonly dutyRef: string,
+    readonly lane: JobKind | "front_office",
+    message: string,
+  ) {
+    super(message);
+    this.name = "DutyBindingError";
+  }
+}
+
+/**
+ * ASSERTION #1 OF THE SEAM: the verb↔duty bound, then the lane bound.
+ *
+ * Called by `gateOrFile` (and by `performCreateOrder`, which keeps its own copy
+ * of that seam) BEFORE `evaluateAuthority`, because the duty key is an INPUT to
+ * the judgement — it picks the door, the minimum level and the pause switch —
+ * so judging first and checking after would be judging under the wrong law.
+ */
+export function assertDutyBinding(spec: Pick<GateSpec, "verb" | "dutyRef" | "lane">): void {
+  if (!dutyGovernsVerb(spec.verb, spec.dutyRef)) {
+    const governing = governingDuties(spec.verb);
+    const ungoverned = UNGOVERNED_VERBS[spec.verb];
+    throw new DutyBindingError(
+      spec.verb,
+      spec.dutyRef,
+      spec.lane,
+      ungoverned
+        ? `[nova:gate] "${spec.verb}" is governed by NO duty on Nova's roster, so it may not be filed under ` +
+            `"${spec.dutyRef}" or any other key. ${ungoverned} Add a duty to src/store/duties.ts (roster edit, ` +
+            `reviewed, mirrored to dakio-api's NovaDuty seed) — do not attach the verb to a neighbouring duty.`
+        : `[nova:gate] "${spec.dutyRef}" does not govern "${spec.verb}". That duty decides the door, the ` +
+            `minimum level and the founder's pause switch, so filing this verb under it would judge the act ` +
+            `under another duty's law and attribute it to another duty on the ledger. Governing duties for ` +
+            `"${spec.verb}": [${governing.join(", ")}].`,
+    );
+  }
+  // The front office is not a job kind; its bound is the binding above plus the
+  // fixed per-verb `*_DUTY_REF` constants in this file.
+  if (spec.lane !== "front_office") assertDutyInLane(spec.lane, spec.dutyRef);
+}
+
 /** What a gated verb answers with once the gate has settled it. */
 export type SettledGateOutcome =
   | { status: "executed"; actionId: string; detail: string; replayed: true; record: ActionRecord }
@@ -1232,16 +1356,39 @@ export type SettledGateOutcome =
 export interface GateSpec {
   verb: ActionRecord["type"];
   department: NovaDepartment;
+  /**
+   * The duty this act is performed under. It must be one of the duty keys that
+   * GOVERN this verb (`VERB_DUTIES` in store/duties.ts) — see
+   * {@link assertDutyBinding}, which refuses the pair before the gate is even
+   * consulted. The duty is not decoration: it selects the door (⇒ the mode
+   * ceiling), the minimum level and the founder's pause switch.
+   */
   dutyRef: string;
   /**
-   * Where this action was decided: `"chat"` (the default, and every verb in
-   * this file), `"job"` for a brain lane, `"founder"` for a founder-initiated
-   * one. RECORDED, NEVER TRUSTED FOR PERMISSION — `evaluateAuthority` takes it
-   * as an audit field and decides on level × mode × guardrails × duty, so a
-   * lane cannot widen its own authority by naming a different origin. It is
-   * parameterised only so a job-driven action does not file itself as chat.
+   * Which lane is filing. A brain lane names its `JobKind` and may only act
+   * under a duty ITS OWN lane claims (`assertDutyInLane`, registry.ts assertion
+   * #3 — enforced here, at the seam, rather than by every lane remembering to
+   * call it); `"front_office"` is the chat lane, which is not a job kind and is
+   * bounded by the verb↔duty binding alone.
+   *
+   * Required on purpose: an optional lane defaults to somebody's guess, and the
+   * whole point of the bound is that a caller cannot decline to be bounded.
    */
-  origin?: string;
+  lane: JobKind | "front_office";
+  /**
+   * Where this action was decided: `"chat"` (every verb in this file), `"job"`
+   * for a brain lane, `"founder"` for a founder-initiated one.
+   *
+   * RECORDED, NEVER TRUSTED FOR PERMISSION. `evaluateAuthority` takes it as an
+   * audit field and decides on level × mode × guardrails × duty, so a lane
+   * cannot widen its own authority by naming a different origin. The RECORDED
+   * half is real: `gateOrFile` stamps it as `origin` receipt evidence on every
+   * row it files (and hands it to the execute path in `rowEvidence`), so a
+   * job-driven row and a chat-driven row are distinguishable on the ledger by
+   * a founder and an auditor. It is a fixed union rather than a free string
+   * because there are exactly three places an action can come from.
+   */
+  origin: ActionOrigin;
   /** Decision-card door, WITHOUT the `door:` prefix. */
   door: string;
   /** Founder-facing row + card title. Phones are masked before it is stored. */
@@ -1363,8 +1510,22 @@ async function settleOwningRow(client: StoreClient, spec: GateSpec, row: ActionR
  * The 2026-08-10 lesson is honoured on every branch: prepared and blocked rows
  * name their rule as `authority_gate` evidence, because 102 prepared rows that
  * did not cost a production diagnosis hours.
+ *
+ * THE TWO BOUNDS THIS SEAM OWNS, and it owns them because it is the ONE place
+ * every lane passes through (see {@link assertDutyBinding}):
+ *
+ *   1. the verb may only be filed under a duty that GOVERNS it, so a caller
+ *      cannot pick a lower minLevel, a friendlier door or an unpaused switch by
+ *      naming a different key;
+ *   2. a brain lane may only act under a duty its own lane claims — registry.ts
+ *      assertion #3, enforced HERE rather than re-implemented inline by each
+ *      lane that remembers to.
  */
 export async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep> {
+  // BEFORE the dedupe read and before the judgement: an incoherent pair is not
+  // a request that should reach the ledger or the gate at all.
+  assertDutyBinding(spec);
+
   const key = String(spec.payload.novaActionId ?? "");
   if (!key) throw new Error(`${spec.verb}: payload.novaActionId is required — it is the at-most-once key`);
 
@@ -1376,7 +1537,12 @@ export async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<G
     type: spec.verb,
     payload: spec.payload,
     dutyKey: spec.dutyRef,
-    origin: spec.origin ?? "chat",
+    // Handed over as an audit field only — the judgement below reads level ×
+    // mode × guardrails × duty and never this. It is RECORDED on the row by
+    // `originEvidence` a few lines down, which is the half that has to be true
+    // for the sentence "a job-driven action does not file itself as chat" to
+    // mean anything on the ledger.
+    origin: spec.origin,
   });
 
   // The title and the params line outlive the card and are re-rendered in logs
@@ -1393,6 +1559,7 @@ export async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<G
       value: authority.rule,
     },
     fingerprintEvidence(spec.payload),
+    originEvidence(spec),
   ];
 
   if (authority.verdict === "refuse") {
@@ -1483,6 +1650,91 @@ export async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<G
     title,
     paramsLine,
     settle: (row) => settleOwningRow(client, spec, row),
+  };
+}
+
+/**
+ * AUTHORIZED, AND NOTHING RAN — filed, not shrugged.
+ *
+ * The gate said Nova may do this alone and the caller has no executor for the
+ * verb (every founder-plane verb, on this side: dakio-api owns those executors).
+ * There are three ways to answer that and only one of them is honest:
+ *
+ *  - execute it anyway ⇒ a second write path outside the gate's own verbs;
+ *  - drop it with a `console.warn` ⇒ what the pulse used to do. No ledger row,
+ *    so nothing records that Nova was authorized and did not act, and the whole
+ *    replay/claim protocol the gated verbs are built around (`step.settle`,
+ *    `rowEvidence`, the masked title and params line) is thrown away at exactly
+ *    the seam a future author is invited to fill;
+ *  - FILE THE FACT. A `prepared` row carrying the gate's own evidence, the
+ *    reason there is no executor, and a Decision card so the founder can do in
+ *    one tap the thing Nova was allowed to do and could not.
+ *
+ * `prepared` is the right status because it is true: the artifact is complete
+ * and nothing has been performed. It is not `blocked` — nothing refused it, and
+ * a blocked row would send a reader hunting for a guardrail that never fired.
+ *
+ * Every idempotency guarantee of the draft path is kept, because this IS the
+ * draft path's filing: a replay resolves through `settle`, so a re-leased rerun
+ * answers from the row that owns the key instead of filing a second one.
+ */
+export async function fileAuthorizedUnexecuted(
+  client: StoreClient,
+  spec: GateSpec,
+  step: Extract<GateStep, { proceed: true }>,
+  /** Why nothing ran, in one founder-readable sentence. */
+  reason: string,
+): Promise<SettledGateOutcome> {
+  const { record, replayed } = await fileRow(client, {
+    type: spec.verb,
+    department: spec.department,
+    title: step.title,
+    payload: spec.payload,
+    justification: justificationOf(spec.receipt),
+    receipt: buildReceipt(spec.receipt, null, null, [
+      ...step.rowEvidence,
+      {
+        source: "executor",
+        note: reason,
+        metric: "missing_executor",
+        value: spec.verb,
+      },
+    ]),
+    riskClass: step.authority.riskClass,
+    status: "prepared",
+    outcome: reason,
+    undoable: false,
+    undoData: null,
+    actor: "nova",
+    targetRef: null,
+    agentId: null,
+    dutyRef: spec.dutyRef,
+    undoDeadline: null,
+    undoneAt: null,
+    decidedAt: null,
+    executedAt: null,
+  });
+  if (replayed) return step.settle(record);
+  const delivered = await client
+    .addDecision(
+      authorGateDecision(client, record, step.authority, {
+        tag: spec.department,
+        door: spec.door,
+        paramsLine: step.paramsLine,
+      }),
+    )
+    .then(() => true)
+    .catch(() => false);
+  return {
+    status: "prepared",
+    actionId: record.id,
+    detail: spec.preparedDetail(delivered),
+    // The rule the gate ACTUALLY gave (`level:acting_ceo`, say) — not a rule
+    // invented here. What stopped the act was the missing executor, and that is
+    // on the row as its outcome and as `executor` evidence, where a reader can
+    // tell the two apart.
+    rule: step.authority.rule,
+    replayed: false,
   };
 }
 
@@ -1689,6 +1941,9 @@ export async function performOfferDiscount(
     verb: DISCOUNT_VERB,
     department: DISCOUNT_DEPARTMENT,
     dutyRef: DISCOUNT_DUTY_REF,
+    // The chat lane, and the origin the ledger records for every one of its rows.
+    lane: "front_office",
+    origin: "chat",
     // NOT `door:orders` — `offer_chat_discount` is deliberately absent from
     // nova-ai's per-verb door override map: a coupon in the Coupons door is
     // where it belongs.
@@ -2202,6 +2457,9 @@ export async function performCancelOrder(
     verb: CANCEL_VERB,
     department: CANCEL_DEPARTMENT,
     dutyRef: CANCEL_DUTY_REF,
+    // The chat lane, and the origin the ledger records for every one of its rows.
+    lane: "front_office",
+    origin: "chat",
     // DEVIATION FROM nova-ai, recorded rather than silent: its
     // `DOOR_BY_ACTION_TYPE` has only `create_order_from_chat`, so a cancel would
     // fall through to `DOOR_BY_DEPARTMENT.sales` = Coupons. A cancellation card
@@ -2546,6 +2804,9 @@ export async function performUpdateContact(
     verb: CONTACT_VERB,
     department: CONTACT_DEPARTMENT,
     dutyRef: CONTACT_DUTY_REF,
+    // The chat lane, and the origin the ledger records for every one of its rows.
+    lane: "front_office",
+    origin: "chat",
     // Parity with nova-ai: no per-verb override exists, so the door comes from
     // the department — `shipping → courier`. Do NOT copy the order path's
     // hardcoded `door:orders`; that string is an override the order verb earned
@@ -2831,6 +3092,9 @@ export async function performOpenCase(
     verb: CASE_VERB,
     department,
     dutyRef: CASE_DUTY_REF,
+    // The chat lane, and the origin the ledger records for every one of its rows.
+    lane: "front_office",
+    origin: "chat",
     // Computed from the DERIVED department, not hardcoded: shipping → courier,
     // finance → accounts, support → inbox, inventory → products.
     door: doorFor(department),
@@ -3144,6 +3408,9 @@ export async function performFlagHandover(
     verb: HANDOVER_VERB,
     department: payload.department,
     dutyRef: HANDOVER_DUTY_REF,
+    // The chat lane, and the origin the ledger records for every one of its rows.
+    lane: "front_office",
+    origin: "chat",
     // Only reached on a BLOCKED handover (the execute path authors no local
     // card). Department's own door, per `DOOR_BY_DEPARTMENT`.
     door: doorFor(payload.department),

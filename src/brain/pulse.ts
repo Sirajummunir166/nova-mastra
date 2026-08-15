@@ -51,6 +51,19 @@
  * exercised (see `pulse.eval.test.ts`), because the day a duty moves into this
  * lane is the wrong day to discover the act path was never written.
  *
+ * A REMEDY NAMES A VERB **AND** THE DUTY IT IS PERFORMED UNDER, and the second
+ * one is not a free choice. The authority seam reads the duty key to pick the
+ * door, the minimum level and the founder's pause switch, so a table that could
+ * choose both could have any verb judged under any duty's law — and this one
+ * did: the reprice remedy filed `update_price` under `finance.expense_flagging`,
+ * a duty registry.ts's own gap list had already ruled "not close enough". The
+ * legitimate pairs now live in `VERB_DUTIES` (store/duties.ts), derived from the
+ * tools' own `dutyRef` declarations and the roster, and `gateOrFile` refuses any
+ * other pair before it judges anything. One consequence is worth stating up
+ * front rather than discovering in a report: `update_price` is governed by NO
+ * duty on the founder's roster, so the margin remedy is not "out of lane" — it
+ * is a ROSTER gap, and it says so.
+ *
  * ── BOOKKEEPING IS CODE NOW ─────────────────────────────────────────────────
  *
  * nova-ai's pulse spent model steps calling `mark_event_processed` on each
@@ -66,22 +79,24 @@ import { Agent } from "@mastra/core/agent";
 import { gateway } from "@ai-sdk/gateway";
 import { z } from "zod";
 
-import { doorFor, gateOrFile, type GateReceiptInput } from "../front-office/actions.js";
+import {
+  doorFor,
+  fileAuthorizedUnexecuted,
+  gateOrFile,
+  type GateReceiptInput,
+  type GateSpec,
+} from "../front-office/actions.js";
 import { senseStore, senseFailures, SENSE_GAPS, type StoreSense } from "../lib/snapshot.js";
 import { storeFor } from "../store/resolve.js";
+import { UNGOVERNED_VERBS } from "../store/duties.js";
 import type { StoreClient } from "../store/client.js";
-import type { ActionType, NovaDepartment } from "../store/types.js";
+import type { ActionType, JobKind, NovaDepartment } from "../store/types.js";
 import { laneFor } from "./registry.js";
 import { comparePulse, nextSnapshot, type PulseFinding } from "./pulse-compare.js";
 import { loadPulseState, savePulseState } from "./pulse-state.js";
 
 /** This lane's kind — every registry lookup below is keyed on it. */
 const KIND = "pulse" as const;
-
-/** The duty keys `registry.ts` binds this lane to. The runtime capability bound. */
-function laneDuties(): readonly string[] {
-  return laneFor(KIND)?.duties ?? [];
-}
 
 // ---------------------------------------------------------------------------
 // DECIDE — the only model in the lane
@@ -192,8 +207,16 @@ const judgeWithModel: DecideFn = async ({ card }) => {
 /** A proposed corrective action for one finding. */
 export interface Remedy {
   type: ActionType;
-  /** The duty this act would be performed under. Checked against the lane. */
-  dutyKey: string;
+  /**
+   * The duty this act would be performed under — and it must be one of the
+   * duties that GOVERN the verb (`VERB_DUTIES` in store/duties.ts), not a key
+   * chosen for how it would be judged.
+   *
+   * `null` means the verb is governed by NO duty on the founder's roster. That
+   * is not a licence to file it under the nearest neighbour; it is a capability
+   * gap of its own kind, and {@link settleFinding} surfaces it as one.
+   */
+  dutyKey: string | null;
   department: NovaDepartment;
   title: string;
   paramsLine: string;
@@ -204,24 +227,43 @@ export type RemedyFn = (finding: PulseFinding, sense: StoreSense) => Remedy | nu
 
 /**
  * THE PRODUCTION REMEDY TABLE — and every entry in it is out of this lane's
- * duties today. That is the finding, not a bug in the table.
+ * reach today. That is the finding, not a bug in the table.
  *
- * Each remedy names the verb that would fix the thing and the duty that verb
- * belongs to. `settleFinding` then checks that duty against the registry, and
- * because none of them is in the pulse's lane, all of them surface as
- * {@link CapabilityGap}s. Cross-referenced with `registry.ts`:
+ * ── WHAT THIS TABLE MAY NOT DO, AND USED TO ────────────────────────────────
  *
- *  · reorder      → `inventory.reorder_drafts`, held by `night_ops`.
- *  · clearance    → `inventory.dead_stock_clearance`, in UNCLAIMED
- *                   ("pulse SENSES dead stock but nothing acts").
- *  · reprice      → `finance.expense_flagging`, in UNCLAIMED (the margin sense
- *                   is real; no duty on the roster describes it).
- *  · supplier     → `operations.supplier_switching`, in UNCLAIMED
- *                   ("`switch_supplier` is a shipped verb with no lane").
- *  · cart recovery→ `sales.abandoned_checkout_emails`, held by `cart_sweep` —
- *                   and DIVISION OF LABOUR, not a gap to close here: doc 07 B2
- *                   is explicit that one cart worked by two lanes is how a
- *                   customer gets nudged twice in one evening.
+ * A remedy names TWO things: the verb, and the duty it would be performed
+ * under. Until the verb↔duty binding existed (`VERB_DUTIES`, enforced at
+ * `gateOrFile`), the second one was a free choice — and the authority seam
+ * reads the duty key to pick the DOOR, the MINIMUM LEVEL and the founder's
+ * PAUSE SWITCH. A table that picked both could therefore have any verb judged
+ * under any duty's law: measured on the demo store, a `create_purchase_order`
+ * filed under `inventory.low_stock_alerts` (minLevel 0, a watching duty) came
+ * back `suggest` at level 1 where the honest `inventory.reorder_drafts` was
+ * refused `duty:min_level`. The duty a remedy names is now a fact about the
+ * verb, checked at the seam; it is not this table's opinion.
+ *
+ * ── EVERY ROW, AND WHY IT CANNOT BE ACTED ON ───────────────────────────────
+ *
+ *  · reorder      → `create_purchase_order` under `inventory.reorder_drafts`.
+ *                   A GOVERNING duty (night_ops claims it for "purchase orders
+ *                   drafted"), just not this lane's. OUT OF LANE.
+ *  · clearance    → `create_discount` under `inventory.dead_stock_clearance`.
+ *                   Governing (UNCLAIMED: "minting a clearance coupon is a
+ *                   Coupons write"), out of lane.
+ *  · reprice      → `update_price`, under NOTHING. This row used to name
+ *                   `finance.expense_flagging`, which registry.ts's own gap
+ *                   list had ALREADY RULED OUT in writing — "no duty on the
+ *                   roster describes it … Closest neighbour, and not close
+ *                   enough". The margin sense is real and the verb is shipped;
+ *                   the roster has no row for "Nova changes a price". A ROSTER
+ *                   GAP, surfaced as one.
+ *  · supplier     → `switch_supplier` under `operations.supplier_switching`.
+ *                   Governing (UNCLAIMED names the verb), out of lane.
+ *  · cart recovery→ `send_customer_message` under
+ *                   `sales.abandoned_checkout_emails`. Governing, held by
+ *                   `cart_sweep` — and DIVISION OF LABOUR, not a gap to close
+ *                   here: doc 07 B2 is explicit that one cart worked by two
+ *                   lanes is how a customer gets nudged twice in one evening.
  *  · revenue drop → NO remedy at all. There is no verb in `ActionType` that
  *                   fixes a week-over-week decline; the judgement belongs to
  *                   `weekly_strategy`. A report is the honest whole response.
@@ -264,7 +306,10 @@ export const productionRemedy: RemedyFn = (finding, sense) => {
   if (finding.domain === "margin" && product) {
     return {
       type: "update_price",
-      dutyKey: "finance.expense_flagging",
+      // NOT `finance.expense_flagging` — see the table header. No duty on the
+      // roster governs `update_price`, and naming the nearest one would be the
+      // laundering this binding exists to stop.
+      dutyKey: null,
       department: "finance",
       title: `${product.name} is priced under the margin floor`,
       paramsLine: finding.observation.evidence,
@@ -299,11 +344,22 @@ export const productionRemedy: RemedyFn = (finding, sense) => {
 // The outcome of one finding
 // ---------------------------------------------------------------------------
 
-/** A remedy this lane may not perform. Surfaced, never acted on. */
+/**
+ * A remedy this lane may not perform. Surfaced, never acted on.
+ *
+ * Two kinds, and the report tells them apart because the fix is different:
+ *  · `out_of_lane` — a real duty governs the verb, another lane holds it (or
+ *    no lane does). The fix is a REGISTRY edit, or a lane that does the work.
+ *  · `ungoverned_verb` — the verb is shipped and NO duty on the founder's
+ *    roster describes it, so there is nothing to hold. The fix is a ROSTER
+ *    edit, reviewed, and mirrored to dakio-api's `NovaDuty` seed.
+ */
 export interface CapabilityGap {
   findingKey: string;
   verb: ActionType;
-  wantedDuty: string;
+  kind: "out_of_lane" | "ungoverned_verb";
+  /** The duty it would need, or `null` when no duty governs the verb at all. */
+  wantedDuty: string | null;
   reason: string;
 }
 
@@ -320,15 +376,50 @@ export type FindingOutcome =
   | { kind: "replayed"; actionId: string }
   /**
    * The gate would let Nova do this alone, and this lane has no executor for
-   * the verb. See {@link settleFinding} — the honest outcome, not a hidden one.
+   * the verb. See {@link settleFinding} — the honest outcome, not a hidden one,
+   * and it carries the id of the row that RECORDS "authorized, nothing ran".
    */
-  | { kind: "no_executor"; verb: ActionType };
+  | { kind: "no_executor"; verb: ActionType; actionId: string };
 
 export interface SettledFinding {
   finding: PulseFinding;
   headline: string;
   note: string;
   outcome: FindingOutcome;
+}
+
+/**
+ * One department's judgement, plus what it is honestly ABOUT.
+ *
+ * DECIDE buys one judgement per moved department — never one per finding, which
+ * is the cost claim this lane exists for. The consequence has to be carried
+ * rather than forgotten: when a department moved on three findings, the model's
+ * `note` is one sentence about all three, so it may not be pasted onto one
+ * finding's receipt and Decision card as though it were about that finding.
+ */
+export interface DepartmentJudgement {
+  /** The model's note, exactly as written. */
+  note: string;
+  /** How many findings that one note covered. */
+  findingCount: number;
+  /** The note, labelled with its scope when it covers more than one finding. */
+  scopedNote: string;
+}
+
+/** Attach a department judgement to the findings it actually covered. */
+export function scopeJudgement(
+  judgement: PulseJudgement,
+  department: NovaDepartment,
+  findingCount: number,
+): DepartmentJudgement {
+  return {
+    note: judgement.note,
+    findingCount,
+    scopedNote:
+      findingCount === 1
+        ? judgement.note
+        : `Nova's note on all ${findingCount} ${department} findings this pass: ${judgement.note}`,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +453,12 @@ export interface PulseResult {
   senseFailures: string[];
   /** Inbox events marked processed by code (never by a model step). */
   eventsProcessed: number;
+  /**
+   * Events the drain could NOT mark, with the reason each. Not fatal (they are
+   * re-read next hour) and no longer silent — see the drain block in
+   * {@link runPulse}.
+   */
+  eventDrainFailures: string[];
   inboxCursor: string | null;
   snapshotWritten: boolean;
   /** Present only when findings survived — a quiet pulse files nothing. */
@@ -386,15 +483,28 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
   const sense = await senseStore(storeId, client);
   const dark = senseFailures(sense);
 
-  // ── The inbox bookkeeping, as CODE ───────────────────────────────────────
+  // ── The inbox bookkeeping, as CODE — A QUEUE DRAIN, OUTSIDE THE GATE ─────
   //
   // Under eve this was model steps: one `mark_event_processed` tool call per
-  // event, inside a paid turn. It decides nothing, so it is a loop. Failures
-  // are swallowed per event: an event that cannot be marked will be re-read
-  // next hour, which is free, and letting it fail the pulse would let one
-  // stuck row stop the watchdog.
+  // event, inside a paid turn. It decides nothing, so it is a loop.
+  //
+  // SAY WHAT IT IS: this write does NOT pass the authority gate, and it is the
+  // only write in this lane that does not. That is defensible because of what
+  // it touches — `NovaInbox.processedAt`, Nova's own read cursor over its own
+  // queue. Nothing a founder or a customer can see moves; no money, no message,
+  // no record of theirs is changed; there is no duty on the roster for "Nova
+  // ticks off its own inbox", and inventing one would put a pause switch on the
+  // founder's roster that stops Nova reading its own mail. It is bookkeeping in
+  // the strict sense, not in the sense a verb claims when it wants a bypass.
+  //
+  // Failures do not fail the pulse (an unmarked event is re-read next hour,
+  // which is free, and one stuck row must not stop the watchdog) — but they are
+  // no longer INVISIBLE: they are counted, ride on the result, and are named in
+  // the report body. A drain that has silently stopped draining is exactly the
+  // sort of thing a swallowed catch hides for a month.
   const events = sense.inbox.ok ? sense.inbox.value : [];
   let eventsProcessed = 0;
+  const drainFailures: string[] = [];
   let cursor: string | null = null;
   for (const event of events) {
     if (cursor === null || Date.parse(event.receivedAt) > Date.parse(cursor)) cursor = event.receivedAt;
@@ -402,6 +512,7 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
       await client.markEventProcessed(event.id);
       eventsProcessed += 1;
     } catch (err) {
+      drainFailures.push(`${event.id}: ${err instanceof Error ? err.message : String(err)}`);
       console.warn(`[pulse] could not mark event ${event.id} processed for ${storeId}:`, err);
     }
   }
@@ -442,6 +553,7 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
       capabilityGaps: [],
       senseFailures: dark,
       eventsProcessed,
+      eventDrainFailures: drainFailures,
       inboxCursor: snapshot.inboxCursor,
       snapshotWritten,
     };
@@ -482,10 +594,14 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
     if (!judgement.worthWaking && !hasCritical) continue;
 
     departmentsWithFindings.push(department);
+    // ONE judgement, N findings — carried as what it is (see
+    // {@link scopeJudgement}), so finding B's receipt and Decision card cannot
+    // present the sentence the model wrote about finding A as its own.
+    const scoped = scopeJudgement(judgement, department, findings.length);
     for (const finding of findings) {
-      const outcome = await settleFinding(client, finding, sense, remedyFor, judgement);
+      const outcome = await settleFinding(client, finding, sense, remedyFor, scoped, KIND);
       if (outcome.kind === "capability_gap") gaps.push(outcome.gap);
-      settled.push({ finding, headline: judgement.headline, note: judgement.note, outcome });
+      settled.push({ finding, headline: judgement.headline, note: scoped.scopedNote, outcome });
     }
   }
 
@@ -504,6 +620,7 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
       capabilityGaps: [],
       senseFailures: dark,
       eventsProcessed,
+      eventDrainFailures: drainFailures,
       inboxCursor: snapshot.inboxCursor,
       snapshotWritten,
     };
@@ -515,7 +632,7 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
     const report = await client.addReport({
       kind: "pulse",
       title: pulseTitle(settled),
-      body: pulseBody(settled, gaps, dark, opts.jobId),
+      body: pulseBody(settled, gaps, dark, drainFailures, opts.jobId),
       // A re-leased rerun re-files the SAME row rather than a duplicate
       // (dakio-api returns the original on a dedupeKey collision).
       dedupeKey: opts.dedupeKey ?? null,
@@ -538,6 +655,7 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
     capabilityGaps: gaps,
     senseFailures: dark,
     eventsProcessed,
+    eventDrainFailures: drainFailures,
     inboxCursor: snapshot.inboxCursor,
     snapshotWritten,
     ...(reportId ? { reportId } : {}),
@@ -570,30 +688,63 @@ async function writeSnapshot(storeId: string, snapshot: Parameters<typeof savePu
  *
  * The order is the whole safety argument:
  *   1. no remedy verb ⇒ the report is the response;
- *   2. the remedy's duty is not in THIS LANE's registry entry ⇒ surface it and
+ *   2. no duty on the roster GOVERNS the remedy's verb ⇒ surface it. The verb
+ *      is shipped and nothing on the founder's roster claims it, so there is
+ *      no duty to perform it under and none may be borrowed;
+ *   3. the remedy's duty is not in THIS LANE's registry entry ⇒ surface it and
  *      stop. Not a soft warning — the gate is never even consulted, because
- *      consulting it would mean this lane had decided it might act;
- *   3. only then the gate, which is the front office's `gateOrFile` →
+ *      consulting it would mean this lane had decided it might act. (The GATE
+ *      enforces both bounds too, and throws; these two checks exist so the
+ *      lane answers with a founder-readable gap rather than a stack trace for
+ *      the conditions it can see coming.)
+ *   4. only then the gate, which is the front office's `gateOrFile` →
  *      `evaluateAuthority`. There is exactly one authority gate in this repo
  *      and this lane uses it rather than growing a second opinion.
+ *
+ * Exported for the suite: every production remedy stops at step 2 or 3, so the
+ * only way to exercise steps 4+ is to drive this function AS a lane that holds
+ * an acting duty — which is exactly the day-one-of-the-duty-moving rehearsal
+ * the act path is built for. `runPulse` always passes its own {@link KIND}.
  */
-async function settleFinding(
+export async function settleFinding(
   client: StoreClient,
   finding: PulseFinding,
   sense: StoreSense,
   remedyFor: RemedyFn,
-  judgement: PulseJudgement,
+  judgement: DepartmentJudgement,
+  /** Whose duty set bounds this act. Production: the pulse's own lane. */
+  lane: JobKind = KIND,
 ): Promise<FindingOutcome> {
   const remedy = remedyFor(finding, sense);
   if (!remedy) return { kind: "reported" };
 
-  const duties = laneDuties();
+  // 2. A verb the roster does not describe. `null` is not "unchecked" — it is
+  //    the remedy table stating that `VERB_DUTIES` has no key for this verb.
+  if (remedy.dutyKey === null) {
+    return {
+      kind: "capability_gap",
+      gap: {
+        findingKey: finding.key,
+        verb: remedy.type,
+        kind: "ungoverned_verb",
+        wantedDuty: null,
+        reason:
+          `The pulse sensed this, and \`${remedy.type}\` would fix it — but NO duty on Nova's roster ` +
+          `governs \`${remedy.type}\`, so there is nothing to perform it under. ` +
+          `${UNGOVERNED_VERBS[remedy.type] ?? ""} Reported instead.`,
+      },
+    };
+  }
+
+  // 3. A governing duty, held by somebody else.
+  const duties = laneFor(lane)?.duties ?? [];
   if (!duties.includes(remedy.dutyKey)) {
     return {
       kind: "capability_gap",
       gap: {
         findingKey: finding.key,
         verb: remedy.type,
+        kind: "out_of_lane",
         wantedDuty: remedy.dutyKey,
         reason:
           `The pulse sensed this, but "${remedy.dutyKey}" is not one of its lane's duties ` +
@@ -606,7 +757,14 @@ async function settleFinding(
     // THE OBSERVATION IS THE REASON. Every row this lane files can be traced to
     // a number it read this hour, and nothing else can end up here.
     reason: finding.observation.evidence,
-    expectedImpact: judgement.note,
+    // THE NOTE IS THE DEPARTMENT'S, NOT THIS FINDING'S. One judgement is bought
+    // per moved department, so when a department moved on three findings the
+    // model wrote one sentence about all three — and this line is what becomes
+    // the Decision card's impact label. Attaching it bare would put the note
+    // the model wrote about finding A on finding B's card. Where the department
+    // had exactly one finding the note IS about it; otherwise it is labelled as
+    // what it is.
+    expectedImpact: judgement.scopedNote,
     // Not the model's self-rated confidence: the finding is a measurement, and
     // a measurement that crossed a threshold is not a guess.
     confidence: finding.severity === "critical" ? 0.9 : 0.7,
@@ -623,26 +781,39 @@ async function settleFinding(
         metric: "priorValue",
         value: finding.observation.priorValue ?? "first sighting",
       },
+      {
+        source: "pulse:judgement",
+        note: judgement.note,
+        metric: "scope",
+        value: judgement.findingCount === 1
+          ? `${finding.department}: this finding`
+          : `${finding.department}: all ${judgement.findingCount} findings this pass`,
+      },
     ],
   };
 
-  const step = await gateOrFile(client, {
+  const spec: GateSpec = {
     verb: remedy.type,
     department: remedy.department,
     dutyRef: remedy.dutyKey,
-    // Recorded, never trusted for permission — but a job-driven action must not
-    // file itself as a chat one.
+    // The lane, so the seam can enforce the registry's capability bound itself
+    // rather than trusting the check above to have been written.
+    lane,
+    // Recorded (as `origin` receipt evidence on the filed row), never trusted
+    // for permission — a job-driven action does not file itself as a chat one.
     origin: "job",
     door: doorFor(remedy.department),
     title: remedy.title,
     paramsLine: remedy.paramsLine,
-    payload: { ...remedy.payload, novaActionId: novaActionIdFor(finding) },
+    payload: { ...remedy.payload, novaActionId: novaActionIdFor(finding, sense.at) },
     receipt,
     preparedDetail: (delivered) =>
       delivered
         ? "Nova prepared this and put it on your desk."
         : "Nova prepared this, but the card did not reach your desk — it is on the action ledger.",
-  });
+  };
+
+  const step = await gateOrFile(client, spec);
 
   if (!step.proceed) {
     const o = step.outcome;
@@ -659,25 +830,60 @@ async function settleFinding(
   // conversation-scoped. Writing one here would be a second write path outside
   // the gate's own verbs, which is precisely what this lane must not grow.
   //
-  // Unreachable in production today (every production remedy is out of lane and
-  // returns above), and named rather than silently dropped so the day a duty
-  // moves into this lane, the missing piece has a name.
-  console.warn(
-    `[pulse] authority allows ${remedy.type} for ${finding.key}, but the pulse lane has no executor for it — ` +
-      `nothing ran. Give the verb an executor, or move the duty to a lane that has one.`,
+  // WHAT THIS BRANCH MUST NOT DO is drop the gate's work on the floor. It used
+  // to: no row, so nothing on the ledger recorded that Nova was authorized and
+  // did not act, and `step.settle` / `step.rowEvidence` / the masked title and
+  // params line — the replay protocol the five customer verbs are built around
+  // — were discarded at exactly the seam a future author is invited to fill.
+  // `fileAuthorizedUnexecuted` files the fact through that protocol, so the
+  // founder can do in one tap what Nova was allowed to do and could not, and so
+  // whoever gives the verb an executor inherits a safe seam.
+  const outcome = await fileAuthorizedUnexecuted(
+    client,
+    spec,
+    step,
+    `Nova was allowed to do this on its own (${step.authority.rule}), but the ${lane} lane has no executor ` +
+      `for \`${remedy.type}\` — nothing ran, so it is on your desk instead.`,
   );
-  return { kind: "no_executor", verb: remedy.type };
+  console.warn(
+    `[pulse] authority allows ${remedy.type} for ${finding.key}, but the ${lane} lane has no executor for it — ` +
+      `nothing ran; filed as ${outcome.actionId}. Give the verb an executor, or move the duty to a lane that has one.`,
+  );
+  return { kind: "no_executor", verb: remedy.type, actionId: outcome.actionId };
 }
 
 /**
- * The at-most-once key for a filed action.
+ * The at-most-once key for a filed action: the CONDITION, plus the day it was
+ * raised on.
  *
- * Keyed on the CONDITION, not on the sighting: two pulses that both decide to
- * act on the same crossed condition file one row, not two. `nm:` matches the
- * customer lane's deterministic-id convention.
+ * ── WHY IT IS NOT THE CONDITION ALONE ──────────────────────────────────────
+ *
+ * It was, and the comment recorded only the benign half ("two pulses that both
+ * decide to act on the same crossed condition file one row, not two"). The
+ * other half: `findByKey` matches at ANY status and `settleOwningRow` answers a
+ * spent key from the row that owns it — FOREVER. So one founder tapping Reject
+ * on one clearance card made that condition permanently unfileable for that
+ * product's life; every later pulse, including one raised because the condition
+ * had materially worsened, answered `replay:rejected`. The chat lane's key at
+ * least carries a per-conversation counter; this one had nothing to advance.
+ *
+ * ── WHY A DAY, AND NOT THE SIGHTING ────────────────────────────────────────
+ *
+ * The sighting time would advance on every pulse, which loses the protection
+ * that matters: a pulse that files its row and then dies before writing its
+ * snapshot is re-leased, re-senses the same condition as a first sighting, and
+ * must not file a second purchase order. Same day ⇒ same key ⇒ it replays.
+ * A day later, a condition that is news again (it re-crossed, or it materially
+ * worsened) gets a key nobody has spent. That is at most one card per condition
+ * per day even in the worst case, and in practice far fewer: an open condition
+ * that has not moved produces no finding at all, so it never reaches this
+ * function.
+ *
+ * The clock is the STORE's (`sense.at`), not this process's — a pulse and the
+ * ledger it writes to must agree about what day it is.
  */
-function novaActionIdFor(finding: PulseFinding): string {
-  return `nm:pulse:${finding.key}`;
+function novaActionIdFor(finding: PulseFinding, at: string): string {
+  return `nm:pulse:${finding.key}:${at.slice(0, 10)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -694,6 +900,7 @@ function pulseBody(
   settled: SettledFinding[],
   gaps: CapabilityGap[],
   dark: string[],
+  drainFailures: string[],
   jobId?: string,
 ): string {
   const lines: string[] = [];
@@ -708,12 +915,30 @@ function pulseBody(
   if (gaps.length > 0) {
     lines.push(
       "**What Nova could not do about it**",
-      ...gaps.map((g) => `- \`${g.verb}\` needs the duty \`${g.wantedDuty}\`, which the pulse does not hold.`),
+      // The two gap kinds read differently on purpose: one needs a lane to hold
+      // a duty that exists, the other needs the roster to grow a duty at all.
+      ...gaps.map((g) =>
+        g.wantedDuty === null
+          ? `- \`${g.verb}\` would fix it, and NO duty on your Nova roster covers \`${g.verb}\` — so there is ` +
+            `nothing to switch on. Nova will not perform a verb you were never promised.`
+          : `- \`${g.verb}\` needs the duty \`${g.wantedDuty}\`, which the pulse does not hold.`,
+      ),
       "",
     );
   }
   if (dark.length > 0) {
     lines.push("**Blind spots this pass**", ...dark.map((d) => `- ${d}`), "");
+  }
+  if (drainFailures.length > 0) {
+    // The inbox drain is the one write in this lane that does not pass the
+    // gate, so when it fails the founder is told rather than a log line being
+    // the only witness.
+    lines.push(
+      `**Inbox queue**: ${drainFailures.length} event(s) could not be marked as seen — Nova will re-read them ` +
+        `next pass.`,
+      ...drainFailures.map((f) => `- ${f}`),
+      "",
+    );
   }
   // Stated on every pulse report, because a founder reading "nothing wrong with
   // your ads" into a Nova report that never looked at ads is the exact failure
@@ -732,7 +957,9 @@ function outcomeLine(outcome: FindingOutcome): string {
     case "reported":
       return "Reported. There is no action Nova can take on this one.";
     case "capability_gap":
-      return `Not acted on: needs the duty \`${outcome.gap.wantedDuty}\`, which this lane does not hold.`;
+      return outcome.gap.wantedDuty === null
+        ? `Not acted on: no duty on your roster covers \`${outcome.gap.verb}\`, so Nova has nothing to do it under.`
+        : `Not acted on: needs the duty \`${outcome.gap.wantedDuty}\`, which this lane does not hold.`;
     case "decision_filed":
       return `Prepared for your approval (${outcome.rule}).`;
     case "refused":
@@ -740,7 +967,10 @@ function outcomeLine(outcome: FindingOutcome): string {
     case "replayed":
       return "Already filed under this key by an earlier pulse.";
     case "no_executor":
-      return `Allowed, but nothing ran — no executor for \`${outcome.verb}\` on this lane.`;
+      return (
+        `Allowed, but nothing ran — no executor for \`${outcome.verb}\` on this lane. Prepared on your desk ` +
+        `instead (${outcome.actionId}).`
+      );
   }
 }
 
@@ -758,9 +988,16 @@ const pulseStep = createStep({
     modelCalls: z.number().describe("0 on a quiet pulse — the whole point of the lane"),
     departments: z.array(z.string()),
     findings: z.array(z.object({ key: z.string(), title: z.string(), outcome: z.string() })),
-    capabilityGaps: z.array(z.object({ verb: z.string(), wantedDuty: z.string() })),
+    capabilityGaps: z.array(
+      z.object({
+        verb: z.string(),
+        kind: z.string().describe("out_of_lane | ungoverned_verb — a registry fix or a roster fix"),
+        wantedDuty: z.string().nullable().describe("null = no duty on the roster governs the verb"),
+      }),
+    ),
     senseFailures: z.array(z.string()),
     eventsProcessed: z.number(),
+    eventDrainFailures: z.array(z.string()),
     snapshotWritten: z.boolean(),
     reportId: z.string().optional(),
   }),
@@ -777,9 +1014,10 @@ const pulseStep = createStep({
         title: f.finding.title,
         outcome: f.outcome.kind,
       })),
-      capabilityGaps: result.capabilityGaps.map((g) => ({ verb: g.verb, wantedDuty: g.wantedDuty })),
+      capabilityGaps: result.capabilityGaps.map((g) => ({ verb: g.verb, kind: g.kind, wantedDuty: g.wantedDuty })),
       senseFailures: result.senseFailures,
       eventsProcessed: result.eventsProcessed,
+      eventDrainFailures: result.eventDrainFailures,
       snapshotWritten: result.snapshotWritten,
       ...(result.reportId ? { reportId: result.reportId } : {}),
     };

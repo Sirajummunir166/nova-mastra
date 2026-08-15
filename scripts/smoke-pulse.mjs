@@ -130,7 +130,13 @@ async function pulse(label) {
   for (const f of result.findings) {
     console.log(`   • [${f.finding.severity}] ${f.finding.title}`);
     console.log(`     ${f.finding.observation.evidence}`);
-    console.log(`     → ${f.outcome.kind}${f.outcome.kind === "capability_gap" ? ` (needs ${f.outcome.gap.wantedDuty})` : ""}`);
+    const gapNote =
+      f.outcome.kind !== "capability_gap"
+        ? ""
+        : f.outcome.gap.wantedDuty === null
+          ? ` (no duty on the roster governs \`${f.outcome.gap.verb}\`)`
+          : ` (needs ${f.outcome.gap.wantedDuty})`;
+    console.log(`     → ${f.outcome.kind}${gapNote}`);
   }
   if (result.senseFailures.length > 0) console.log(`   blind: ${result.senseFailures.join("; ")}`);
   assert(observed === result.modelCalls, `the lane's reported modelCalls (${result.modelCalls}) must match the real calls (${observed})`);
@@ -234,19 +240,23 @@ try {
   assert(changed.observed === 1, `one moved department = ONE judgement call (got ${changed.observed})`);
   ok(`run 3: 1 model call, 1 finding, 1 department — "${finding.finding.observation.evidence}"`);
 
-  // The act path: the remedy for a thin margin is `update_price` under
-  // `finance.expense_flagging`, which this lane does not hold. It surfaces.
-  assert(changed.result.capabilityGaps.length === 1, "the remedy is out of lane, so it surfaces as a capability gap");
-  assert(
-    changed.result.capabilityGaps[0].wantedDuty === "finance.expense_flagging",
-    `naming the duty it would need (got ${changed.result.capabilityGaps[0].wantedDuty})`,
-  );
+  // The act path: the remedy for a thin margin is `update_price`, and NO duty on
+  // the founder's roster governs a reprice. This used to read
+  // `finance.expense_flagging` — a duty registry.ts's own gap list had already
+  // ruled "closest neighbour, and not close enough", and which the authority
+  // seam would nonetheless have used to pick the door, the minLevel and the
+  // pause switch. The honest answer is a roster gap, and it says so.
+  assert(changed.result.capabilityGaps.length === 1, "the remedy cannot be performed, so it surfaces as a capability gap");
+  const gap = changed.result.capabilityGaps[0];
+  assert(gap.verb === "update_price", `naming the verb that would fix it (got ${gap.verb})`);
+  assert(gap.kind === "ungoverned_verb", `and the KIND of gap it is (got ${gap.kind})`);
+  assert(gap.wantedDuty === null, `with no duty to name, because none governs a reprice (got ${gap.wantedDuty})`);
   const actions = await client.listActions();
   assert(
     !actions.some((a) => String(a.payload?.novaActionId ?? "").startsWith("nm:pulse:")),
     "and NOTHING was filed under a duty the lane does not hold",
   );
-  ok("run 3: the remedy needed `finance.expense_flagging` — surfaced, not acted on, nothing filed");
+  ok("run 3: `update_price` is governed by no duty on the roster — surfaced, not acted on, nothing filed");
 
   const report = (await client.listReports({ kind: "pulse", limit: 1 }))[0];
   assert(report, "one consolidated report was filed");

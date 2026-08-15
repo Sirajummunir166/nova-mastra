@@ -574,9 +574,29 @@ type AuthorityVerdictish = { verdict: AuthorityDecision["verdict"]; rule: string
 export interface AuthorityRequest {
   type: ActionType | string;
   payload: Record<string, unknown>;
-  /** E-5 duty this action is performed under. Unknown keys fail closed. */
+  /**
+   * E-5 duty this action is performed under. Unknown keys fail closed.
+   *
+   * IT MUST ALSO BE A DUTY THAT GOVERNS `type`, and this seam does not check
+   * that — it cannot, coherently: it judges one request and the pairing is a
+   * fact about the verb, not about the tenant. `VERB_DUTIES` (duties.ts) holds
+   * the pairs and `gateOrFile` (front-office/actions.ts) refuses a bad one
+   * before calling here. Anything that reaches `evaluateAuthority` by another
+   * route owes the same check — the key selects the door, the minimum level and
+   * the pause switch below, so an unbound key silently moves all three.
+   */
   dutyKey?: string;
-  /** "chat" | "job" | "founder" — recorded, never trusted for permission. */
+  /**
+   * "chat" | "job" | "founder" — an AUDIT FIELD. Nothing in this function reads
+   * it and nothing may start: it is caller-supplied, so trusting it for
+   * permission would let a lane widen its own authority by renaming itself.
+   *
+   * Where it is actually recorded: `gateOrFile` stamps it as `origin` receipt
+   * evidence on every row it files (see `originEvidence`), which is what makes
+   * a job-filed row and a chat-filed row distinguishable on the ledger. This
+   * parameter exists so that the two halves — judged without it, recorded with
+   * it — are decided in one place.
+   */
   origin?: string;
 }
 

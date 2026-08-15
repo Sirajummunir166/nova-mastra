@@ -17,7 +17,7 @@
  * on the tenant's current level, which changes independently of this file.
  */
 
-import type { NovaDepartment } from "./types.js";
+import type { ActionType, NovaDepartment } from "./types.js";
 
 /** A founder-facing surface a duty writes into. */
 export interface DoorSpec {
@@ -282,3 +282,229 @@ export const DUTY_BY_KEY: ReadonlyMap<string, DutySpec> = new Map(DUTIES.map((d)
 
 /** Duties whose door isn't built yet — the roster's honest minority. */
 export const NEEDS_DOOR_DUTIES: readonly DutySpec[] = DUTIES.filter((d) => !DOORS[d.door]?.exists);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * WHICH DUTY MAY A VERB BE PERFORMED UNDER
+ *
+ * ── The hole this closes ───────────────────────────────────────────────────
+ *
+ * `evaluateAuthority` takes the verb and the duty key as INDEPENDENT inputs,
+ * and the duty key is what selects the door (⇒ the mode ceiling), the minimum
+ * level, and the founder's per-duty pause switch. Nothing anywhere checked that
+ * the duty had anything to do with the verb. So a caller could file a
+ * `create_purchase_order` (minLevel 2, door Purchases, `high` risk) under
+ * `inventory.low_stock_alerts` (minLevel 0, door Products, a WATCHING duty) and
+ * have it judged at minLevel 0, under the wrong door's mode, unstoppable by a
+ * founder who paused "Reorder drafts", and land on the ledger attributed to
+ * "Low-stock alerts". Measured, not theorised: at level 1 the honest pair is
+ * refused `duty:min_level` and the laundered pair comes back `suggest`.
+ *
+ * This table is that missing edge. It is enforced at the ONE seam every lane
+ * files through (`gateOrFile` in front-office/actions.ts) and at
+ * `performCreateOrder`, which keeps its own copy of that seam.
+ *
+ * ── Where each row comes from. Nothing here is invented. ───────────────────
+ *
+ *  1. nova-ai's tools each declare a `dutyRef` on their `performAction` call
+ *     (`agent/tools/*.ts`) — twelve verbs, taken verbatim.
+ *  2. This repo's front-office verbs declare theirs as `*_DUTY_REF` constants
+ *     in `front-office/actions.ts`.
+ *  3. For the founder-plane verbs, which predate the duty registry and declare
+ *     nothing, the roster above plus `brain/registry.ts` (the lane claims and,
+ *     more usefully, the WRITTEN REASONS in `UNCLAIMED`) say which duty
+ *     describes the act. Those reasons are evidence in both directions —
+ *     `operations.supplier_switching`'s reads "`switch_supplier` is a shipped
+ *     verb with no lane that calls it", which names the pair; and
+ *     `finance.expense_flagging`'s reads "no duty on the roster describes it …
+ *     Closest neighbour, and not close enough", which REFUSES the pair the
+ *     pulse's remedy table had been filing `update_price` under.
+ *
+ * ── An empty list is a capability gap, not a free pass ─────────────────────
+ *
+ * Four shipped verbs are governed by NO duty on the founder's roster. That is
+ * the same honesty mechanism as `doorExists: false` and `UNCLAIMED`: the verb
+ * exists, nothing on the roster claims it, and the founder therefore has no row
+ * to read, no level to set and no switch to pause. Until a duty is added, the
+ * seam refuses them — a verb nobody promised is not a verb Nova may perform.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * ActionType → the duty key(s) that legitimately govern it.
+ *
+ * A verb may have SEVERAL governing duties (one act, several promises a founder
+ * reads: a chat reply is both `support.inbox_replies` and the mined
+ * `support.customer_replies`, and `brain/registry.ts` explains why a lane that
+ * named only one would keep replying after the founder paused the other). It
+ * may also have none — see {@link UNGOVERNED_VERBS}.
+ *
+ * Every value is checked against the roster at module load.
+ */
+export const VERB_DUTIES: Readonly<Record<ActionType, readonly string[]>> = {
+  // ── Front Office, from the tools' own `dutyRef` (nova-ai + actions.ts) ────
+  /** `create_order_from_chat.ts` → "sales.inbox_orders". */
+  create_order_from_chat: ["sales.inbox_orders"],
+  /** `cancel_order_from_chat.ts` → "sales.inbox_orders" — pausing chat orders pauses chat cancels. */
+  cancel_order_from_chat: ["sales.inbox_orders"],
+  /** `offer_chat_discount.ts` → "sales.inbox_discounts". */
+  offer_chat_discount: ["sales.inbox_discounts"],
+  /**
+   * `reply_in_thread.ts` → "support.inbox_replies". The mined
+   * `support.customer_replies` rides with it for the reason `registry.ts` gives
+   * on the `inbox_reply` lane: the roster carries two rows for one act.
+   */
+  send_inbox_reply: ["support.inbox_replies", "support.customer_replies"],
+  /** `flag_handover.ts` → "support.inbox_escalations". */
+  escalate_conversation: ["support.inbox_escalations"],
+  /** `link_customer.ts` → "support.inbox_replies". */
+  link_customer_identity: ["support.inbox_replies"],
+  /**
+   * `schedule_follow_up.ts` → "support.inbox_replies". The two nudge duties
+   * `registry.ts` names on the `followup` lane are the other two producers of
+   * the same row (in-thread cart nudges, NBA nudges).
+   */
+  schedule_follow_up: ["support.inbox_replies", "sales.inbox_cart_recovery", "sales.lead_followups"],
+  /** `verify_payment_slip.ts` → "support.inbox_replies" ("the duty is the thread's"). */
+  verify_payment_slip: ["support.inbox_replies"],
+  /** `open_case.ts` → "shipping.delivery_cases". */
+  open_case: ["shipping.delivery_cases"],
+  /** `update_order_contact.ts` → "shipping.delivery_cases". */
+  update_order_contact: ["shipping.delivery_cases"],
+  /** `confirm_order_intent.ts` → "shipping.predispatch_confirms". */
+  confirm_order_intent: ["shipping.predispatch_confirms"],
+  /** `bulk_refund.ts` → "support.refund_processing" (founder-only either way). */
+  bulk_refund: ["support.refund_processing"],
+  /**
+   * Module 06's verb has no nova-ai tool to copy from (module 06 never shipped
+   * there). `registry.ts`'s `courier_intervention` lane is the producer and
+   * claims exactly these two: the parcel is late (`delay_chasing`) and the
+   * customer is waiting in a case (`delivery_cases`).
+   */
+  flag_courier_issue: ["shipping.delay_chasing", "shipping.delivery_cases"],
+
+  // ── Founder plane: no tool declares a duty, so the roster decides ─────────
+  /**
+   * `night_ops` claims BOTH for "purchase orders drafted", and both sit at the
+   * Purchases door, minLevel 2. Either is an honest attribution for a PO.
+   */
+  create_purchase_order: ["inventory.reorder_drafts", "operations.po_drafting"],
+  /** UNCLAIMED: "`switch_supplier` is a shipped verb with no lane that calls it." */
+  switch_supplier: ["operations.supplier_switching"],
+  /**
+   * The three Coupons-door duties, and the gap list names the verb in each:
+   * "minting a clearance coupon is a Coupons write", "No lane mints an upsell
+   * coupon", "No lane builds a bundle".
+   */
+  create_discount: ["inventory.dead_stock_clearance", "sales.upsell_offers", "growth.bundle_offers"],
+  /**
+   * One message to one customer, on the founder plane. The six purposes the
+   * payload allows (`cart_recovery`, `winback`, `upsell`, `sales_reply`,
+   * `support_reply`, `order_update`) line up with these roster rows, and the
+   * gap list names the verb from the other side ("no lane messages a lapsed
+   * customer", "Nothing reads payment state and schedules a chase").
+   *
+   * The two Broadcast CAMPAIGN duties are deliberately NOT here: UNCLAIMED
+   * rules explicitly that "cart_sweep's email is cart recovery, not campaigns",
+   * and there is no campaign-send verb in `ActionType` at all.
+   */
+  send_customer_message: [
+    "sales.abandoned_checkout_emails",
+    "sales.sms_cart_recovery",
+    "sales.winback_campaigns",
+    "sales.upsell_offers",
+    "sales.payment_chasing",
+    "sales.lead_followups",
+    "support.customer_replies",
+  ],
+  /** The three ad-account duties `night_ops` claims for "ads reviewed". */
+  update_campaign: [
+    "marketing.ad_budget_optimization",
+    "marketing.pause_weak_ad_sets",
+    "marketing.campaign_scaling",
+  ],
+  /**
+   * The THINNEST row in this table, and it is flagged rather than dressed up:
+   * `marketing.seasonal_promotions` is the only roster duty that describes a
+   * campaign being brought into existence rather than tuned. A lane that wants
+   * to launch a non-seasonal campaign needs a roster row first — that is a
+   * roster edit, reviewed, not a widening here.
+   */
+  create_campaign: ["marketing.seasonal_promotions"],
+  /** UNCLAIMED: "nothing publishes to FB/IG" / "No lane produces video/story assets". */
+  publish_social_post: ["marketing.social_posts", "marketing.reels_and_stories"],
+  /** UNCLAIMED: "No lane touches the dropship marketplace" — this is that verb. */
+  import_product: ["product_research.winning_product_imports"],
+  /**
+   * Assigning the parcel to a courier IS the pickup booking, and the roster has
+   * exactly one Delivery-door duty for it. (`shipping.rate_compare` is a
+   * comparison; comparing is not assigning.)
+   */
+  assign_courier: ["shipping.pickup_booking"],
+
+  // ── Governed by nothing on the roster. See UNGOVERNED_VERBS. ─────────────
+  update_price: [],
+  resolve_ticket: [],
+  merge_customer_records: [],
+} as const;
+
+/**
+ * The four shipped verbs no duty on the founder's roster governs, each with the
+ * reason — the same posture as `UNCLAIMED` and `doorExists: false`.
+ *
+ * These are not "allow by default": the seam refuses them, loudly, because a
+ * verb the founder was never promised is a verb they cannot level, pause or
+ * read on the roster. Each leaves this list by a ROSTER EDIT (reviewed, and
+ * mirrored to dakio-api's `NovaDuty` seed), never by being quietly attached to
+ * whichever neighbour looks close.
+ */
+export const UNGOVERNED_VERBS: Readonly<Record<string, string>> = {
+  update_price:
+    "No duty on the roster describes Nova changing a price. `product_research.pricing_research` is " +
+    "RESEARCH at the Reports door, and registry.ts's gap list has already ruled on the nearest " +
+    "neighbour: `finance.expense_flagging` is 'closest neighbour, and not close enough'. The pulse's " +
+    "margin sense is real and the remedy has nowhere to land — a roster gap, not a verb to launder.",
+  resolve_ticket:
+    "registry.ts calls this THE HONESTY CASE: dakio-api's SupportTicket is the DAKIO PLATFORM desk " +
+    "(merchant ↔ Dakio), not the merchant's customer support, so filing it under " +
+    "`support.complaint_resolution` would tell a founder Nova resolves THEIR customers' complaints. " +
+    "It does not.",
+  merge_customer_records:
+    "The bug doc 07 names, still open: 'a merge card shipped with no duty reference because its duty " +
+    "was never added to the roster'. Identity merging is real work with no roster row; " +
+    "`identity_merge_sweep` is a server sweep and cannot claim one.",
+};
+
+/** The duty keys that may govern `verb`. Empty ⇒ ungoverned (see above). */
+export function governingDuties(verb: string): readonly string[] {
+  return VERB_DUTIES[verb as ActionType] ?? [];
+}
+
+/**
+ * Does `dutyKey` legitimately govern `verb`? Everything unknown answers false —
+ * an unknown verb has no governing duty by definition, and an unknown duty key
+ * is `evaluateAuthority`'s own hard refusal.
+ */
+export function dutyGovernsVerb(verb: string, dutyKey: string): boolean {
+  return governingDuties(verb).includes(dutyKey);
+}
+
+/**
+ * Boot-time check, same posture as `registry.ts`'s `assertLaneDutiesExist`: a
+ * binding that names a duty which is not on the roster would refuse 100% of
+ * that verb's work at runtime with `duty:unknown`, so it fails at import
+ * instead. Exported so a test can drive it with a deliberately broken table.
+ */
+export function assertVerbDutiesExist(table: Readonly<Record<string, readonly string[]>>): void {
+  const unknown: string[] = [];
+  for (const [verb, keys] of Object.entries(table)) {
+    for (const key of keys) if (!DUTY_BY_KEY.has(key)) unknown.push(`${verb} → "${key}"`);
+  }
+  if (unknown.length > 0) {
+    throw new Error(
+      `[nova:duties] VERB_DUTIES binds a verb to a duty that is not on Nova's roster: ${unknown.join(", ")}. ` +
+        `An off-roster duty is a hard refusal at every authority tier (evaluateAuthority → refuse, rule ` +
+        `"duty:unknown"), so the binding would authorise nothing. Fix the key, or add the duty to DUTIES.`,
+    );
+  }
+}
+
+assertVerbDutiesExist(VERB_DUTIES);

@@ -214,6 +214,86 @@ async function estimateChatOrderTotal(
 }
 
 /**
+ * A NUMERIC CAP THAT MIGHT NOT BE THERE — and the trap that makes this helper
+ * necessary rather than defensive noise.
+ *
+ * `evaluateAuthority` calls `checkGuardrailsForAuthority(client,
+ * state.guardrails.platform, …)`. The parameter is TYPED as the full
+ * `Guardrails`, so `guardrails.maxAutoPurchaseOrderTotal` compiles — and at
+ * runtime, on a live tenant, the platform bag is the flat `inbox.*` JSON.
+ * `undefined` comes back, `total > undefined` is `false`, and the cap simply
+ * never fires. That is not hypothetical: it is why the `create_discount` arm
+ * below has been dead since it shipped (masked only by the separate canonical
+ * check in authority.ts), and it was silently true of the ৳300,000 auto-PO cap,
+ * the ±15% price-change cap, the 25% margin FLOOR and the ±50% budget-change
+ * cap — four money rules a founder can see in their settings and none of which
+ * could stop anything.
+ *
+ * So every numeric cap is read through here, and a cap that is not a finite
+ * number is NOT a cap that passed: the caller must fail closed on `null`. The
+ * inbox keys next door already work this way; the canonical ones now do too.
+ */
+function cap(guardrails: Guardrails, key: keyof Guardrails): number | null {
+  const value = guardrails[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * "Nova has no limit to check this against, so it prepared it for you" — the
+ * one answer a missing money cap may produce. Never `allow`.
+ */
+function noCap(rule: string, what: string, whatBn: string): GuardrailCheck {
+  return {
+    result: "needs_approval",
+    rule,
+    why: `Nova has no ${what} to check this against, so it prepared the action for you instead of doing it.`,
+    whyBn: `${whatBn} নোভার কাছে নেই, তাই কাজটি নিজে না করে আপনার জন্য প্রস্তুত করেছে।`,
+  };
+}
+
+/**
+ * Verbs that legitimately reach the end of the switch with no arm of their own,
+ * each with the reason — because the `default` no longer allows.
+ *
+ * WHY THE DEFAULT FAILS CLOSED NOW. `default: allow` meant every verb WITHOUT
+ * an arm was auto-executable the moment the dial reached L3/L4, and nothing
+ * anywhere listed which verbs those were. `send_customer_message` was one of
+ * them: a real message to a real customer, from a job, with no check at all,
+ * while the same message from the customer lane passed five fail-closed ones.
+ * A silent list is not a decision, and the way to make it one is to write it
+ * down and make everything else ask.
+ *
+ * WHY NOT FLIP THE DEFAULT AND STOP THERE. Because three of these are shipped
+ * product decisions that a blanket flip would quietly reverse — most sharply
+ * `confirm_order_intent`, where module 06 says in as many words that "a
+ * confirmation ping that needs approving is a confirmation that arrives after
+ * the parcel has already gone". A rule that reverses a documented ruling
+ * without naming it is worse than the hole it closes.
+ *
+ * A NEW VERB IS NOT ADDED HERE BY REFLEX. Landing a verb with no arm now makes
+ * it draft, visibly, in the founder's desk — which is the right place to
+ * discover that its guardrail was never written.
+ */
+const NO_GUARDRAIL_NEEDED: Readonly<Record<string, string>> = {
+  schedule_follow_up:
+    "Books a job row and nothing else (module 04, OD-6). The reply it eventually composes is a " +
+    "separate `send_inbox_reply` through this whole gate, and the undo cancels the job cleanly — the " +
+    "guarded thing is the send, not the scheduling.",
+  open_case:
+    "One case row. No money, no message, nothing a customer can see (module 06). The department work " +
+    "it enqueues ends in a verb that is gated on its own.",
+  confirm_order_intent:
+    "Writes `confirmedAt` off the customer's own yes. Module 06 makes it deliberately auto-able at " +
+    "T1+: a confirmation that needs approving arrives after the parcel has gone.",
+  escalate_conversation:
+    "Hands authority AWAY, and is in NEVER_GATED for that reason — it returns before this function on " +
+    "the authority path. Listed so the deprecated `gateAction` path agrees.",
+  link_customer_identity:
+    "The SERVER decides the match and the undo clears the join (module 03); also NEVER_GATED, so it " +
+    "returns before this function on the authority path.",
+};
+
+/**
  * Hard business limits. "block" means Nova may never do it, even with
  * approval — the owner must change the guardrail itself. "needs_approval"
  * means the action is legitimate but exceeds what Nova may do alone.
@@ -226,17 +306,39 @@ async function checkGuardrails(
 ): Promise<GuardrailCheck> {
   switch (type) {
     case "create_discount": {
+      const ceiling = cap(guardrails, "maxDiscountPct");
+      // THE ONE ARM THAT MAY ALLOW ON A MISSING CAP, and only because the cap is
+      // enforced upstream: `evaluateAuthority` checks `state.guardrails.maxDiscountPct`
+      // — the CANONICAL trio, which is really there — against this same payload
+      // before it ever calls this function, and blocks on it. This arm is the
+      // duplicate. Failing closed here would draft every legitimate discount on
+      // a tenant whose platform bag happens not to mirror the key, in the name
+      // of a limit that has already been applied.
+      if (ceiling === null) return { result: "allow" };
       const percentOff = Number(payload.percentOff ?? 0);
-      if (percentOff > guardrails.maxDiscountPct) {
+      if (percentOff > ceiling) {
         return {
           result: "block",
           rule: "max_discount_pct",
-          why: `Discount of ${percentOff}% exceeds the ${guardrails.maxDiscountPct}% guardrail.`,
+          why: `Discount of ${percentOff}% exceeds the ${ceiling}% guardrail.`,
         };
       }
       return { result: "allow" };
     }
     case "update_price": {
+      const maxChangePct = cap(guardrails, "maxPriceChangePct");
+      const marginFloor = cap(guardrails, "minMarginPct");
+      // Both are needed and neither is enforced anywhere else — the margin floor
+      // in particular is a BLOCK that exists nowhere but here, so a missing key
+      // meant Nova could reprice a product to a taka above cost and this
+      // function would answer `allow`.
+      if (maxChangePct === null || marginFloor === null) {
+        return noCap(
+          "no_price_change_cap",
+          "price-change limit or margin floor",
+          "দাম পরিবর্তনের সীমা বা মুনাফার সর্বনিম্ন হার",
+        );
+      }
       const productId = String(payload.productId ?? "");
       const newPrice = Number(payload.newPrice ?? 0);
       const product = await client.getProduct(productId);
@@ -244,19 +346,19 @@ async function checkGuardrails(
         return { result: "block", rule: "unknown_product", why: `Unknown product: ${productId}` };
       }
       const changePct = Math.abs((newPrice - product.price) / product.price) * 100;
-      if (changePct > guardrails.maxPriceChangePct) {
+      if (changePct > maxChangePct) {
         return {
           result: "needs_approval",
           rule: "max_price_change_pct",
-          why: `Price change of ${changePct.toFixed(1)}% exceeds the ${guardrails.maxPriceChangePct}% autonomous limit.`,
+          why: `Price change of ${changePct.toFixed(1)}% exceeds the ${maxChangePct}% autonomous limit.`,
         };
       }
       const marginPct = ((newPrice - product.cost) / newPrice) * 100;
-      if (marginPct < guardrails.minMarginPct) {
+      if (marginPct < marginFloor) {
         return {
           result: "block",
           rule: "min_margin_pct",
-          why: `New price leaves ${marginPct.toFixed(1)}% margin, below the ${guardrails.minMarginPct}% floor.`,
+          why: `New price leaves ${marginPct.toFixed(1)}% margin, below the ${marginFloor}% floor.`,
         };
       }
       return { result: "allow" };
@@ -264,6 +366,10 @@ async function checkGuardrails(
     case "update_campaign": {
       const budget = payload.dailyBudget;
       if (budget === undefined || budget === null) return { result: "allow" };
+      const maxChangePct = cap(guardrails, "maxBudgetChangePct");
+      if (maxChangePct === null) {
+        return noCap("no_budget_change_cap", "budget-change limit", "বাজেট পরিবর্তনের সীমা");
+      }
       const campaign = await client.getCampaign(String(payload.campaignId ?? ""));
       if (!campaign) {
         return { result: "block", rule: "unknown_campaign", why: `Unknown campaign: ${String(payload.campaignId)}` };
@@ -272,11 +378,11 @@ async function checkGuardrails(
         campaign.dailyBudget > 0
           ? (Math.abs(Number(budget) - campaign.dailyBudget) / campaign.dailyBudget) * 100
           : 100;
-      if (changePct > guardrails.maxBudgetChangePct) {
+      if (changePct > maxChangePct) {
         return {
           result: "needs_approval",
           rule: "max_budget_change_pct",
-          why: `Budget change of ${changePct.toFixed(0)}% exceeds the ${guardrails.maxBudgetChangePct}% autonomous limit.`,
+          why: `Budget change of ${changePct.toFixed(0)}% exceeds the ${maxChangePct}% autonomous limit.`,
         };
       }
       return { result: "allow" };
@@ -615,13 +721,74 @@ async function checkGuardrails(
       return { result: "allow" };
     }
     case "create_purchase_order": {
+      const limit = cap(guardrails, "maxAutoPurchaseOrderTotal");
+      // The ৳300,000 cap a founder can see in their settings. Read off the
+      // PLATFORM bag, which on a live tenant may carry only `inbox.*` keys — so
+      // for as long as this line said `guardrails.maxAutoPurchaseOrderTotal`
+      // the comparison was `total > undefined`, which is `false`, and a
+      // purchase order of any size executed. Unlike `create_discount` above,
+      // nothing in authority.ts masks it: there is no canonical PO cap.
+      if (limit === null) {
+        return noCap(
+          "no_auto_purchase_order_cap",
+          "purchase-order limit",
+          "কত টাকার ক্রয়াদেশ নিজে দিতে পারবে তার সীমা",
+        );
+      }
       const quantity = Number(payload.quantity ?? 0);
       const unitCost = Number(payload.unitCost ?? 0);
       const total = quantity * unitCost;
-      if (total > guardrails.maxAutoPurchaseOrderTotal) {
+      if (total > limit) {
         return {
           result: "needs_approval",
-          why: `PO total ৳${total.toFixed(2)} exceeds the ৳${guardrails.maxAutoPurchaseOrderTotal} autonomous limit.`, rule: "max_auto_purchase_order_total",
+          why: `PO total ৳${total.toFixed(2)} exceeds the ৳${limit} autonomous limit.`,
+          rule: "max_auto_purchase_order_total",
+        };
+      }
+      return { result: "allow" };
+    }
+    /**
+     * A MESSAGE TO A REAL CUSTOMER, FROM A JOB (C-4).
+     *
+     * This verb had no arm at all, so it fell to `default: allow`: `riskClass`
+     * low, no spend extractor, nothing in FOUNDER_ONLY / NEVER_GATED /
+     * ALWAYS_DRAFT — at L3 or L4 a cart-recovery SMS from a background lane
+     * would have been sent with no check whatsoever. The same sentence sent from
+     * the customer lane passes five fail-closed checks, including "Nova is
+     * switched off for this thread ⇒ BLOCK" and "the founder is holding this
+     * conversation ⇒ draft". A message is not less consequential because a cron
+     * decided to send it; if anything it is more, because nobody is watching.
+     *
+     * WHAT IT CANNOT CHECK, STATED RATHER THAN FAKED. There is no thread here:
+     * the payload names a `customerId` and a channel (email/sms/chat), and this
+     * repo has no per-customer "Nova off" flag and no messaging-frequency
+     * ledger to read. So the honest arm is the one the customer lane falls back
+     * to whenever it cannot prove the message is safe: prepare it, and let the
+     * founder send. It becomes auto-able the day a founder switch exists to
+     * turn on — and that switch has to arrive with a real per-customer opt-out
+     * behind it, not just a boolean.
+     */
+    case "send_customer_message": {
+      // Bracket-indexed through a widened view, exactly as the `inbox.*` keys
+      // are, and `!== true` rather than `=== false`: a missing key, the string
+      // "true" and a 1 are none of them permission.
+      const bag = guardrails as unknown as Record<string, unknown>;
+      if (bag["outbound.customerMessageAuto"] !== true) {
+        return {
+          result: "needs_approval",
+          rule: "guardrail:customer_message_not_auto",
+          why: "Nova doesn't message a customer on its own from a background job, so it prepared this message for you to send.",
+          whyBn: "নোভা নিজে থেকে ক্রেতাকে বার্তা পাঠায় না, তাই বার্তাটি আপনার অনুমোদনের জন্য তৈরি করে রেখেছে।",
+        };
+      }
+      // Even with the switch on, a message Nova cannot attribute to a customer
+      // is a message it cannot honour an opt-out for.
+      if (typeof payload.customerId !== "string" || payload.customerId.length === 0) {
+        return {
+          result: "needs_approval",
+          rule: "guardrail:customer_message_no_recipient",
+          why: "Nova couldn't tell who this message is for, so it prepared it for you rather than sending it blind.",
+          whyBn: "এই বার্তাটি কার জন্য নোভা বুঝতে পারেনি, তাই না পাঠিয়ে আপনার জন্য প্রস্তুত করেছে।",
         };
       }
       return { result: "allow" };
@@ -674,7 +841,16 @@ async function checkGuardrails(
       return { result: "allow" };
     }
     default:
-      return { result: "allow" };
+      // FAIL CLOSED, with a written exception list (see NO_GUARDRAIL_NEEDED).
+      // "No arm was written for this verb" is not the same claim as "this verb
+      // needs no guardrail", and until now the switch could not tell them apart.
+      if (NO_GUARDRAIL_NEEDED[type]) return { result: "allow" };
+      return {
+        result: "needs_approval",
+        rule: "guardrail:no_arm",
+        why: `Nova has no guardrail written for "${type}", so it prepared the action for you instead of doing it on its own.`,
+        whyBn: `"${type}"-এর জন্য নোভার কোনো নিরাপত্তা নিয়ম লেখা নেই, তাই কাজটি নিজে না করে আপনার জন্য প্রস্তুত করেছে।`,
+      };
   }
 }
 

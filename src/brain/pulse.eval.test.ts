@@ -29,12 +29,21 @@
 import { test, before, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
-import { runPulse, productionRemedy, type DecideFn, type PulseJudgement } from "./pulse.js";
+import {
+  runPulse,
+  productionRemedy,
+  scopeJudgement,
+  settleFinding,
+  type DecideFn,
+  type PulseJudgement,
+} from "./pulse.js";
 import { loadPulseState, resetPulseState } from "./pulse-state.js";
 import { comparePulse, PULSE_THRESHOLDS } from "./pulse-compare.js";
 import { senseStore, SENSE_GAPS } from "../lib/snapshot.js";
 import { storeFor, resetStores } from "../store/resolve.js";
 import { laneFor } from "./registry.js";
+import { gateOrFile, originOf } from "../front-office/actions.js";
+import { dutyGovernsVerb, governingDuties, UNGOVERNED_VERBS } from "../store/duties.js";
 import { DEFAULT_GUARDRAILS } from "../store/autonomy.js";
 import type { StoreSeed } from "../store/types.js";
 
@@ -309,7 +318,21 @@ test("a finding whose remedy needs a duty this lane does not hold SURFACES — i
   assert.ok(result.capabilityGaps.length > 0);
   const duties = laneFor("pulse")!.duties;
   for (const gap of result.capabilityGaps) {
+    if (gap.wantedDuty === null) {
+      // The other honest kind: the verb is shipped and NO duty on the roster
+      // governs it, so there is no duty to hold. `update_price` is the one.
+      assert.equal(gap.kind, "ungoverned_verb");
+      assert.deepEqual(governingDuties(gap.verb), [], `${gap.verb} is genuinely governed by nothing`);
+      assert.match(gap.reason, /NO duty on Nova's roster/);
+      continue;
+    }
+    assert.equal(gap.kind, "out_of_lane");
     assert.equal(duties.includes(gap.wantedDuty), false, `${gap.wantedDuty} is genuinely outside the lane`);
+    assert.ok(
+      dutyGovernsVerb(gap.verb, gap.wantedDuty),
+      `${gap.wantedDuty} must be a duty that GOVERNS ${gap.verb} — a gap names the duty the verb ` +
+        `really answers to, never whichever key would have been judged most leniently`,
+    );
     assert.match(gap.reason, /not one of its lane's duties/);
   }
 
@@ -336,8 +359,176 @@ test("the production remedy table proposes real verbs — the gap is the DUTY, n
   assert.ok(proposed.length > 0);
   const duties = laneFor("pulse")!.duties;
   for (const remedy of proposed) {
+    if (remedy.dutyKey === null) continue; // an ungoverned verb — pinned below
     assert.equal(duties.includes(remedy.dutyKey), false, `${remedy.type} → ${remedy.dutyKey} is out of lane, as documented`);
   }
+});
+
+/**
+ * C-1, THE BINDING, FROM THE TABLE'S SIDE.
+ *
+ * Every remedy names a verb AND the duty it would be performed under, and the
+ * second one is a fact about the verb — not a choice. Before `VERB_DUTIES` this
+ * table could pair any verb with any key, and the authority seam would judge the
+ * act under that key's door, minLevel and pause switch. The margin remedy really
+ * did file `update_price` under `finance.expense_flagging`, a duty registry.ts's
+ * own gap list had already ruled "not close enough".
+ */
+test("every production remedy names a duty that GOVERNS its verb — or names none, honestly", async () => {
+  const sense = await senseStore(A);
+  const proposed = comparePulse(sense, null)
+    .findings.map((f) => productionRemedy(f, sense))
+    .filter((r): r is NonNullable<typeof r> => r !== null);
+
+  assert.ok(proposed.length > 0, "precondition: the seeded store proposes remedies");
+  for (const remedy of proposed) {
+    if (remedy.dutyKey === null) {
+      assert.deepEqual(
+        governingDuties(remedy.type),
+        [],
+        `${remedy.type} is filed as ungoverned, so the roster must genuinely have no duty for it`,
+      );
+      assert.ok(UNGOVERNED_VERBS[remedy.type], `${remedy.type} must carry a written reason in UNGOVERNED_VERBS`);
+      continue;
+    }
+    assert.ok(
+      dutyGovernsVerb(remedy.type, remedy.dutyKey),
+      `${remedy.type} may not be performed under ${remedy.dutyKey} — that duty does not govern it, and the ` +
+        `duty key is what picks the door, the minimum level and the founder's pause switch`,
+    );
+  }
+
+  // The specific pair the table used to ship, named so the regression cannot
+  // come back quietly.
+  assert.equal(
+    dutyGovernsVerb("update_price", "finance.expense_flagging"),
+    false,
+    "registry.ts's gap list already ruled on this one: 'Closest neighbour, and not close enough'",
+  );
+  const margin = proposed.find((r) => r.type === "update_price");
+  assert.ok(margin, "the seeded store still produces the margin remedy");
+  assert.equal(margin!.dutyKey, null, "and it now names no duty, because none governs a reprice");
+});
+
+/**
+ * C-1, THE BINDING, FROM THE GATE'S SIDE — the assertion that makes the table's
+ * discipline unnecessary to trust.
+ *
+ * `inLaneReorder` (the fixture this suite used to carry) filed a
+ * `create_purchase_order` under `inventory.low_stock_alerts`: a duty the pulse
+ * genuinely holds, minLevel 0, door Products, a WATCHING duty. Measured on this
+ * very store, that construction bought a real difference — at level 1 the honest
+ * duty is refused `duty:min_level` while the laundered one comes back `suggest`.
+ * The seam now refuses the pair outright.
+ */
+test("the gate REFUSES a verb filed under a duty that does not govern it — at every tier", async () => {
+  const client = storeFor(A);
+  const actionsBefore = (await client.listActions()).length;
+
+  const laundered = {
+    verb: "create_purchase_order" as const,
+    department: "inventory" as const,
+    // In lane, on the roster, enabled, minLevel 0 — and it does not govern a PO.
+    dutyRef: "inventory.low_stock_alerts",
+    lane: "pulse" as const,
+    origin: "job" as const,
+    door: "products",
+    title: "Reorder before the shelf empties",
+    paramsLine: "2 units",
+    payload: { novaActionId: "nm:test:laundered", supplierId: "s", productId: "p", quantity: 2, unitCost: 100 },
+    receipt: { reason: "r", expectedImpact: "i", confidence: 0.5, evidence: [] },
+    preparedDetail: () => "prepared",
+  };
+
+  await assert.rejects(
+    () => gateOrFile(client, laundered),
+    (err: Error) => {
+      assert.equal(err.name, "DutyBindingError");
+      assert.match(err.message, /does not govern/);
+      // The refusal names the duties that DO govern it, so the fix is obvious.
+      assert.match(err.message, /inventory\.reorder_drafts/);
+      return true;
+    },
+    "a purchase order may not be judged under a watching duty's minLevel, door and pause switch",
+  );
+
+  // Refused BEFORE anything was judged, filed or spent.
+  assert.equal((await client.listActions()).length, actionsBefore, "nothing reached the ledger");
+
+  // Every tier, not just this store's: the check runs before `getAuthority` is
+  // even read, so the dial cannot change the answer.
+  await client.setAutonomy({ level: 4, guardrails: DEFAULT_GUARDRAILS, updatedAt: client.now() });
+  await assert.rejects(() => gateOrFile(client, laundered), /does not govern/, "including at Acting CEO");
+
+  // And the honest pair is accepted by the binding (it fails the LANE check
+  // instead, which is the next assertion's subject).
+  assert.ok(dutyGovernsVerb("create_purchase_order", "inventory.reorder_drafts"));
+});
+
+/**
+ * C-2 — the registry's assertion #3 was advertised as "the runtime capability
+ * bound" and called from nowhere but its own test. The pulse re-implemented it
+ * inline, so the bound held by convention in one file. It is now the seam's.
+ */
+test("the gate REFUSES a duty outside the filing lane — assertion #3 runs on the production path", async () => {
+  const client = storeFor(A);
+  await assert.rejects(
+    () =>
+      gateOrFile(client, {
+        verb: "create_purchase_order",
+        department: "inventory",
+        // Governs the verb, and belongs to night_ops — not to the pulse.
+        dutyRef: "inventory.reorder_drafts",
+        lane: "pulse",
+        origin: "job",
+        door: "products",
+        title: "Reorder",
+        paramsLine: "2 units",
+        payload: { novaActionId: "nm:test:out-of-lane", quantity: 2, unitCost: 100 },
+        receipt: { reason: "r", expectedImpact: "i", confidence: 0.5, evidence: [] },
+        preparedDetail: () => "prepared",
+      }),
+    /may not act under duty/,
+    "the lane bound is enforced at the seam every lane goes through, not by each lane remembering",
+  );
+});
+
+/**
+ * C-3 — `origin` was a declared parameter that nothing read and nothing stored,
+ * while two files claimed in comments that it was "RECORDED … so a job-driven
+ * action does not file itself as chat". A pulse row and a chat row were
+ * indistinguishable on the ledger.
+ */
+test("a job-filed row RECORDS that a job filed it", async () => {
+  const client = storeFor(A);
+  await client.setAutonomy({ level: 2, guardrails: DEFAULT_GUARDRAILS, updatedAt: client.now() });
+
+  const step = await gateOrFile(client, {
+    verb: "create_purchase_order",
+    department: "inventory",
+    dutyRef: "inventory.reorder_drafts",
+    // night_ops legitimately holds the duty AND the duty governs the verb.
+    lane: "night_ops",
+    origin: "job",
+    door: "purchases",
+    title: "Reorder before the shelf empties",
+    paramsLine: "2 units",
+    payload: { novaActionId: "nm:test:origin", supplierId: "s", productId: "p", quantity: 2, unitCost: 100 },
+    receipt: { reason: "r", expectedImpact: "i", confidence: 0.5, evidence: [] },
+    preparedDetail: () => "prepared",
+  });
+  assert.equal(step.proceed, false, "level 2 drafts it");
+
+  const row = (await client.listActions()).find(
+    (r) => (r.payload as Record<string, unknown>).novaActionId === "nm:test:origin",
+  );
+  assert.ok(row, "the row is on the ledger");
+  assert.equal(originOf(row!), "job", "and it says a job decided it, not a conversation");
+  assert.match(
+    row!.receipt.evidence.find((e) => e.source === "origin")!.note,
+    /night_ops/,
+    "naming the lane, so an auditor can tell WHICH job",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -345,66 +536,166 @@ test("the production remedy table proposes real verbs — the gap is the DUTY, n
 // ---------------------------------------------------------------------------
 
 /**
- * An IMAGINED in-lane remedy. Every production remedy is out of lane (the test
- * above pins that), so the gate path would otherwise be unreachable — and the
- * day a duty moves into this lane is the wrong day to find out the act path was
- * never written. The subject here is the GATE and the autonomy dial, not the
- * choice of verb: a reorder filed under the low-stock-alert duty this lane
- * really does hold.
+ * THE REHEARSAL FIXTURE — a legitimate reorder, exercised as the lane that
+ * legitimately holds it.
+ *
+ * This replaces a fixture that filed the same `create_purchase_order` under
+ * `inventory.low_stock_alerts` "because the subject here is the GATE, not the
+ * choice of verb". It was not a harmless stand-in: that pair is exactly the
+ * laundering the binding now refuses, and shipping it as a blessed fixture
+ * taught the suite that the violation was the intended shape.
+ *
+ * The honest way to reach the gate path is to be a lane that may: `night_ops`
+ * holds `inventory.reorder_drafts`, and that duty governs a purchase order. So
+ * these two cases drive `settleFinding` AS night_ops — which is precisely the
+ * "the day a duty moves into this lane" rehearsal the act path exists for, with
+ * nothing pretended. `runPulse` itself always passes its own lane; there is no
+ * option to override it.
  */
-const inLaneReorder = () => ({
+const reorderRemedy = () => ({
   type: "create_purchase_order" as const,
-  dutyKey: "inventory.low_stock_alerts",
+  dutyKey: "inventory.reorder_drafts",
   department: "inventory" as const,
   title: "Reorder before the shelf empties",
   paramsLine: "2 units · test supplier",
   payload: { supplierId: "sup-artisan", productId: "prod-candle-amber", quantity: 2, unitCost: 100 },
 });
 
-test("autonomy decides: a gated action becomes a Decision card, not an execution", async () => {
-  await baseline();
+/** One real finding off the seeded store, for the two gate-path cases. */
+async function coverFinding() {
   demo(A).data.products.find((p) => p.id === "prod-candle-amber")!.stock = 2;
+  const sense = await senseStore(A);
+  const finding = comparePulse(sense, null).findings.find((f) => f.key.startsWith("inventory:cover:"));
+  assert.ok(finding, "precondition: a stock-out condition is open on the seeded store");
+  return { sense, finding: finding! };
+}
+
+const oneJudgement = { note: "order it today", findingCount: 1, scopedNote: "order it today" };
+
+test("autonomy decides: a gated action becomes a Decision card, not an execution", async () => {
   const client = storeFor(A);
   assert.equal((await client.getAutonomy()).level, 2, "the demo store ships at level 2 — prepared actions");
+  const { sense, finding } = await coverFinding();
 
-  const result = await runPulse(A, {
-    decide: countingJudge().decide,
-    remedyFor: (finding) => (finding.domain === "inventory" ? inLaneReorder() : null),
-  });
-
-  const outcome = result.findings[0]!.outcome;
+  const outcome = await settleFinding(client, finding, sense, reorderRemedy, oneJudgement, "night_ops");
   assert.equal(outcome.kind, "decision_filed");
-  assert.equal(result.capabilityGaps.length, 0, "the duty is in lane, so this is not a gap — it is a gated act");
 
-  const action = (await client.listActions("prepared")).find((a) => a.dutyRef === "inventory.low_stock_alerts");
+  const action = (await client.listActions("prepared")).find((a) => a.dutyRef === "inventory.reorder_drafts");
   assert.ok(action, "the action is on the ledger as PREPARED, never executed");
   assert.equal(action!.type, "create_purchase_order");
   // The receipt traces the row back to the number this pulse measured.
   assert.ok(action!.receipt.evidence.some((e) => e.source.startsWith("pulse:")));
   assert.match(action!.receipt.reason, /days of cover/);
+  assert.equal(originOf(action!), "job", "a job filed it, and the row says so");
 
   const decision = (await client.listDecisions()).find((d) => d.actionId === action!.id);
   assert.ok(decision, "and the founder has a card to answer");
   assert.equal(decision!.tag, "inventory");
 });
 
-test("even when the gate says EXECUTE, the pulse never invents a write path it does not have", async () => {
-  await baseline();
-  demo(A).data.products.find((p) => p.id === "prod-candle-amber")!.stock = 2;
+/**
+ * C-6. The gate says EXECUTE and the lane has no executor. It used to throw the
+ * whole gate step away — `step.settle`, `step.rowEvidence`, the masked title and
+ * params line — and file NOTHING, so no ledger row recorded that Nova had been
+ * authorized and had not acted, and the seam a future author was invited to fill
+ * had already discarded the replay protocol.
+ */
+test("even when the gate says EXECUTE, the pulse files the authorized-but-unexecuted fact", async () => {
   const client = storeFor(A);
-  const actionsBefore = (await client.listActions()).length;
   // Acting CEO: the dial itself would allow this one.
   await client.setAutonomy({ level: 4, guardrails: DEFAULT_GUARDRAILS, updatedAt: client.now() });
+  const { sense, finding } = await coverFinding();
 
-  const result = await runPulse(A, {
-    decide: countingJudge().decide,
-    remedyFor: (finding) => (finding.domain === "inventory" ? inLaneReorder() : null),
-  });
-
-  const outcome = result.findings[0]!.outcome;
+  const outcome = await settleFinding(client, finding, sense, reorderRemedy, oneJudgement, "night_ops");
   assert.equal(outcome.kind, "no_executor", "founder-plane verbs have no executor on this side — say so, do not fake one");
-  assert.equal((await client.listActions()).length, actionsBefore, "and nothing was filed as done");
-  assert.match((await client.listReports({ kind: "pulse" }))[0]!.body, /no executor/);
+
+  const row = (await client.listActions()).find((a) => a.id === (outcome as { actionId: string }).actionId);
+  assert.ok(row, "and the fact is ON THE LEDGER, not only in a console.warn");
+  assert.equal(row!.status, "prepared", "prepared, because that is what happened: complete, and not performed");
+  assert.notEqual(row!.status, "executed", "nothing ran");
+  assert.match(row!.outcome ?? "", /no executor/);
+  assert.ok(
+    row!.receipt.evidence.some((e) => e.source === "executor" && e.value === "create_purchase_order"),
+    "the missing executor is named as evidence, beside the authority rule that allowed the act",
+  );
+  assert.ok(
+    row!.receipt.evidence.some((e) => e.source === "authority_gate" && e.value === "level:acting_ceo"),
+    "and the gate's own rule survives — the two reasons are distinguishable",
+  );
+  assert.ok(
+    (await client.listDecisions()).some((d) => d.actionId === row!.id),
+    "the founder gets the card, so they can do in one tap what Nova was allowed to do and could not",
+  );
+
+  // The replay protocol survived too: a re-leased rerun answers from the row
+  // that owns the key instead of filing a second purchase order. (It reads back
+  // as `decision_filed` because that is what the row IS — prepared, on the
+  // desk; what matters is that it is the SAME row.)
+  const rowsBefore = (await client.listActions()).length;
+  const again = await settleFinding(client, finding, sense, reorderRemedy, oneJudgement, "night_ops");
+  assert.equal((again as { actionId: string }).actionId, row!.id, "the same row answers, not a second PO");
+  assert.equal((await client.listActions()).length, rowsBefore, "and nothing new was filed");
+});
+
+/**
+ * C-7. `nm:pulse:<condition>` was the whole key, and `findByKey` matches at ANY
+ * status: one founder tapping Reject made that condition permanently unfileable
+ * for the product's life — every later pulse, including one raised because the
+ * condition had materially worsened, answered `replay:rejected`.
+ */
+test("a rejected condition can be raised again the next day — but not twice in one", async () => {
+  const client = storeFor(A);
+  const { sense, finding } = await coverFinding();
+
+  const first = await settleFinding(client, finding, sense, reorderRemedy, oneJudgement, "night_ops");
+  assert.equal(first.kind, "decision_filed");
+  const rowId = (first as { actionId: string }).actionId;
+
+  // The founder says no.
+  const rows = (storeFor(A) as unknown as { data: { actions: { id: string; status: string }[] } }).data.actions;
+  rows.find((r) => r.id === rowId)!.status = "rejected";
+
+  // Same day, same condition: still one row. A pulse that dies after filing and
+  // is re-leased must not file a second purchase order.
+  const sameDay = await settleFinding(client, finding, sense, reorderRemedy, oneJudgement, "night_ops");
+  assert.equal(sameDay.kind, "refused", "the spent key answers from the row that owns it");
+  assert.equal((sameDay as { actionId: string }).actionId, rowId);
+
+  // Tomorrow, with the condition news again: a key nobody has spent.
+  const tomorrow = { ...sense, at: new Date(Date.parse(sense.at) + 24 * 3600 * 1000).toISOString() };
+  const nextDay = await settleFinding(client, finding, tomorrow, reorderRemedy, oneJudgement, "night_ops");
+  assert.equal(nextDay.kind, "decision_filed", "a genuinely recurring condition is not silenced forever by one no");
+  assert.notEqual((nextDay as { actionId: string }).actionId, rowId);
+});
+
+/**
+ * The other half of C-7's sibling defect: ONE judgement is bought per moved
+ * department, and it used to be pasted onto every finding's receipt — so
+ * finding B's Decision card could carry the note the model wrote about A.
+ */
+test("a department-level note is labelled as one, never presented as this finding's own", async () => {
+  const client = storeFor(A);
+  const { sense, finding } = await coverFinding();
+  const shared = scopeJudgement(
+    { worthWaking: true, headline: "h", note: "reorder the amber candle" },
+    "inventory",
+    3,
+  );
+
+  const outcome = await settleFinding(client, finding, sense, reorderRemedy, shared, "night_ops");
+  const row = (await client.listActions()).find((a) => a.id === (outcome as { actionId: string }).actionId)!;
+  assert.match(
+    row.receipt.expectedImpact,
+    /all 3 inventory findings this pass/,
+    "the impact label says whose note it is",
+  );
+  assert.ok(
+    row.receipt.evidence.some((e) => e.source === "pulse:judgement" && String(e.value).includes("all 3")),
+    "and the scope rides as evidence beside the note itself",
+  );
+
+  // A department with ONE finding is the case where the note really is about it.
+  assert.equal(scopeJudgement({ worthWaking: true, headline: "h", note: "n" }, "inventory", 1).scopedNote, "n");
 });
 
 // ---------------------------------------------------------------------------

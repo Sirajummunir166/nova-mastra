@@ -37,7 +37,15 @@
  * 3. **Runtime** — {@link assertDutyInLane}: a brain workflow may only pass a
  *    `dutyKey` drawn from its own lane. That is what turns this registry from
  *    documentation into a CAPABILITY BOUND — a pulse cannot quietly start
- *    pausing ad sets.
+ *    pausing ad sets. Enforced AT THE GATE (`gateOrFile` calls it for every
+ *    filing whose lane is a job kind), not by each lane remembering to; a lane
+ *    names itself on the `GateSpec` and the seam does the rest.
+ *
+ * A SECOND BOUND SITS BESIDE IT, and it is the one that makes this one worth
+ * anything: `VERB_DUTIES` in `src/store/duties.ts` says which duties may govern
+ * which verb. Lane membership alone would still let the pulse file a purchase
+ * order under `inventory.low_stock_alerts` — a duty it legitimately holds, and
+ * the wrong law to judge a purchase order under.
  *
  * ## What a claim means, precisely
  *
@@ -378,6 +386,15 @@ export const LANE_CLAIMED_DUTY_KEYS: ReadonlySet<string> = new Set(
  * authority layer, and `evaluateAuthority` would happily evaluate it, because
  * from there a valid key is a valid key. With it, the pulse cannot quietly
  * start pausing ad sets — `marketing.pause_weak_ad_sets` is not in its lane.
+ *
+ * WHERE IT IS CALLED FROM, and why that had to change. It used to be called
+ * from nowhere but its own test: the pulse re-implemented the same membership
+ * check inline, so the registry's "runtime bound" was enforced by convention in
+ * one file, and every future lane had to remember. It is now called by
+ * `gateOrFile` (front-office/actions.ts) — the ONE seam every lane files
+ * through, which takes the lane on its `GateSpec` and asserts membership there,
+ * beside the verb↔duty binding. A lane cannot decline to be bounded, because it
+ * cannot decline to name itself: the field is required.
  *
  * Throws rather than returning false: this is a programming error at the seam
  * between a workflow and the gate, not a runtime condition to branch on.
