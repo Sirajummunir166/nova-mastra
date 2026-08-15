@@ -1339,6 +1339,10 @@ test("turn wiring, live: an order the gate BLOCKED becomes a guardrail_blocked h
 import { orderActionKey, handoverActionKey, buildActionLine, ORDER_FACTS } from "./turn.js";
 import { PREPARED_DETAIL_BY_VERB, resolveDiscountAmount } from "./actions.js";
 import { newLiveContext } from "./state.js";
+// Phase E: the instructed lane's directives reach the same writer prompt as
+// every line above, so the honesty suite has to be able to see them.
+import { instructionFor } from "../brain/router.js";
+import type { JobKind, NovaJob } from "../store/types.js";
 
 /** A BD mobile and a street line — the two shapes no founder-facing string may carry. */
 const PII_STREET = "House 5, Road 2, Dhanmondi";
@@ -2020,6 +2024,59 @@ async function customerFacingLines(): Promise<Array<{ where: string; text: strin
   const onlyClosed = newLiveContext("conv-wording-closed", AURORA);
   onlyClosed.pendingOrders = [{ actionId: "a4", title: "Linen Throw", state: "closed" }];
   lines.push({ where: "turn ANSWER_ORDER_STATUS (only closed)", text: buildActionLine(onlyClosed, "ANSWER_ORDER_STATUS", "") });
+
+  // Phase E: the instructed lane. Nova opening its own mouth is still Nova
+  // talking to a customer, so both halves of what reaches the writer belong in
+  // this list — the ACTION line, and the fenced NOVA'S OWN DIRECTIVE beside it.
+  // A directive is the newest place a plausible-sounding promise could be
+  // written down, which is exactly why it is enumerated here.
+  for (const action of ["PAY_PROMISE", "CART_NUDGE", "NBA_NUDGE", "CASE_UPDATE"]) {
+    lines.push({ where: `turn ${action}`, text: buildActionLine(ctx, action, "") });
+  }
+  const job = (kind: JobKind, payload: Record<string, unknown>): NovaJob => ({
+    id: "job_wording",
+    kind,
+    payload,
+    dueAt: new Date().toISOString(),
+    priority: 3,
+    status: "leased",
+    attempts: 1,
+    lastError: null,
+    dedupeKey: `${kind}:wording`,
+    leaseUntil: null,
+    department: null,
+    leaseToken: "lt",
+  });
+  const directives: Array<[string, NovaJob, Parameters<typeof instructionFor>[1]]> = [
+    [
+      "inbox_reply",
+      job("inbox_reply", { conversationId: "c1" }),
+      { lane: "customer_turn", kind: "inbox_reply", conversationId: "c1", platform: "messenger", mode: "inbox_reply" },
+    ],
+    [
+      "followup/promise",
+      job("followup", { conversationId: "c1", promiseId: "p1" }),
+      { lane: "customer_turn", kind: "followup", conversationId: "c1", platform: "messenger", mode: "promise", promiseId: "p1" },
+    ],
+    [
+      "followup/cart_recovery",
+      job("followup", { conversationId: "c1", triggeredBy: "cart_recovery", cartItems: [{ name: "Linen Throw", qty: 2 }] }),
+      { lane: "customer_turn", kind: "followup", conversationId: "c1", platform: "messenger", mode: "cart_recovery" },
+    ],
+    [
+      "followup/nba_nudge",
+      job("followup", { conversationId: "c1" }),
+      { lane: "customer_turn", kind: "followup", conversationId: "c1", platform: "messenger", mode: "nba_nudge" },
+    ],
+    [
+      "case_update",
+      job("case_update", { conversationId: "c1", caseId: "case_1" }),
+      { lane: "customer_turn", kind: "case_update", conversationId: "c1", platform: "messenger", mode: "case_update" },
+    ],
+  ];
+  for (const [where, row, plan] of directives) {
+    lines.push({ where: `directive ${where}`, text: instructionFor(row, plan).directive });
+  }
   return lines;
 }
 

@@ -7,24 +7,42 @@
 import type { Intent } from "./classify.js";
 import { computeMissing, type NovaLiveContext } from "./state.js";
 
-export type NextAction =
-  | "GREET"
-  | "ASK_PRODUCT"
-  | "ANSWER_PRICE"
-  | "ANSWER_STOCK"
-  | "ANSWER_DELIVERY_FAQ"
-  | "ASK_SIZE"
-  | "ASK_QTY"
-  | "ASK_ZONE"
-  | "ASK_PHONE_ADDR"
-  | "PRESENT_SUMMARY"
-  | "CREATE_ORDER"
-  | "DECLINE_DISCOUNT_ONCE"
-  | "OFFER_ALTERNATIVE"
-  | "ANSWER_ORDER_STATUS"
-  | "ESCALATE"
-  | "ACKNOWLEDGE_REJECT"
-  | "CLARIFY";
+/**
+ * THE CLOSED SET, spelled once at runtime.
+ *
+ * It is a value and not only a type because the instruction seam
+ * (`turn.ts`) has to VALIDATE an action label that arrived from outside the
+ * process — a job payload is data, and a type gives a string arriving at
+ * runtime no protection at all. A second hand-written list would drift from
+ * this union the first time an action is added; deriving the type from the
+ * list makes drift impossible.
+ */
+export const NEXT_ACTIONS = [
+  "GREET",
+  "ASK_PRODUCT",
+  "ANSWER_PRICE",
+  "ANSWER_STOCK",
+  "ANSWER_DELIVERY_FAQ",
+  "ASK_SIZE",
+  "ASK_QTY",
+  "ASK_ZONE",
+  "ASK_PHONE_ADDR",
+  "PRESENT_SUMMARY",
+  "CREATE_ORDER",
+  "DECLINE_DISCOUNT_ONCE",
+  "OFFER_ALTERNATIVE",
+  "ANSWER_ORDER_STATUS",
+  "ESCALATE",
+  "ACKNOWLEDGE_REJECT",
+  "CLARIFY",
+] as const;
+
+export type NextAction = (typeof NEXT_ACTIONS)[number];
+
+/** Runtime membership test for a string that came from outside this process. */
+export function isNextAction(value: unknown): value is NextAction {
+  return typeof value === "string" && (NEXT_ACTIONS as readonly string[]).includes(value);
+}
 
 /**
  * Order of asks on the checkout ladder: variant → qty → zone → phone/addr →

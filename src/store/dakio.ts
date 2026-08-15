@@ -76,6 +76,7 @@ import type {
   IntentObservedRequest,
   IntentObservedResult,
   JobKind,
+  JobSettleResult,
   LinkCustomerRequest,
   LinkCustomerResult,
   MemoryEntry,
@@ -122,6 +123,61 @@ export class NotImplementedError extends Error {
   }
 }
 
+/**
+ * A request that ran out of time — either one attempt exceeded the per-attempt
+ * timeout, or the whole call (attempts + backoff) exceeded its deadline.
+ *
+ * Typed and thrown rather than left to hang, because "hung" is the one failure
+ * a caller cannot act on. A brain job whose store call never settles holds its
+ * 10-minute lease open until the watchdog takes it back and re-runs the work,
+ * and — since the dispatcher awaits its tenants together — holds every other
+ * tenant's tick open with it. A rejection, by contrast, lands in the
+ * dispatcher's existing release arm within a bounded time.
+ */
+export class DakioTimeoutError extends Error {
+  readonly timeoutMs: number;
+  readonly elapsedMs: number;
+  constructor(message: string, timeoutMs: number, elapsedMs: number) {
+    super(message);
+    this.name = "DakioTimeoutError";
+    this.timeoutMs = timeoutMs;
+    this.elapsedMs = elapsedMs;
+  }
+}
+
+/**
+ * Per-attempt timeout. Deliberately far above the 8s the fleet and profile
+ * reads use: those are single cheap lookups, while these are merchant-data
+ * reads that can legitimately be slow on a cold Railway container or a large
+ * order list. 20s kills a HUNG call, not a slow one.
+ */
+const DEFAULT_TIMEOUT_MS = 20_000;
+/**
+ * Whole-call budget across every attempt and backoff. Bounded well inside the
+ * 10-minute job lease so a store call can never be the reason a lease lapses,
+ * and above one attempt so the retry budget is still worth something.
+ */
+const DEFAULT_DEADLINE_MS = 45_000;
+
+function envMs(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  // A bad or non-positive value is never "no bound" — that is the bug this
+  // whole change exists to remove.
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** Default per-attempt timeout, overridable with `NOVA_STORE_TIMEOUT_MS`. */
+export function defaultRequestTimeoutMs(): number {
+  return envMs("NOVA_STORE_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
+}
+
+/** Default whole-call deadline, overridable with `NOVA_STORE_DEADLINE_MS`. */
+export function defaultRequestDeadlineMs(): number {
+  return envMs("NOVA_STORE_DEADLINE_MS", DEFAULT_DEADLINE_MS);
+}
+
 export interface DakioClientConfig {
   baseUrl: string;
   /**
@@ -132,6 +188,10 @@ export interface DakioClientConfig {
   token: string | (() => string);
   /** Retry budget for 429/5xx. Default 3. */
   maxRetries?: number;
+  /** Per-attempt timeout in ms. Default {@link defaultRequestTimeoutMs}. */
+  timeoutMs?: number;
+  /** Whole-call budget in ms, across attempts and backoff. Default {@link defaultRequestDeadlineMs}. */
+  deadlineMs?: number;
 }
 
 interface RequestOptions {
@@ -158,10 +218,29 @@ interface RequestOptions {
 
 const RETRYABLE = new Set([429, 500, 502, 503, 504]);
 
+/**
+ * Did this rejection come from our own AbortSignal.timeout?
+ *
+ * `AbortSignal.timeout` rejects with a DOMException named `TimeoutError`;
+ * undici wraps some of those as an `AbortError` and some as a TypeError whose
+ * `cause` carries the real one, so all three shapes are checked. Anything else
+ * stays a plain network error and keeps its existing message.
+ */
+function isTimeout(err: unknown): boolean {
+  for (let cur: unknown = err, depth = 0; cur && depth < 4; depth += 1) {
+    const name = (cur as { name?: unknown }).name;
+    if (name === "TimeoutError" || name === "AbortError") return true;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 export class DakioStoreClient implements StoreClient {
   private readonly base: string;
   private readonly tokenProvider: () => string;
   private readonly maxRetries: number;
+  private readonly timeoutMs: number;
+  private readonly deadlineMs: number;
 
   constructor(
     private readonly storeId: string,
@@ -170,6 +249,10 @@ export class DakioStoreClient implements StoreClient {
     this.base = config.baseUrl.replace(/\/+$/, "");
     this.tokenProvider = typeof config.token === "function" ? config.token : () => config.token as string;
     this.maxRetries = config.maxRetries ?? 3;
+    this.timeoutMs = config.timeoutMs ?? defaultRequestTimeoutMs();
+    // A deadline shorter than one attempt would make the timeout unreachable,
+    // so the floor is one full attempt.
+    this.deadlineMs = Math.max(config.deadlineMs ?? defaultRequestDeadlineMs(), this.timeoutMs);
   }
 
   now(): string {
@@ -203,20 +286,50 @@ export class DakioStoreClient implements StoreClient {
     const url = this.url(path, opts.query);
     let lastErr: unknown;
 
+    // Every attempt AND every backoff spends from one budget. Without this a
+    // hung dakio-api parked the call forever (no signal was ever passed), and
+    // with only a per-attempt timeout the retries would still stack to
+    // maxRetries × timeout — long enough to outlive a job lease.
+    const startedAt = Date.now();
+    const remaining = (): number => this.deadlineMs - (Date.now() - startedAt);
+
     for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
+      const budget = remaining();
+      if (budget <= 0) {
+        throw new DakioTimeoutError(
+          `Dakio ${method} ${path} exceeded its ${this.deadlineMs}ms deadline after ${attempt} attempt(s)` +
+            (lastErr ? ` (last error: ${String(lastErr)})` : ""),
+          this.deadlineMs,
+          Date.now() - startedAt,
+        );
+      }
+      // Never let one attempt run past the whole call's deadline.
+      const attemptTimeoutMs = Math.min(this.timeoutMs, budget);
+
       let res: Response;
       try {
         res = await fetch(url, {
           method,
           headers,
           body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+          // The bounded wait. `AbortSignal.timeout` aborts the body stream too,
+          // so a server that sends headers and then stalls is covered as well.
+          signal: AbortSignal.timeout(attemptTimeoutMs),
         });
       } catch (err) {
-        // Network error — retry with backoff.
+        // Network error OR the timeout firing — both retryable, both bounded.
         lastErr = err;
-        if (attempt < this.maxRetries) {
-          await this.backoff(attempt);
+        if (attempt < this.maxRetries && remaining() > 0) {
+          await this.backoff(attempt, remaining());
           continue;
+        }
+        if (isTimeout(err)) {
+          throw new DakioTimeoutError(
+            `Dakio ${method} ${path} timed out after ${attempt + 1} attempt(s) ` +
+              `(${attemptTimeoutMs}ms per attempt, ${this.deadlineMs}ms deadline)`,
+            attemptTimeoutMs,
+            Date.now() - startedAt,
+          );
         }
         throw new Error(`Dakio ${method} ${path} failed: ${String(err)}`);
       }
@@ -243,9 +356,9 @@ export class DakioStoreClient implements StoreClient {
         if (res.status === 204) return undefined as T;
         return (await res.json()) as T;
       }
-      if (RETRYABLE.has(res.status) && attempt < this.maxRetries) {
+      if (RETRYABLE.has(res.status) && attempt < this.maxRetries && remaining() > 0) {
         lastErr = new Error(`HTTP ${res.status}`);
-        await this.backoff(attempt);
+        await this.backoff(attempt, remaining());
         continue;
       }
       // Non-retryable (or budget exhausted): surface the taxonomy.
@@ -255,11 +368,13 @@ export class DakioStoreClient implements StoreClient {
     throw new Error(`Dakio ${method} ${path} exhausted retries: ${String(lastErr)}`);
   }
 
-  private backoff(attempt: number): Promise<void> {
-    // Exponential + jitter: ~150ms, 300ms, 600ms …
+  private backoff(attempt: number, budgetMs = Number.POSITIVE_INFINITY): Promise<void> {
+    // Exponential + jitter: ~150ms, 300ms, 600ms … capped by whatever is left
+    // of the deadline, so sleeping never eats the budget it is waiting for.
     const base = 150 * 2 ** attempt;
     const jitter = base * 0.25 * Math.random();
-    return new Promise((r) => setTimeout(r, base + jitter));
+    const wait = Math.max(0, Math.min(base + jitter, budgetMs));
+    return new Promise((r) => setTimeout(r, wait));
   }
 
   private get<T>(path: string, query?: RequestOptions["query"], nullOn404 = false): Promise<T> {
@@ -1244,18 +1359,33 @@ export class DakioStoreClient implements StoreClient {
     return jobs;
   }
 
-  async completeJob(id: string, leaseToken: string, sessionId?: string): Promise<void> {
-    await this.request(`/api/v1/agent-data/jobs/${encodeURIComponent(id)}/complete`, {
-      method: "POST",
-      body: { leaseToken, sessionId },
-    });
+  /**
+   * Both settle routes answer 200 either way: `{ok:true}` when this lease
+   * really wrote the outcome, `{ok:true, stale:true}` when it did not because
+   * the lease had already been recovered (novaJobs.js — the `upd.count === 0`
+   * branch on complete, the `!job` and post-race branches on release). Since
+   * the difference is a body field and not a status, reading it is the ONLY
+   * way to tell "settled" from "orphaned"; ignoring the response, as this used
+   * to, makes the two indistinguishable at every layer above.
+   *
+   * Anything the server does not explicitly mark stale is `false` — a body
+   * from an older dakio-api that never sends the field must read as "wrote it",
+   * because assuming stale would make every normal completion look duplicated.
+   */
+  async completeJob(id: string, leaseToken: string, sessionId?: string): Promise<JobSettleResult> {
+    const body = await this.request<{ stale?: unknown } | undefined>(
+      `/api/v1/agent-data/jobs/${encodeURIComponent(id)}/complete`,
+      { method: "POST", body: { leaseToken, sessionId } },
+    );
+    return { ok: true, stale: body?.stale === true };
   }
 
-  async releaseJob(id: string, leaseToken: string, error: string): Promise<void> {
-    await this.request(`/api/v1/agent-data/jobs/${encodeURIComponent(id)}/release`, {
-      method: "POST",
-      body: { leaseToken, error },
-    });
+  async releaseJob(id: string, leaseToken: string, error: string): Promise<JobSettleResult> {
+    const body = await this.request<{ stale?: unknown } | undefined>(
+      `/api/v1/agent-data/jobs/${encodeURIComponent(id)}/release`,
+      { method: "POST", body: { leaseToken, error } },
+    );
+    return { ok: true, stale: body?.stale === true };
   }
 
   // ---- Catalog photo memory (Stage 11 Phase 3) ----

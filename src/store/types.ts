@@ -2071,6 +2071,29 @@ export interface NovaJob {
   leaseToken: string | null;
 }
 
+/**
+ * What `completeJob` / `releaseJob` answer.
+ *
+ * The whole point of this type is the one boolean. dakio-api answers a
+ * SUPERSEDED lease with HTTP 200 `{ok:true, stale:true}` — not an error,
+ * because nothing went wrong: the lease window simply passed, the watchdog
+ * re-dued the row, and somebody else owns it now. That 200 is the ONLY way a
+ * caller ever learns its lease was recovered and its work may be running
+ * twice. Both backends used to answer `void`, so the signal never left the
+ * HTTP layer.
+ *
+ * `stale: true` ⇒ NOTHING was written. Do not treat it as success (the row did
+ * not record this outcome) and do not retry it (the row has moved on) — treat
+ * it as "my work was orphaned": worth logging, worth counting, and worth
+ * knowing before any side effect this job performs is assumed unique.
+ */
+export interface JobSettleResult {
+  /** Always `true`. The call was ACCEPTED; failures throw instead. */
+  readonly ok: true;
+  /** `true` = superseded lease, nothing written, work possibly duplicated. */
+  readonly stale: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Seed container
 // ---------------------------------------------------------------------------

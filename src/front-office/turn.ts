@@ -10,7 +10,7 @@
  */
 
 import { classifyL0, detectLang, type Classified, type Intent } from "./classify.js";
-import { nextBestAction, type NextAction } from "./nba.js";
+import { isNextAction, nextBestAction, type NextAction } from "./nba.js";
 import { renderStateCard, renderRecent } from "./card.js";
 import { loadContext, primeContext, saveContext, withTurnLock } from "./context-store.js";
 import { observe, TTL } from "./cache.js";
@@ -69,11 +69,173 @@ export interface TurnOptions {
   epoch?: number;
 }
 
+/* ───────────────────────────────────────────────────────────────────────────
+ * THE INSTRUCTION SEAM — Nova's own words are not the customer's
+ * (phase E spec §B, problem 2: "do not paper over it")
+ *
+ * `runCustomerTurn(storeId, convId, message)` takes CUSTOMER SPEECH. The three
+ * conversation-bound job kinds are not that:
+ *
+ *   inbox_reply  "re-read the unprocessed events on this thread and reply"
+ *   followup     "a promise you made is coming due — pay it off"
+ *   case_update  "case X moved; tell them what happened"
+ *
+ * Those are instructions TO a turn. Passing one as `message` — the shortcut the
+ * spec names — would hand Nova's own sentence to `classifyL0`/the resolver as
+ * if the customer had typed it. The damage is not cosmetic: "A promise you made
+ * on this conversation is coming due" contains no product, no size, no zone and
+ * no confirm, so L0 misses, the paid resolver runs on Nova's own prose, and the
+ * NBA ladder then plans the next customer step from an intent the customer never
+ * expressed. It would also be PUSHED INTO `ctx.recent` as `role: "customer"`,
+ * i.e. written into the durable thread state as something the customer said —
+ * which every later turn, every state card and every escalation brief would
+ * then read back as fact.
+ *
+ * ── WHY A SECOND ENTRY POINT, NOT AN `instruction` FIELD ON `TurnOptions` ────
+ *
+ * Both were on the table. `runInstructedTurn` won on three counts:
+ *
+ * 1. THE SIGNATURE STOPS THE MISTAKE. An options field leaves
+ *    `runCustomerTurn(store, conv, "pay off promise p_1")` a legal call that
+ *    type-checks and silently does the wrong thing. `runInstructedTurn` has no
+ *    `message` parameter AT ALL — the customer's words are not the caller's to
+ *    supply, because the seam re-reads them from the store itself. A wrong call
+ *    is not available to write.
+ * 2. THE CUSTOMER TEXT COMES FROM A DIFFERENT PLACE. A live turn is handed the
+ *    message by the ingress (dakio-api just delivered it). An instructed turn
+ *    must RE-READ the thread — nova-ai's ids-only discipline: content never
+ *    rides the job bus, because what a job carries is what was true when the
+ *    job was minted, and the whole point of re-reading is that the world moved.
+ *    That is a different data flow, not a different flag on the same one.
+ * 3. THE OUTCOME CONTRACT DIFFERS. A live turn always owes an answer. An
+ *    instructed turn may legitimately end in SILENCE (an NBA nudge that finds
+ *    nothing worth saying) or in NO TURN AT ALL (a promise whose debt is gone).
+ *    `TurnResult.silent`/`skipped` exist for that, and only this entry point
+ *    can produce them.
+ *
+ * What the instruction is allowed to do, exactly:
+ *   • it decides WHAT THE TURN IS FOR (the ACTION label the writer is briefed
+ *     with, when Nova is the one opening its mouth);
+ *   • it reaches the writer prompt as a clearly-fenced NOVA'S OWN DIRECTIVE
+ *     block, never inside the LAST MESSAGES transcript;
+ *   • it is NEVER classified, never language-detected, never pushed into
+ *     `ctx.recent`, and never counted as a customer turn.
+ *
+ * SHADOW STILL HOLDS. An instructed turn inherits the same default (`shadow`)
+ * and the same gates: the order gate is unreachable in shadow, the hand-over
+ * gate is unreachable in shadow, and nothing in this file has ever sent a
+ * message to a customer in either mode — this lane DRAFTS (phase C/D). An
+ * instructed turn therefore writes nothing a live one would not.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/** The three conversation-bound job kinds — the only things that may instruct a turn. */
+export type InstructedJobKind = "inbox_reply" | "followup" | "case_update";
+
+/**
+ * The sub-mode, which is finer than the kind because `followup` carries three
+ * different jobs of work behind one row (nova-ai Stage 10 modules 03/04/05):
+ *
+ *   promise        — Nova owes a specific answer at a specific time. Pre-checked
+ *                    by the router: if the debt is gone there is no turn at all.
+ *   cart_recovery  — the ONLY seam that carries a payload snapshot (the basket),
+ *                    because ids-only would leave the model unable to name the
+ *                    item and "you left something in your cart" is a blast.
+ *   nba_nudge      — Nova owes NOTHING. Silence is a legitimate outcome.
+ */
+export type InstructedTurnMode =
+  | "inbox_reply"
+  | "promise"
+  | "cart_recovery"
+  | "nba_nudge"
+  | "case_update";
+
+/**
+ * The four action labels that exist ONLY because Nova opened its own mouth.
+ * Each is the meaning of one `InstructedTurnMode` — see `ACTION_FOR_MODE`.
+ */
+export type InstructedAction = "PAY_PROMISE" | "CART_NUDGE" | "NBA_NUDGE" | "CASE_UPDATE";
+
+/**
+ * The ONE action each Nova-speaks-first mode means. `inbox_reply` is absent on
+ * purpose: it IS a customer turn, so the deterministic ladder picks its move and
+ * the instruction's label is never read.
+ */
+const ACTION_FOR_MODE: Record<Exclude<InstructedTurnMode, "inbox_reply">, InstructedAction> = {
+  promise: "PAY_PROMISE",
+  cart_recovery: "CART_NUDGE",
+  nba_nudge: "NBA_NUDGE",
+  case_update: "CASE_UPDATE",
+};
+
+const INSTRUCTED_MODES: ReadonlySet<string> = new Set<InstructedTurnMode>([
+  "inbox_reply",
+  "promise",
+  "cart_recovery",
+  "nba_nudge",
+  "case_update",
+]);
+
+/**
+ * The two actions that reach a dakio-api MUTATION (`hardValidateAndCreate` →
+ * `create_order_from_chat`, and `performFlagHandover` → `escalate_conversation`).
+ * An instruction may never name either — see `validateInstructedAction`.
+ */
+const WRITE_ACTIONS: ReadonlySet<string> = new Set<NextAction>(["CREATE_ORDER", "ESCALATE"]);
+
+export interface TurnInstruction {
+  jobKind: InstructedJobKind;
+  mode: InstructedTurnMode;
+  /**
+   * Nova's own directive, in Nova's own voice. Rendered to the writer under its
+   * own fenced heading; never classified, never stored as customer speech.
+   */
+  directive: string;
+  /**
+   * The ACTION label the writer is briefed with WHEN NOVA SPEAKS FIRST (no new
+   * customer message to answer). When there IS fresh customer text, the
+   * deterministic NBA ladder decides the action exactly as on the live lane —
+   * an instruction may say what a turn is for, never what the customer needs.
+   *
+   * TYPED AS `string` ON PURPOSE, and validated at the seam
+   * (`validateInstructedAction`): this field is filled from a JOB PAYLOAD, i.e.
+   * from outside this process, where a union buys nothing at all. The closed set
+   * it is checked against is `NEXT_ACTIONS` ∪ the four instructed labels, minus
+   * the two write actions.
+   */
+  action: string;
+  /**
+   * Does someone expect an answer? `false` ⇒ a turn that says nothing is a
+   * SUCCESS, not a failure — the NBA-nudge contract.
+   */
+  owesReply: boolean;
+  /** ids-only: the inbound messages that triggered this job (inbox_reply). */
+  messageIds?: string[];
+  /** Audit/observability only — never authorization. */
+  jobId?: string;
+  /**
+   * WHICH debt this turn is meant to pay (`mode: "promise"`). An id ALONE does
+   * not say which thread it is owed on, which is why {@link TurnInstruction.promise}
+   * exists — see `assertPromiseOwedHere`.
+   */
+  promiseId?: string;
+  /**
+   * THE PROMISE ROW ITSELF, as the router read it — the thing an id cannot be.
+   *
+   * `conversationId` is the field that matters: a promise is a debt owed to a
+   * person ON A THREAD, and a job that pairs promise P with conversation B pays
+   * A's debt into B's thread. The router's guard rail only checks that SOME
+   * conversationId is present on the payload; the row's own is the one that
+   * decides. Supply it and the seam enforces it without a second read; omit it
+   * and the seam reads the promise back itself (a fallback, not the contract).
+   */
+  promise?: { id: string; conversationId: string | null };
+}
+
 export interface TurnResult {
   reply: string;
   intent: Intent;
   rung: 0 | 1;
-  action: NextAction | "ORDER_CONFIRMED" | "ORDER_PENDING_APPROVAL";
+  action: NextAction | InstructedAction | "ORDER_CONFIRMED" | "ORDER_PENDING_APPROVAL";
   stage: string;
   missing: string[];
   stateCard: string;
@@ -93,6 +255,27 @@ export interface TurnResult {
   wouldHaveDone?: Record<string, unknown>;
   /** Shadow only: model call(s) that failed; the turn still returned its deterministic half. */
   modelFailure?: string;
+
+  /* ── Instructed turns only (`runInstructedTurn`) ─────────────────────────── */
+  /** What asked for this turn, and what the classifier actually saw. */
+  instructed?: {
+    jobKind: InstructedJobKind;
+    mode: InstructedTurnMode;
+    jobId?: string;
+    owesReply: boolean;
+    /**
+     * The customer's latest inbound as re-read from the store — `null` when
+     * Nova opened its own mouth (nothing new to classify). NEVER the directive.
+     */
+    classifiedInbound: string | null;
+  };
+  /**
+   * The turn deliberately produced no customer-visible words. Only an honest
+   * answer when `instructed.owesReply` is false, or when the thread is locked.
+   */
+  silent?: boolean;
+  /** The turn did nothing at all — and spent no model call doing it. */
+  skipped?: "no_inbound" | "already_answered" | "thread_locked";
 }
 
 /* ── At-most-once keys — ONE derivation per verb ────────────────────────────
@@ -212,6 +395,268 @@ export function runCustomerTurn(
   return withTurnLock(storeId, convId, () => executeTurn(storeId, convId, message, mode, epoch));
 }
 
+/**
+ * One turn on a customer thread that NOVA asked for — the entry point the three
+ * conversation-bound job kinds use. See the seam block above `TurnInstruction`
+ * for why this is a separate function and not a flag.
+ *
+ * There is no `message` parameter on purpose: the customer's latest inbound is
+ * RE-READ from the store here (`getInboxConversation`, the same read the shadow
+ * ingress uses), because ids-only means the job row cannot be trusted to carry
+ * what was said — only which thread it was said on.
+ */
+export async function runInstructedTurn(
+  storeId: string,
+  convId: string,
+  instruction: TurnInstruction,
+  opts: TurnOptions = {},
+): Promise<TurnResult> {
+  // THE BOUNDARY CHECK, before a lock is taken, a thread is read or a model is
+  // paid: everything on `instruction` came from a job payload, and the two
+  // fields that can select real-world consequences (the action label and the
+  // promise this turn claims to be paying) are checked here or nowhere.
+  const action = validateInstructedAction(instruction);
+  if (instruction.mode === "promise") await assertPromiseOwedHere(storeId, convId, instruction);
+
+  const mode: TurnMode = opts.mode ?? "shadow";
+  // The epoch is READ, never computed (Stage 11 discipline, same as the shadow
+  // ingress): dakio-api's session roll partitions the persisted context, and a
+  // turn that guessed 0 on a rolled thread would mint at-most-once keys that
+  // replay the previous session's rows. `getSessionEpoch` answers 0 rather than
+  // throwing on an unreachable server; the catch covers a client that does not.
+  const epoch =
+    Number.isFinite(opts.epoch) && (opts.epoch as number) > 0
+      ? Math.floor(opts.epoch as number)
+      : await storeFor(storeId)
+          .getSessionEpoch(convId)
+          .catch(() => 0);
+
+  const inbound = await readLatestInbound(storeId, convId, instruction.messageIds);
+  return withTurnLock(storeId, convId, () =>
+    executeTurn(storeId, convId, inbound.text, mode, epoch, { instruction, inbound, action }),
+  );
+}
+
+/** What an instructed turn carries into `executeTurn` beyond the customer text. */
+interface InstructedInput {
+  instruction: TurnInstruction;
+  inbound: { text: string; ids: string[] };
+  /** The VALIDATED action label — the only one `executeTurn` may read. */
+  action: NextAction | InstructedAction;
+}
+
+/* ── D1: the action label is data from a job, so it is validated like data ───
+ *
+ * `instruction.action` used to be cast (`as NextAction`) straight into the
+ * variable that drives BOTH write gates. A typo'd or hostile label therefore
+ * selected a write path with nothing in between: `CREATE_ORDER` walked into the
+ * order gate (live: a real dakio-api order, or a prepared card on the founder's
+ * desk; shadow: a `create_chat_order` row minted under this conversation's own
+ * at-most-once key), and `ESCALATE` walked into the hand-over gate, which locks
+ * the thread for the rest of the epoch and raises a card for a human.
+ *
+ * ── MAY AN INSTRUCTED TURN SELECT THE ORDER GATE AT ALL? NO. ────────────────
+ *
+ * A job saying "place the order" and a customer saying "hae" are not the same
+ * trust statement, and the gate is built on the second one. Everything it sends
+ * to dakio-api asserts the customer: the payload's `confirmedByCustomer: true`,
+ * the receipt's "customer replied yes to the final order summary", the
+ * conversation-sourced evidence row. A job payload can assert none of that — it
+ * knows only that some scheduler woke up. Worse, the ladder-side precondition
+ * (`intent === "confirm" && ctx.purchase.confirmSent`) is exactly what the
+ * instructed path SKIPS: on a Nova-speaks-first turn the label bypasses
+ * `nextBestAction`, so an instruction naming CREATE_ORDER is an order placed
+ * with no summary presented and no confirmation given.
+ *
+ * The same holds one gate over: an instruction naming ESCALATE would hand a live
+ * thread to a person, and mute Nova on it, because a job payload said so.
+ *
+ * What this does NOT touch: an `inbox_reply` turn IS a customer turn, and the
+ * ladder may still decide CREATE_ORDER or ESCALATE from the customer's own
+ * re-read words. That decision comes from `nextBestAction` on customer speech,
+ * which is precisely the trust statement the gate is built on.
+ */
+function validateInstructedAction(instruction: TurnInstruction): NextAction | InstructedAction {
+  const { mode, action } = instruction;
+  if (!INSTRUCTED_MODES.has(mode)) {
+    throw new Error(
+      `nova instructed turn: unknown instruction mode ${JSON.stringify(mode)} — the seam accepts only ` +
+        `${[...INSTRUCTED_MODES].join(" | ")}`,
+    );
+  }
+  if (typeof action !== "string" || action.length === 0) {
+    throw new Error(`nova instructed turn: instruction (mode ${mode}) carries no action label`);
+  }
+  if (WRITE_ACTIONS.has(action)) {
+    throw new Error(
+      `nova instructed turn: an instruction may not select the write action ${action} — ` +
+        "a job asking for it is not a customer confirming one, and the gate's whole safety argument " +
+        "is the customer's own words (see the note above `validateInstructedAction`)",
+    );
+  }
+  if (mode === "inbox_reply") {
+    // The label is a fallback name only — the ladder decides this lane's move —
+    // but an unknown string in a field this file reads is still a bug worth
+    // failing on rather than carrying.
+    if (!isNextAction(action)) {
+      throw new Error(
+        `nova instructed turn: inbox_reply carries action ${JSON.stringify(action)}, which is not a known action`,
+      );
+    }
+    return action;
+  }
+  const expected = ACTION_FOR_MODE[mode];
+  if (action !== expected) {
+    throw new Error(
+      `nova instructed turn: mode ${mode} means ${expected}, but the instruction carries ` +
+        `${JSON.stringify(action)} — the mode names the work, and the label may not disagree with it`,
+    );
+  }
+  return expected;
+}
+
+/* ── D3: a promise is paid on the thread it is owed on, or not at all ───────
+ *
+ * The router's guard rail checks that the follow-up payload HAS a
+ * conversationId. That stops the worst version (a promise answered into the
+ * founder's own chat) and misses the one underneath it: the `InboxPromise` row
+ * carries its OWN `conversationId`, and nothing compared the two. A job pairing
+ * promise P (owed on thread A) with conversation B therefore pays A's debt into
+ * B's thread — the exact failure the guard rail exists to prevent, one level
+ * deeper.
+ *
+ * THE CONTRACT THIS SEAM WANTS (and what it does without it):
+ *
+ *   • `instruction.promise` — the promise ROW the router already read when it
+ *     asked "is this debt still open?" (`promiseStillOpen` iterates the rows and
+ *     throws the matched one away). Supplied, this is authoritative and free:
+ *     `promise.conversationId` must equal the conversation being turned on.
+ *   • Absent, this reads the open list back itself. That read is best-effort by
+ *     nature — one page, and a shop may hold more open promises than a page —
+ *     so a promise NOT on the page is unverifiable rather than wrong, and the
+ *     turn proceeds with a loud warning naming the missing contract. What is
+ *     never allowed is the case the read CAN see: a row that names another
+ *     thread, which throws.
+ */
+async function assertPromiseOwedHere(
+  storeId: string,
+  convId: string,
+  instruction: TurnInstruction,
+): Promise<void> {
+  const promiseId = instruction.promiseId ?? instruction.promise?.id;
+  if (!promiseId) {
+    throw new Error(
+      `nova instructed turn: a promise turn on conversation ${convId} names no promise — ` +
+        "'pay off the promise' with no promise identifies no debt on any thread",
+    );
+  }
+
+  const refuse = (owedOn: string | null): never => {
+    throw new Error(
+      `nova instructed turn: promise ${promiseId} is owed on conversation ${owedOn ?? "(none)"} but this turn ` +
+        `runs on ${convId} — paying one thread's debt into another's is the failure the router's ` +
+        "conversation guard rail exists to prevent",
+    );
+  };
+
+  const verified = instruction.promise;
+  if (verified) {
+    if (verified.id !== promiseId) {
+      throw new Error(
+        `nova instructed turn: instruction names promise ${promiseId} but carries the row for ` +
+          `${verified.id} — one of the two is about a debt this turn is not paying`,
+      );
+    }
+    if (verified.conversationId !== convId) refuse(verified.conversationId);
+    return;
+  }
+
+  let row: { id: string; conversationId: string | null } | undefined;
+  try {
+    const open = await storeFor(storeId).listPromises({ status: "open", limit: PROMISE_SCAN_LIMIT });
+    row = open.find((p) => p.id === promiseId);
+  } catch (err) {
+    console.warn(`[nova:turn] promise read failed for ${storeId}/${promiseId}:`, err);
+  }
+  if (row) {
+    if (row.conversationId !== convId) refuse(row.conversationId);
+    return;
+  }
+  console.warn(
+    `[nova:turn] promise ${promiseId} could not be verified against conversation ${convId}: the caller ` +
+      "supplied no `instruction.promise` row and the open-promise page did not contain it — " +
+      "wire the router to pass the row it already read",
+  );
+}
+
+/** One page of open promises, the same bound the router's own check uses. */
+const PROMISE_SCAN_LIMIT = 50;
+
+/**
+ * The customer's latest inbound, read back from dakio-api's own thread view.
+ *
+ * `messageIds` (inbox_reply's payload) narrows to the exact batch the job was
+ * minted for; if none of those ids are on the thread — the read failed, the
+ * batch aged out of the 50-message window, Meta deleted them — the fallback is
+ * the LATEST inbound rather than nothing, because "what is the customer waiting
+ * on" is answered by the thread, and a turn that classified nothing would plan
+ * from an empty state card.
+ *
+ * A failed read yields empty text, which the caller treats as "no customer
+ * words" — never as an excuse to classify the directive.
+ */
+async function readLatestInbound(
+  storeId: string,
+  convId: string,
+  messageIds?: string[],
+): Promise<{ text: string; ids: string[] }> {
+  let inbound: Array<{ id: string; text: string }> = [];
+  try {
+    const thread = await storeFor(storeId).getInboxConversation(convId, { messages: 50 });
+    inbound = (thread?.messages ?? [])
+      .filter((m) => m.direction === "in" && typeof m.text === "string" && m.text.length > 0)
+      .map((m) => ({ id: m.id, text: m.text as string }));
+  } catch (err) {
+    console.warn(`[nova:turn] thread read failed for ${storeId}/${convId}:`, err);
+    return { text: "", ids: [] };
+  }
+  if (messageIds?.length) {
+    const wanted = new Set(messageIds);
+    const picked = inbound.filter((m) => wanted.has(m.id));
+    if (picked.length > 0) {
+      return { text: picked.map((m) => m.text).join("\n"), ids: picked.map((m) => m.id) };
+    }
+  }
+  const last = inbound.at(-1);
+  return last ? { text: last.text, ids: [last.id] } : { text: "", ids: [] };
+}
+
+
+/* ── D6: what "this thread already answered that" actually means ────────────
+ *
+ * The ids `readLatestInbound` collected were threaded in and then dropped, and
+ * the staleness test fell back to comparing TEXT with the last customer line.
+ * Text is not identity: a customer who types "hello", gets an answer, and types
+ * "hello" again has sent TWO messages, and the second one was being skipped as
+ * "already answered" — a lost customer message on the very lane that exists so
+ * no customer message is lost.
+ *
+ * So: when the job carried ids AND this thread has an id-stamped customer line
+ * to compare them against, the ids decide — a batch is absorbed only if every
+ * id in it is. Otherwise (the live lane wrote the line, and the live ingress is
+ * handed text without an id) the text comparison stands, which is what keeps a
+ * fallback `inbox_reply` for a message the live lane already answered a free
+ * no-op.
+ */
+function threadHasAbsorbed(ctx: NovaLiveContext, message: string, ids: string[]): boolean {
+  const absorbed = new Set<string>();
+  for (const m of ctx.recent) {
+    if (m.role !== "customer") continue;
+    for (const id of m.ids ?? []) absorbed.add(id);
+  }
+  if (ids.length > 0 && absorbed.size > 0) return ids.every((id) => absorbed.has(id));
+  return [...ctx.recent].reverse().find((m) => m.role === "customer")?.text === message;
+}
 
 async function executeTurn(
   storeId: string,
@@ -219,6 +664,7 @@ async function executeTurn(
   message: string,
   mode: TurnMode,
   epoch: number,
+  instructed?: InstructedInput,
 ): Promise<TurnResult> {
   const t0 = Date.now();
   const timings: Record<string, number> = { receivedAt: t0 };
@@ -242,27 +688,77 @@ async function executeTurn(
   // anything looks (see `reconcilePendingOrders`).
   await reconcilePendingOrders(ctx);
 
-  pushMessage(ctx, { role: "customer", text: message, at: t0 });
+  /* ── Whose turn is this, really? ──────────────────────────────────────────
+   *
+   * A live delivery is always the customer's turn: dakio-api just handed us the
+   * words. An INSTRUCTED turn re-read the thread, and what it holds depends on
+   * the kind:
+   *
+   *   inbox_reply            IS a customer turn — the same message the live lane
+   *                          would have delivered, arriving by the job bus
+   *                          because delivery failed. Same builder, same ladder.
+   *   followup / case_update NOVA SPEAKS FIRST. The customer's latest inbound is
+   *                          CONTEXT (what they last wanted, in their own
+   *                          words) — it is not a new turn, it was answered
+   *                          already, and re-answering it is not what this job
+   *                          asked for.
+   *
+   * `treatAsCustomerTurn` gates the four things only a real, unanswered customer
+   * message may do: enter `ctx.recent` as a customer line, move the language
+   * preference, apply its entity DELTA to the state, and be worth the paid L1
+   * resolver. It never gates CLASSIFICATION itself — the customer's latest
+   * inbound is always what gets classified, and the directive never is.
+   *
+   * The staleness test is the thread state, not a timestamp — see
+   * `threadHasAbsorbed` for what "already seen" means and why message IDS
+   * decide it whenever they are known. */
+  const isNewToThread = message.length > 0 && !threadHasAbsorbed(ctx, message, instructed?.inbound.ids ?? []);
+  const novaSpeaksFirst = !!instructed && instructed.instruction.mode !== "inbox_reply";
+  const treatAsCustomerTurn = !instructed || (!novaSpeaksFirst && isNewToThread);
 
-  // Language: detected every turn; preference only moves with a customer
-  // reason, and an EXPLICIT request locks it until another explicit request.
-  const lang = detectLang(message);
-  ctx.customer.lang.detected = lang.detected;
-  ctx.customer.lang.conf = lang.conf;
-  if (/\b(english please|in english|speak english|talk in english)\b/i.test(message)) {
-    ctx.customer.lang.pref = "en";
-    ctx.customer.lang.lockedByRequest = true;
-  } else if (/banglay bolen|বাংলায় বলেন|bangla(?:y|te)? (?:bolen|bolun|likhen)/i.test(message)) {
-    ctx.customer.lang.pref = "bn";
-    ctx.customer.lang.lockedByRequest = true;
-  } else if (!ctx.customer.lang.lockedByRequest && lang.detected !== "en") {
-    ctx.customer.lang.pref = "bn";
-  } else if (!ctx.customer.lang.lockedByRequest && lang.detected === "en" && lang.conf >= 0.7) {
-    ctx.customer.lang.pref = "en";
+  if (instructed && instructed.instruction.mode === "inbox_reply" && !isNewToThread) {
+    // D7 — the fallback lane's cheap no-op. `inbox_reply` exists so no customer
+    // message is lost when live delivery fails; if the live lane got there
+    // first (or an earlier attempt of this same job did), there is nothing to
+    // answer. Not a failure, and not worth a model call.
+    return skippedTurn(ctx, mode, instructed, message.length === 0 ? "no_inbound" : "already_answered", t0);
+  }
+
+  if (treatAsCustomerTurn) {
+    // The ids ride WITH the line when they are known (the instructed lane
+    // re-read the thread and holds them), so the next turn can tell "the same
+    // message again" from "the same words again" — see `threadHasAbsorbed`.
+    const ids = instructed?.inbound.ids ?? [];
+    pushMessage(ctx, { role: "customer", text: message, at: t0, ...(ids.length > 0 ? { ids } : {}) });
+
+    // Language: detected every turn; preference only moves with a customer
+    // reason, and an EXPLICIT request locks it until another explicit request.
+    // Nova's own directive is deliberately NOT run through this — a directive is
+    // written in English and would flip a Bangla thread to English replies.
+    const lang = detectLang(message);
+    ctx.customer.lang.detected = lang.detected;
+    ctx.customer.lang.conf = lang.conf;
+    if (/\b(english please|in english|speak english|talk in english)\b/i.test(message)) {
+      ctx.customer.lang.pref = "en";
+      ctx.customer.lang.lockedByRequest = true;
+    } else if (/banglay bolen|বাংলায় বলেন|bangla(?:y|te)? (?:bolen|bolun|likhen)/i.test(message)) {
+      ctx.customer.lang.pref = "bn";
+      ctx.customer.lang.lockedByRequest = true;
+    } else if (!ctx.customer.lang.lockedByRequest && lang.detected !== "en") {
+      ctx.customer.lang.pref = "bn";
+    } else if (!ctx.customer.lang.lockedByRequest && lang.detected === "en" && lang.conf >= 0.7) {
+      ctx.customer.lang.pref = "en";
+    }
   }
 
   // Hard lock after handover: the thread belongs to a person now. One line of
   // silence, no model spend (register R14/R19 — never re-greet, never retry).
+  //
+  // An INSTRUCTED turn obeys the same lock, and it matters more here: a
+  // follow-up, a cart nudge or a case update firing into a thread a human took
+  // over is Nova talking over its own colleague. `skipped: "thread_locked"`
+  // says so, so the dispatcher completes the job truthfully instead of
+  // recording a reply that was never owed.
   if (ctx.conversation.stage === "escalated") {
     bump(ctx);
     saveContext(ctx);
@@ -282,12 +778,32 @@ async function executeTurn(
       // every key was minted under.
       epoch: ctx.epoch,
       modelCalls,
+      ...(instructed
+        ? { instructed: instructedStamp(instructed, null), silent: true, skipped: "thread_locked" as const }
+        : {}),
     };
   }
 
   // ---- Classify: L0 rules, else L1 resolver --------------------------------
+  //
+  // WHAT GETS CLASSIFIED IS THE CUSTOMER'S LATEST INBOUND — always, and only.
+  // The directive is never handed to `classifyL0` or to the resolver: it is
+  // Nova's own sentence, and classifying it would put an intent the customer
+  // never expressed into the state, the state card and every later turn.
+  //
+  // With no inbound at all (a thread where the customer has said nothing that
+  // survives, or a failed read) there is simply nothing to classify — and the
+  // honest floor is `other`/rung 0, NOT "classify whatever text is around".
+  //
+  // The paid L1 resolver runs only for a real, unanswered customer message.
+  // Spending it to re-read a message a previous turn already answered would buy
+  // nothing: the state it would produce is the state that turn already applied.
   const awaiting = ctx.purchase.confirmSent ? "confirm" : ctx.conversation.nextAction === "ASK_QTY" ? "qty" : null;
-  let classified: Classified | null = classifyL0(message, { awaiting });
+  let classified: Classified | null =
+    message.length > 0 ? classifyL0(message, { awaiting }) : { intent: "other", entities: {}, rung: 0, confidence: 0 };
+  if (!classified && !treatAsCustomerTurn) {
+    classified = { intent: "other", entities: {}, rung: 0, confidence: 0 };
+  }
   if (!classified) {
     modelCalls += 1;
     try {
@@ -313,7 +829,14 @@ async function executeTurn(
   timings.resolvedMs = Date.now() - t0;
 
   // ---- Apply the delta ------------------------------------------------------
-  const e = classified.entities;
+  //
+  // ONLY FOR A MESSAGE THIS THREAD HAS NOT ALREADY ABSORBED. When Nova speaks
+  // first, the inbound above was classified for CONTEXT — its entities were
+  // applied by the turn that answered it, and re-applying them here would
+  // re-fire the side effects: `confirmSent = false` voids a summary the
+  // customer is looking at, and a re-read `qty` writes a "qty corrected" memo
+  // for a correction nobody made.
+  const e = treatAsCustomerTurn ? classified.entities : {};
   if (e.size) {
     ctx.purchase.variant = e.size;
     if (ctx.products.focusId) ctx.products.tracked[ctx.products.focusId] = "wants_to_buy";
@@ -330,12 +853,13 @@ async function executeTurn(
   }
   if (e.phone) ctx.customer.phone = fact(e.phone, "customer");
   if (e.address) ctx.customer.addr = fact(e.address, "customer");
-  if (classified.intent === "buy_intent" && ctx.products.focusId) {
+  if (treatAsCustomerTurn && classified.intent === "buy_intent" && ctx.products.focusId) {
     ctx.products.tracked[ctx.products.focusId] = "wants_to_buy";
   }
 
   // Product resolution — when the message names a product (or nothing is focused).
   const wantsProduct =
+    treatAsCustomerTurn &&
     (classified.intent === "product_query" || classified.intent === "buy_intent" || classified.intent === "price_q" || classified.intent === "stock_q") &&
     !!e.productText;
   if (wantsProduct) {
@@ -347,7 +871,21 @@ async function executeTurn(
   }
 
   // ---- Selective validation: only what the action touches -------------------
-  let action = nextBestAction(ctx, classified.intent);
+  //
+  // WHO PICKS THE MOVE. When the customer is the one who spoke — a live turn or
+  // an `inbox_reply`, which IS a customer turn that came in by the job bus
+  // instead of the delivery POST — the deterministic NBA ladder decides, exactly
+  // as nova-ai routes that kind through the same builder as the live lane. When
+  // NOVA opened its own mouth (a follow-up, a nudge, a case update), the ladder
+  // has no question to answer, so the INSTRUCTION names what the turn is for:
+  // PAY_PROMISE / CART_NUDGE / NBA_NUDGE / CASE_UPDATE.
+  //
+  // The instructed label is `instructed.action` — the one `runInstructedTurn`
+  // VALIDATED against the closed set at the seam — never `instruction.action`,
+  // which is raw payload data and may name a write gate or nothing at all.
+  let action: NextAction | InstructedAction = novaSpeaksFirst
+    ? instructed!.action
+    : nextBestAction(ctx, classified.intent);
 
   const needsFee = (action === "ASK_PHONE_ADDR" || action === "PRESENT_SUMMARY" || action === "CREATE_ORDER" || action === "ANSWER_DELIVERY_FAQ") && !!ctx.purchase.zone;
   if (needsFee || action === "ANSWER_DELIVERY_FAQ") {
@@ -547,8 +1085,30 @@ async function executeTurn(
       ctx.conversation.stage = computeStage(ctx);
     }
   }
-  ctx.conversation.nextAction = action;
-  ctx.conversation.confidence = classified.confidence >= 0.85 ? "high" : classified.confidence >= 0.6 ? "med" : "low";
+  /* ── D2: NOVA SPEAKING FIRST DOES NOT ANSWER FOR THE CUSTOMER ──────────────
+   *
+   * `conversation.nextAction` is not a log line — it is the customer ladder's
+   * PENDING-ASK state, read back at the top of the next turn as `awaiting`
+   * ("...nextAction === 'ASK_QTY' ? 'qty' : null") so that a bare "2" is
+   * understood as the answer to the question Nova asked. A follow-up, a cart
+   * nudge or a case update that overwrote it with its own label ("NBA_NUDGE")
+   * silently broke the NEXT REAL CUSTOMER TURN: the same "2" no longer
+   * classifies at L0, falls through to the paid resolver, and arrives with no
+   * idea which question it answers.
+   *
+   * The instruction says what THIS turn is for; it does not know, and may not
+   * answer, what the customer was last asked. So the ladder's own state is
+   * written only when the ladder decided this turn — the same test that governs
+   * the delta, the transcript and the language preference. `confidence` rides
+   * with it for the same reason: on a Nova-speaks-first turn it grades a re-read
+   * of a message some earlier turn already graded (or, with no inbound at all,
+   * the `other`/0 floor), and writing that over the customer's last real turn
+   * would make the state card report a certainty nobody measured. */
+  if (!novaSpeaksFirst) {
+    ctx.conversation.nextAction = action;
+    ctx.conversation.confidence =
+      classified.confidence >= 0.85 ? "high" : classified.confidence >= 0.6 ? "med" : "low";
+  }
   if (action === "PRESENT_SUMMARY") ctx.purchase.confirmSent = true;
   if (action === "DECLINE_DISCOUNT_ONCE") {
     ctx.purchase.objRound += 1;
@@ -567,7 +1127,43 @@ async function executeTurn(
     try {
       const writeRes = await withGatewayRetry(() =>
         writerAgent.generate(
-          [{ role: "user", content: `${card}\n\nLAST MESSAGES:\n${renderRecent(ctx)}\n\nACTION: ${actionLine}\nWrite the reply.` }],
+          [
+            {
+              role: "user",
+              content:
+                `${card}\n\nLAST MESSAGES:\n${renderRecent(ctx)}` +
+                /* ── D5: THE ONE FACT THAT BUYS SILENCE ────────────────────
+                 *
+                 * When Nova speaks first, the customer's latest inbound was
+                 * re-read and classified for CONTEXT — but it is NOT pushed
+                 * into `ctx.recent` (it is not a new customer turn), so the
+                 * transcript block above could not contain it, and the writer
+                 * was nudging blind about the single fact that should stop it:
+                 * the customer already said something that makes the nudge
+                 * wrong ("I want to cancel", "already bought it elsewhere").
+                 *
+                 * It is included as THEIR WORDS, under its own heading, and
+                 * fenced the other way from the directive: not a question this
+                 * turn was sent to answer, and never the classified message —
+                 * `treatAsCustomerTurn` is still false, no delta is applied, no
+                 * transcript line is written and the ladder is still not
+                 * consulted. It is evidence for whether to say less, or
+                 * nothing. */
+                (novaSpeaksFirst && message.length > 0
+                  ? `\n\nCUSTOMER'S LATEST MESSAGE ON THIS THREAD (the customer's own words, re-read from the ` +
+                    `thread just now — this is NOT a new question you were asked to answer, and it was not ` +
+                    `sent in reply to you; if it makes what you were about to say wrong, unnecessary or ` +
+                    `ill-timed, say less or say nothing):\n${message}`
+                  : "") +
+                // THE FENCE. The directive is Nova's own, and it is rendered
+                // OUTSIDE the transcript with the boundary stated in words, so
+                // no wording of it can read as something the customer said.
+                (instructed
+                  ? `\n\nNOVA'S OWN DIRECTIVE (your instruction from the store's own system — the customer did NOT say any of this, do not answer it, do not quote it):\n${instructed.instruction.directive}`
+                  : "") +
+                `\n\nACTION: ${actionLine}\nWrite the reply.`,
+            },
+          ],
           { instructions: writerSystem({ name: store.name, currency: store.currency }) },
         ),
       );
@@ -604,6 +1200,76 @@ async function executeTurn(
     modelCalls,
     ...(wouldHaveDone ? { wouldHaveDone } : {}),
     ...(modelFailure ? { modelFailure } : {}),
+    ...(instructed
+      ? {
+          // What the classifier actually saw — the customer's latest inbound,
+          // or `null` when the thread held none. Never the directive.
+          instructed: instructedStamp(instructed, message.length > 0 ? message : null),
+          /* SILENT MEANS THE TURN PRODUCED NOTHING AT ALL — no words and no
+           * artifact. It is deliberately NOT "the reply string is empty":
+           *   • a shadow turn that decided an order suppressed its draft on
+           *     purpose and has `wouldHaveDone` to show for it;
+           *   • an executed hand-over suppressed its draft because the SERVER
+           *     sends the holding line, and has `handoverActionId`.
+           * Both are successes. Folding them in here would make the dispatcher
+           * release finished work, five times, on a job that did its job.
+           * What is left is the real thing: a nudge that chose to say nothing
+           * (a success, `owesReply: false`) or a turn that owed an answer and
+           * produced none (a failure the dispatcher must see). */
+          ...(reply === "" && !wouldHaveDone && !order && !pendingActionId && !handoverActionId
+            ? { silent: true }
+            : {}),
+        }
+      : {}),
+  };
+}
+
+/** The `instructed` block on a result — one shape, one place. */
+function instructedStamp(
+  instructed: InstructedInput,
+  classifiedInbound: string | null,
+): NonNullable<TurnResult["instructed"]> {
+  const { jobKind, mode, jobId, owesReply } = instructed.instruction;
+  return { jobKind, mode, ...(jobId ? { jobId } : {}), owesReply, classifiedInbound };
+}
+
+/**
+ * A turn that did nothing, spent nothing, and wrote nothing — the honest shape
+ * for "there was no work here after all".
+ *
+ * State is deliberately NOT saved: nothing about the conversation changed, and
+ * bumping the version on a no-op would make the context store's own history lie
+ * about how many turns this thread has had.
+ */
+function skippedTurn(
+  ctx: NovaLiveContext,
+  mode: TurnMode,
+  instructed: InstructedInput,
+  skipped: NonNullable<TurnResult["skipped"]>,
+  t0: number,
+): TurnResult {
+  return {
+    reply: "",
+    intent: "other",
+    rung: 0,
+    // The pending ask as the LADDER left it (an instructed turn no longer
+    // overwrites it — see the D2 note). Widened rather than narrowed: state
+    // persisted before that fix can still hold an instructed label, and
+    // reporting it as a ladder step it never was would be the same lie one
+    // layer down.
+    action: ctx.conversation.nextAction as NextAction | InstructedAction,
+    stage: ctx.conversation.stage,
+    missing: computeMissing(ctx),
+    stateCard: renderStateCard(ctx),
+    timings: { receivedAt: t0, sentMs: Date.now() - t0 },
+    cacheHits: ctx.toolLedger.length,
+    version: ctx.version,
+    mode,
+    epoch: ctx.epoch,
+    modelCalls: 0,
+    instructed: instructedStamp(instructed, null),
+    silent: true,
+    skipped,
   };
 }
 
@@ -1062,6 +1728,34 @@ export function buildActionLine(
       break;
     case "ACKNOWLEDGE_REJECT":
       bits.push("accept gracefully, leave the door open, no pressure");
+      break;
+
+    /* ── Instructed turns: Nova opened its own mouth ────────────────────────
+     *
+     * These four labels are reachable ONLY through `runInstructedTurn`, and the
+     * substance of each turn is in the fenced NOVA'S OWN DIRECTIVE block that
+     * rides alongside this line (see `brain/router.ts`). What is added here is
+     * only the part that belongs with every other action's wording rule: what
+     * the reply may and may not claim. */
+    case "PAY_PROMISE":
+      bits.push(
+        "answer the exact thing you promised, in one message; if you still cannot answer it, say that plainly and say what you are waiting on — never invent the answer, and never apologise twice for one delay",
+      );
+      break;
+    case "CART_NUDGE":
+      bits.push(
+        "ONE short personal message naming the item(s) in the directive, or nothing at all; no price, no total and no discount you have not just looked up, and no claim about stock",
+      );
+      break;
+    case "NBA_NUDGE":
+      bits.push(
+        "you booked this yourself and nobody is waiting: one short message only if the thread still supports one, otherwise write nothing at all",
+      );
+      break;
+    case "CASE_UPDATE":
+      bits.push(
+        "one message: what happened on the case and what comes next, using only what the state above supports; name no date, no courier action and no outcome that is not already recorded",
+      );
       break;
     case "GREET":
       bits.push("greet back briefly as the shop, invite them to say what they're looking for");

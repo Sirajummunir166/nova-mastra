@@ -65,6 +65,7 @@ import type {
   IntentObservedRequest,
   IntentObservedResult,
   JobKind,
+  JobSettleResult,
   LinkCustomerRequest,
   LinkCustomerResult,
   MemoryEntry,
@@ -2522,26 +2523,39 @@ export class DemoStore implements StoreClient {
     return due;
   }
 
-  async completeJob(id: string, leaseToken: string): Promise<void> {
+  /**
+   * The demo store MODELS the superseded-lease answer rather than just
+   * declining to write. dakio-api answers 200 `{ok:true, stale:true}` when the
+   * token no longer matches the row, and a demo backend that silently returned
+   * `void` for the same case let every test above it pass while the real
+   * server was telling callers their work had been orphaned. Same three
+   * conditions as the server's `where` clause — row exists, still `leased`,
+   * token matches — and the same non-mutating answer when any of them misses.
+   */
+  async completeJob(id: string, leaseToken: string): Promise<JobSettleResult> {
     const jobs = (this.data.jobs ??= []);
     const job = jobs.find((j) => j.id === id);
-    if (!job || job.status !== "leased" || job.leaseToken !== leaseToken) return; // superseded lease — leave it alone
+    // Superseded (or unknown, or already settled) — leave it alone and SAY SO.
+    if (!job || job.status !== "leased" || job.leaseToken !== leaseToken) return { ok: true, stale: true };
     job.status = "done";
     job.leaseUntil = null;
+    return { ok: true, stale: false };
   }
 
-  async releaseJob(id: string, leaseToken: string, error: string): Promise<void> {
+  async releaseJob(id: string, leaseToken: string, error: string): Promise<JobSettleResult> {
     const jobs = (this.data.jobs ??= []);
     const job = jobs.find((j) => j.id === id);
-    if (!job || job.status !== "leased" || job.leaseToken !== leaseToken) return; // superseded lease — leave whatever currently owns it alone
+    // Superseded — leave whatever currently owns this row alone, and report it.
+    if (!job || job.status !== "leased" || job.leaseToken !== leaseToken) return { ok: true, stale: true };
     job.lastError = error;
     job.leaseUntil = null;
     if (job.attempts >= MAX_ATTEMPTS) {
       job.status = "failed";
-      return;
+      return { ok: true, stale: false };
     }
     job.status = "due";
     job.dueAt = new Date(Date.now() + backoffMinutes(job.attempts) * 60_000).toISOString();
+    return { ok: true, stale: false };
   }
 
   // ---- Catalog photo memory (Stage 11 Phase 3) ----

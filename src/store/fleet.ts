@@ -26,6 +26,7 @@
 
 import { ensureTenant, isTenantActive, listTenants, type TenantRecord } from "./tenants.js";
 import { mintFleetToken } from "../lib/service-token.js";
+import { storeBackendMode } from "./mode.js";
 
 /** Re-fetch cadence. The dispatcher ticks every minute; a fresh-enough fleet
  * once a minute is plenty, and one fleet call per tick is the worst case. */
@@ -94,7 +95,11 @@ export async function listFleetStoreIds(opts: FleetOptions = {}): Promise<string
  *   and then the `isTenantActive` gate.
  */
 export async function resolveDispatchTenants(opts: FleetOptions = {}): Promise<TenantRecord[]> {
-  if (process.env.NOVA_STORE_BACKEND !== "dakio") {
+  // The mode comes from `storeBackendMode()`, never from a local env read.
+  // This branch used to say `!== "dakio"` while `resolve.ts` said `=== "demo"`,
+  // so an unset var made this loop the seed list while the clients it fed
+  // pointed at the live API.
+  if (storeBackendMode() === "demo") {
     return listTenants().filter((t) => isTenantActive(t.storeId));
   }
 

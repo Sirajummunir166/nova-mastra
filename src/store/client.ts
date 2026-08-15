@@ -68,6 +68,7 @@ import type {
   IntentObservedRequest,
   IntentObservedResult,
   JobKind,
+  JobSettleResult,
   LinkCustomerRequest,
   LinkCustomerResult,
   MemoryEntry,
@@ -708,10 +709,21 @@ export interface StoreClient {
   ): Promise<NovaJobDef>;
   /** Expands due job-defs and drains debounced events into jobs, then atomically leases up to `limit` due rows for this tenant. Each returned job carries its own fresh `leaseToken`. */
   claimDueJobs(limit: number): Promise<NovaJob[]>;
-  /** `leaseToken` must be the value the job was claimed with — a stale (superseded) lease's call is a safe no-op, never overwriting a newer lease's outcome. */
-  completeJob(id: string, leaseToken: string, sessionId?: string): Promise<void>;
-  /** Requeues with backoff below the attempts cap, or marks `failed` at the cap. Same stale-lease-safe contract as completeJob. */
-  releaseJob(id: string, leaseToken: string, error: string): Promise<void>;
+  /**
+   * `leaseToken` must be the value the job was claimed with — a stale
+   * (superseded) lease's call is a safe no-op, never overwriting a newer
+   * lease's outcome.
+   *
+   * Resolves `{ ok: true, stale }`. `stale: true` means the no-op happened:
+   * this lease was already recovered by the watchdog (or the row is already
+   * done/failed), nothing was written, and the work this caller just finished
+   * may be running again somewhere else. It is NOT an error and must not be
+   * retried — but it is the only notice a caller ever gets, so swallowing it
+   * is how duplicate side effects go unnoticed.
+   */
+  completeJob(id: string, leaseToken: string, sessionId?: string): Promise<JobSettleResult>;
+  /** Requeues with backoff below the attempts cap, or marks `failed` at the cap. Same stale-lease-safe contract and `JobSettleResult` as completeJob. */
+  releaseJob(id: string, leaseToken: string, error: string): Promise<JobSettleResult>;
 
   // ---- Catalog photo memory (Stage 11 Phase 3 — product vision) ----
   //

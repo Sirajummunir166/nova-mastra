@@ -119,6 +119,7 @@ export function mintFleetToken(opts: MintOptions = {}): string {
 export function resetServiceTokenCache(): void {
   cache.clear();
   tokenMapCache = null;
+  legacyRefusalWarned.clear();
 }
 
 let tokenMapCache: Record<string, string> | null = null;
@@ -138,12 +139,96 @@ function tokenMap(): Record<string, string> {
   return tokenMapCache;
 }
 
+/** Stores already warned about a mis-scoped legacy token — one warn per store. */
+const legacyRefusalWarned = new Set<string>();
+
+/** Test-only: let a suite re-observe a warning it has already triggered. */
+export function resetLegacyTokenWarnings(): void {
+  legacyRefusalWarned.clear();
+}
+
+/**
+ * Read a service token's own `tenantId` claim without verifying it.
+ *
+ * Unverified is fine and deliberate: this is not an authorisation decision. It
+ * answers "which store did whoever minted this INTEND it for", purely so we
+ * can decline to send it anywhere else. dakio-api still verifies the signature
+ * and derives the real tenant from it — a forged claim here can only ever
+ * cause us to self-mint instead, never to widen access.
+ */
+function declaredTenantOf(token: string): string | null {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1]!, "base64url").toString()) as {
+      tenantId?: unknown;
+    };
+    return typeof payload.tenantId === "string" && payload.tenantId.length > 0
+      ? payload.tenantId
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The legacy single-store `NOVA_SERVICE_TOKEN`, but ONLY for the store it
+ * actually belongs to.
+ *
+ * It used to be an unconditional `?? process.env.NOVA_SERVICE_TOKEN` between
+ * the per-store map and the self-mint, which meant that in any deployment
+ * where the var was still set — a leftover from the one-dev-store era, exactly
+ * the kind of thing nobody removes — EVERY per-tenant client the dispatcher
+ * built carried one tenant's credential. dakio-api derives the tenant from the
+ * token, so store B's "isolated" client would read and WRITE store A's data.
+ * Per-tenant isolation is the assumption the entire fleet design rests on, and
+ * one stale env var quietly inverted it.
+ *
+ * It is bound rather than deleted because deleting it would silently change
+ * behaviour for any deployment still relying on it (and the mint path needs
+ * `NOVA_SERVICE_SECRET`, which such a deployment may not have set) — a
+ * single-store install that today works would start failing closed at the
+ * first request, with nothing pointing at the cause. Binding keeps that install
+ * working, makes the cross-tenant case impossible, and says out loud what to
+ * fix. `tenants.ts` already had to defend against this leak downstream, with a
+ * profile storeId identity check whose comment names "the legacy single
+ * NOVA_SERVICE_TOKEN fallback" as the hazard; this closes it at the source.
+ *
+ * Which store it belongs to comes from `NOVA_SERVICE_TOKEN_STORE_ID` if the
+ * operator declared one, otherwise from the token's own `tenantId` claim
+ * (dakio-api's fixed token shape carries it, so a real service token is
+ * self-describing). A token that is neither declared nor self-describing
+ * cannot be bound to anyone and is therefore used for no one.
+ */
+function legacyTokenFor(storeId: string): string | null {
+  const token = process.env.NOVA_SERVICE_TOKEN;
+  if (!token) return null;
+
+  const declared = process.env.NOVA_SERVICE_TOKEN_STORE_ID?.trim() || declaredTenantOf(token);
+  if (declared === storeId) return token;
+
+  if (!legacyRefusalWarned.has(storeId)) {
+    legacyRefusalWarned.add(storeId);
+    console.warn(
+      `[service-token] NOVA_SERVICE_TOKEN is ${
+        declared ? `scoped to '${declared}'` : "not bound to any store"
+      } — REFUSING it for '${storeId}' and self-minting that store's own token instead. ` +
+        `Sending it would authenticate ${storeId} as ${declared ?? "another tenant"} on dakio-api. ` +
+        `Use NOVA_SERVICE_TOKENS ({"storeId":"jwt"}) for per-store pins, or set ` +
+        `NOVA_SERVICE_TOKEN_STORE_ID to declare which store NOVA_SERVICE_TOKEN belongs to.`,
+    );
+  }
+  return null;
+}
+
 /**
  * Resolve the service token for a tenant, in precedence order:
- *   1. explicit pre-minted token in `NOVA_SERVICE_TOKENS` (pin/override)
- *   2. single-tenant `NOVA_SERVICE_TOKEN` (legacy one-dev-store fallback)
+ *   1. explicit pre-minted token in `NOVA_SERVICE_TOKENS` (per-store pin)
+ *   2. legacy `NOVA_SERVICE_TOKEN` — only for the ONE store it is bound to
  *   3. self-mint from `NOVA_SERVICE_SECRET` — the fleet-scale default
+ *
+ * Every branch returns a token scoped to `storeId` and nothing else.
  */
 export function serviceTokenFor(storeId: string): string {
-  return tokenMap()[storeId] ?? process.env.NOVA_SERVICE_TOKEN ?? mintServiceToken(storeId);
+  return tokenMap()[storeId] ?? legacyTokenFor(storeId) ?? mintServiceToken(storeId);
 }

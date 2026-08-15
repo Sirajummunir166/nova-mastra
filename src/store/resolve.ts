@@ -3,14 +3,17 @@
  * `getStoreClient()` singleton.
  *
  * `storeFor(storeId)` returns the `StoreClient` bound to exactly one store.
- * The backend is chosen by `NOVA_STORE_BACKEND` (Phase 02):
+ * The backend comes from `storeBackendMode()` (`mode.ts`), the single reading
+ * of `NOVA_STORE_BACKEND`:
  *
- *   - `demo` (default): a keyed map of `DemoStore` instances (one seeded
- *     dataset per tenant), so two tenants live side by side in one process and
- *     the isolation suite can prove they never cross. Deterministic, no network.
- *   - `dakio`: a `DakioStoreClient` per tenant, pinned to the tenant's Nova
- *     service token, talking to the live Dakio Express backend over HTTPS. No
- *     tool, executor, or context-layer changes — the interface held.
+ *   - `demo` (explicit opt-in): a keyed map of `DemoStore` instances (one
+ *     seeded dataset per tenant), so two tenants live side by side in one
+ *     process and the isolation suite can prove they never cross.
+ *     Deterministic, no network.
+ *   - `dakio` (the default, including when the var is unset): a
+ *     `DakioStoreClient` per tenant, pinned to the tenant's Nova service
+ *     token, talking to the live Dakio Express backend over HTTPS. No tool,
+ *     executor, or context-layer changes — the interface held.
  *
  * Callers get the store id from `requireStore(ctx)` (verified auth) and pass
  * it here. `storeFor` never reads ambient state, so nothing can accidentally
@@ -22,6 +25,7 @@ import type { StoreClient } from "./client.js";
 import { DemoStore } from "./backend.js";
 import { DakioStoreClient } from "./dakio.js";
 import { serviceTokenFor } from "../lib/service-token.js";
+import { storeBackendMode } from "./mode.js";
 import { createSeed } from "./seed.js";
 import { createBeaconSeed } from "./seed-beacon.js";
 
@@ -34,17 +38,11 @@ const SEEDERS: Record<string, (nowMs: number) => StoreSeed> = {
 /** Live per-store backends, created lazily on first access. */
 const instances = new Map<string, StoreClient>();
 
-/**
- * Which backend `storeFor` builds. Deviation from nova-ai, on purpose: there
- * the default was `demo` (an eve-dev affordance). In this service the worse
- * failure is a deployment that forgets the env var and silently serves the
- * seeded in-memory store as if it were the founder's real business — so the
- * default is `dakio`, and the deterministic demo store is the explicit
- * opt-in (`NOVA_STORE_BACKEND=demo`, which the eval suites set themselves).
- */
-function backendMode(): "demo" | "dakio" {
-  return process.env.NOVA_STORE_BACKEND === "demo" ? "demo" : "dakio";
-}
+/* Which backend `storeFor` builds is decided by `storeBackendMode()` in
+ * `mode.ts` — the one reading of `NOVA_STORE_BACKEND` in the repo. It used to
+ * be a local one-liner here and another, OPPOSITE one-liner in `fleet.ts`, so
+ * an unset env var gave the dispatcher demo tenants and live clients at the
+ * same time. Never re-derive the mode from the env here. */
 
 /* Token precedence (`NOVA_SERVICE_TOKENS` map → `NOVA_SERVICE_TOKEN` →
  * self-mint) lives in `service-token.ts` (`serviceTokenFor`), shared with the
@@ -59,7 +57,7 @@ function makeDakioClient(storeId: string): DakioStoreClient {
 }
 
 function makeClient(storeId: string): StoreClient {
-  if (backendMode() === "dakio") return makeDakioClient(storeId);
+  if (storeBackendMode() === "dakio") return makeDakioClient(storeId);
   const seeder = SEEDERS[storeId] ?? createSeed;
   return new DemoStore(seeder(Date.now()));
 }

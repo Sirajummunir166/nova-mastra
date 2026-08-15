@@ -98,6 +98,17 @@ export interface ChatTurnMessage {
   role: "customer" | "nova";
   text: string;
   at: number;
+  /**
+   * The STORE's own message ids this line was read from — set only by the
+   * instructed lane, which re-reads the thread and therefore knows them (the
+   * live ingress is handed text and no id). It is what "this thread has already
+   * absorbed that message" means when it is known: two messages with identical
+   * text are two messages, and deciding by text alone silently drops the
+   * second one ("hello" asked twice is one answered customer and one ignored).
+   * Optional, so persisted state written before it loads unchanged and the live
+   * lane keeps falling back to the text comparison.
+   */
+  ids?: string[];
 }
 
 export interface ToolLedgerEntry {

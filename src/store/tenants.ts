@@ -22,6 +22,7 @@
  */
 
 import { serviceTokenFor } from "../lib/service-token.js";
+import { storeBackendMode } from "./mode.js";
 
 export type TenantStatus = "active" | "paused";
 
@@ -216,14 +217,11 @@ const staleWarned = new Set<string>();
 /** Stores already warned about failing closed — one warn per store per process. */
 const failClosedWarned = new Set<string>();
 
-/**
- * Which backend `ensureTenant` provisions from. Deliberately a local duplicate
- * of `resolve.ts`'s one-liner: importing it from there would create a
- * `tenants.ts → resolve.ts → (store clients)` dependency for one env read.
- */
-function backendMode(): "demo" | "dakio" {
-  return process.env.NOVA_STORE_BACKEND === "dakio" ? "dakio" : "demo";
-}
+/* Which backend `ensureTenant` provisions from comes from `mode.ts`. It was a
+ * "deliberate local duplicate" of `resolve.ts`'s one-liner — and the duplicate
+ * had the OPPOSITE default, which is precisely how the split brain happened.
+ * `mode.ts` imports nothing, so the cycle the duplicate was avoiding
+ * (`tenants.ts → resolve.ts → store clients`) does not exist. */
 
 const PLANS: readonly TenantPlan[] = ["starter", "growth", "scale"];
 
@@ -321,7 +319,7 @@ export async function ensureTenant(
   storeId: string,
   opts: { nowMs?: number } = {},
 ): Promise<TenantRecord | null> {
-  if (backendMode() !== "dakio") return TENANTS.get(storeId) ?? null;
+  if (storeBackendMode() !== "dakio") return TENANTS.get(storeId) ?? null;
   if (STATIC_IDS.has(storeId)) return TENANTS.get(storeId) ?? null;
 
   const nowMs = opts.nowMs ?? Date.now();
