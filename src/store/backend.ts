@@ -108,6 +108,10 @@ import { SPEND_MINOR } from "./authority.js";
 import { NOVA_MAX_CONSECUTIVE_OUTBOUND } from "./inboxIntents.js";
 import { createSeed } from "./seed.js";
 import { lastOccurrenceAtOrBefore } from "./cron.js";
+// Phase E: DemoStore plays the SERVER role, so it stamps `NovaJob.department`
+// the way dakio-api does at row creation. `departments.ts` has type-only
+// imports from this layer, so this direction opens no cycle.
+import { departmentForJob } from "../brain/departments.js";
 import { randomUUID } from "node:crypto";
 
 // 1 = approval-surfacing/critical … 9 = lowest. Mirrors dakio-api's
@@ -150,6 +154,20 @@ const PRIORITY_BY_KIND: Record<JobKind, number> = {
   catalog_vision: 6,
   cart_sweep: 5,
   pulse: 9,
+  // Phase E: the four server-sweep kinds this union was missing. They are here
+  // because the Record is TOTAL over JobKind, not because DemoStore dispatches
+  // them — dakio-api leases all four off the queue inside its own claim
+  // transaction, and nothing on this side may ever hand one to a model lane
+  // (see the tripwire block on `JobKind` in types.ts).
+  //
+  // Numbers mirror dakio-api's `PRIORITY_BY_KIND` exactly, including the one
+  // that looks wrong: `order_confirm_sweep` sits at 4, a band ABOVE the other
+  // sweeps, because it is the backstop that names an order nobody ever
+  // confirmed to the customer — the one sweep whose silence a customer feels.
+  inbox_sla_sweep: 6,
+  order_confirm_sweep: 4,
+  night_shift: 6,
+  catalog_photo_sweep: 6,
 };
 const LEASE_MINUTES = 10;
 const MAX_ATTEMPTS = 5;
@@ -2350,10 +2368,11 @@ export class DemoStore implements StoreClient {
     for (const [bucketStart, bucketEvents] of buckets) {
       const dedupeKey = `cart_sweep:event-window:${new Date(bucketStart).toISOString()}`;
       if (jobs.some((j) => j.dedupeKey === dedupeKey)) continue; // already expanded this window
+      const payload = { triggeredBy: "event", eventCount: bucketEvents.length };
       jobs.push({
         id: this.nextId("job"),
         kind: "cart_sweep",
-        payload: { triggeredBy: "event", eventCount: bucketEvents.length },
+        payload,
         dueAt: new Date(bucketStart + bucketMs).toISOString(),
         priority: PRIORITY_BY_KIND.cart_sweep,
         status: "due",
@@ -2361,6 +2380,7 @@ export class DemoStore implements StoreClient {
         lastError: null,
         dedupeKey,
         leaseUntil: null,
+        department: departmentForJob("cart_sweep", payload),
         leaseToken: null,
       });
     }
@@ -2387,6 +2407,7 @@ export class DemoStore implements StoreClient {
         lastError: null,
         dedupeKey,
         leaseUntil: null,
+        department: departmentForJob(def.kind, def.config),
         leaseToken: null,
       });
     }

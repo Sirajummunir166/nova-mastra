@@ -27,21 +27,43 @@ function b64url(input: Buffer | string): string {
   return Buffer.from(input).toString("base64url");
 }
 
-export function mintServiceToken(tenantId: string): string {
-  const secret = process.env.NOVA_SERVICE_SECRET;
+/**
+ * Test-only overrides, restored in phase E (the phase A port dropped them and
+ * the fleet + service-token suites are written against them).
+ *
+ * Every field is optional and every default is the production one, so
+ * `mintServiceToken(id)` behaves exactly as it did with no second argument.
+ * They exist so a suite can drive the cache deterministically — freeze `nowMs`
+ * across two mints and the ONLY difference is the tenant id; shrink `ttlSec`
+ * and the refresh-skew boundary is reachable without a mocked clock; pass
+ * `secret` and a case never has to mutate `process.env` under a parallel
+ * runner.
+ */
+export interface MintOptions {
+  /** Override the secret (tests). Defaults to `NOVA_SERVICE_SECRET`. */
+  secret?: string;
+  /** Token lifetime in seconds. Default 1h. */
+  ttlSec?: number;
+  /** Override "now" (epoch ms) — tests only. */
+  nowMs?: number;
+}
+
+export function mintServiceToken(tenantId: string, opts: MintOptions = {}): string {
+  const secret = opts.secret ?? process.env.NOVA_SERVICE_SECRET;
   if (!secret) {
     throw new Error(
       `Cannot mint a service token for '${tenantId}': set NOVA_SERVICE_SECRET ` +
         `(must equal dakio-api's NOVA_SERVICE_SECRET).`,
     );
   }
-  const nowMs = Date.now();
+  const nowMs = opts.nowMs ?? Date.now();
+  const ttlSec = opts.ttlSec ?? DEFAULT_TTL_SEC;
 
   const cached = cache.get(tenantId);
   if (cached && cached.expMs - REFRESH_SKEW_MS > nowMs) return cached.token;
 
   const iat = Math.floor(nowMs / 1000);
-  const exp = iat + DEFAULT_TTL_SEC;
+  const exp = iat + ttlSec;
   const header = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
   const payload = b64url(JSON.stringify({ type: "service", sub: "nova", tenantId, iat, exp }));
   const signingInput = `${header}.${payload}`;
@@ -63,18 +85,19 @@ export function mintServiceToken(tenantId: string): string {
  */
 const FLEET_CACHE_KEY = "::fleet::";
 
-export function mintFleetToken(): string {
-  const secret = process.env.NOVA_SERVICE_SECRET;
+export function mintFleetToken(opts: MintOptions = {}): string {
+  const secret = opts.secret ?? process.env.NOVA_SERVICE_SECRET;
   if (!secret) {
     throw new Error("Fleet listing needs NOVA_SERVICE_SECRET (NOVA_STORE_BACKEND=dakio).");
   }
-  const nowMs = Date.now();
+  const nowMs = opts.nowMs ?? Date.now();
+  const ttlSec = opts.ttlSec ?? DEFAULT_TTL_SEC;
 
   const cached = cache.get(FLEET_CACHE_KEY);
   if (cached && cached.expMs - REFRESH_SKEW_MS > nowMs) return cached.token;
 
   const iat = Math.floor(nowMs / 1000);
-  const exp = iat + DEFAULT_TTL_SEC;
+  const exp = iat + ttlSec;
   const header = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
   const payload = b64url(JSON.stringify({ type: "service", sub: "nova-fleet", iat, exp }));
   const signingInput = `${header}.${payload}`;
@@ -83,6 +106,19 @@ export function mintFleetToken(): string {
 
   cache.set(FLEET_CACHE_KEY, { token, expMs: exp * 1000 });
   return token;
+}
+
+/**
+ * Clear the mint cache — tests, or a forced rotation after the secret changes.
+ *
+ * Clears `tokenMapCache` too, and that half is the one that matters outside
+ * tests: `NOVA_SERVICE_TOKENS` is parsed ONCE and memoised, so a process that
+ * has already answered one `serviceTokenFor` call will keep serving the old
+ * map for its lifetime unless this is called.
+ */
+export function resetServiceTokenCache(): void {
+  cache.clear();
+  tokenMapCache = null;
 }
 
 let tokenMapCache: Record<string, string> | null = null;

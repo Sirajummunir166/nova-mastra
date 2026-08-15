@@ -1958,7 +1958,74 @@ export type JobKind =
    * pending photos — the batch cap IS the price: one completed run charges
    * one Nova task on the meter, so 100 photos = 1 task.
    */
-  | "catalog_vision";
+  | "catalog_vision"
+  /* ──────────────────────────────────────────────────────────────────────────
+   * ROUTING TRIPWIRES — the four kinds this union was missing (phase E).
+   *
+   * dakio-api's `JOB_KINDS` (src/routes/novaJobs.js) knows 21 kinds; the
+   * ported union knew 17. The four below are SERVER SWEEPS: dakio-api leases
+   * and executes them inside its own claim transaction, off the queue, BEFORE
+   * the candidate query runs — so a healthy dispatcher is never handed one and
+   * the omission cost nothing at runtime.
+   *
+   * It cost something at the TYPE level, which is why they are here now: any
+   * `Record<JobKind, …>` router table was exhaustive over 17 of the 21 kinds
+   * the server can actually mint. TypeScript called that table complete. It
+   * wasn't — it was complete over a stale copy of the server's list.
+   *
+   * The failure mode, if one ever does reach a model lane: the lane renders an
+   * `undefined` prompt, the turn fails, the row retries, and `MAX_ATTEMPTS=5`
+   * burns five failed attempts into a `failed` row every single night, forever
+   * — silently, because a failed sweep looks exactly like a flaky one.
+   *
+   * So each is registered here as a TRIPWIRE, not as work: `src/brain/registry.ts`
+   * maps every one of them to `null` in an exhaustive `Record<JobKind, …>`, and
+   * `registry.eval.test.ts` asserts no server-sweep kind ever acquires a lane.
+   * Adding a 22nd kind to this union breaks that Record at compile time — which
+   * is the whole point of naming them. Do NOT give one of these a workflow.
+   * ────────────────────────────────────────────────────────────────────────── */
+  /**
+   * Stage 10 module 08 — the escalation SLA sweep (every 10 min).
+   *
+   * SERVER SWEEP. One of only two entries in dakio-api's `SERVER_SWEEPS` that
+   * can send a customer-visible message, which is why its selection rule lives
+   * entirely in the WHERE clause (`lib/inboxSlaSweep.js`): a bound on rows
+   * examined is not a bound on rows acted on. There is nothing for a model to
+   * do — the holding message is a deterministic template.
+   */
+  | "inbox_sla_sweep"
+  /**
+   * Stage 11 — the order-confirmation backstop (every 10 min).
+   *
+   * SERVER SWEEP, and the reason is almost poetic: it fires precisely when the
+   * MODEL could not speak (a chat order no outbound message on its own thread
+   * has ever named). Handing it to a model lane would route the backstop for a
+   * broken model through the model.
+   */
+  | "order_confirm_sweep"
+  /**
+   * Blueprint 17 (R1) — the production night shift, 01:30 tenant-local,
+   * deliberately BEFORE `night_ops` at 02:00 so the judgment turn reads fresh
+   * grades instead of yesterday's.
+   *
+   * SERVER SWEEP: deterministic grading arithmetic over the founder's own
+   * rows. A grade a model can invent is exactly what the rooms doctrine
+   * forbids. (Doc 07 B5: nova-ai also carried a `runNightShift` that was a
+   * canned Stage-3 gate demo, explicitly never to run against a real tenant.
+   * The migration ports the real grader and does NOT bring that name collision
+   * along — nothing in nova-mastra may claim this kind.)
+   */
+  | "night_shift"
+  /**
+   * Stage 11 Phase 3 — the catalog photo-memory reconciler (nightly).
+   *
+   * SERVER SWEEP, and the twin of `catalog_vision` above — the split between
+   * them IS the model line. This one syncs memory rows, counts what is
+   * pending, and MINTS the `catalog_vision` job; the leased turn is where the
+   * captioning happens. Deterministic bookkeeping, no prompt, nothing for a
+   * model to do.
+   */
+  | "catalog_photo_sweep";
 export type JobStatus = "due" | "leased" | "done" | "failed" | "skipped";
 
 export interface NovaJobDef {
@@ -1983,6 +2050,23 @@ export interface NovaJob {
   lastError: string | null;
   dedupeKey: string;
   leaseUntil: string | null;
+  /**
+   * Blueprint 17 — the ROOM this visit belongs to. `null` = not a room visit.
+   *
+   * Stamped by dakio-api at row creation (`lib/novaJobDepartments.js`
+   * `departmentForJob`, whose default the payload can override) and sent on
+   * every claimed job by `jobOut`; the merchant room feed reads this column to
+   * render "Nova is working here". It arrived on the wire before this type
+   * named it, so a claimed job has carried a `department` this side silently
+   * dropped — and every reader that wanted the room had to re-derive it.
+   *
+   * It is server-authoritative: nova-mastra never sets it, and
+   * `src/brain/registry.ts`'s copy of the map exists for ROUTING and registry
+   * checks, never for stamping. Nullable because the server sweeps map to
+   * `null` on purpose — bookkeeping passes are not room visits and must never
+   * light a room up.
+   */
+  department: NovaDepartment | null;
   /** Fencing value for this specific lease — pass it back to completeJob/releaseJob so a stale (superseded) lease's call is a safe no-op. */
   leaseToken: string | null;
 }
