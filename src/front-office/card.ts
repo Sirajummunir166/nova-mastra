@@ -66,6 +66,11 @@ export function renderStateCard(ctx: NovaLiveContext, now = Date.now()): string 
   if (ctx.orders.length) {
     lines.push(`ORDERS ${ctx.orders.map((o) => `#${o.no} ৳${o.total}`).join(" · ")}`);
   }
+  // No number and no total on purpose — no order exists yet (FD-3: the shop
+  // confirms each chat order; the card must not let a later turn invent one).
+  if (ctx.pendingOrders?.length) {
+    lines.push(`PENDING SHOP CONFIRM ${ctx.pendingOrders.map((o) => o.title).join(" · ")}`);
+  }
   if (ctx.conversation.summary) lines.push(`MEMO ${ctx.conversation.summary}`);
 
   return lines.join("\n");

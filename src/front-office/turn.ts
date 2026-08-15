@@ -25,7 +25,8 @@ import {
   type NovaLiveContext,
 } from "./state.js";
 import { feeForZone, focusProduct, hydratePolicies, resolveProduct, variantIdFor, variantStock } from "./hydrate.js";
-import { listProducts, createChatOrder, type DakioProduct } from "./dakio.js";
+import { listProducts, type DakioProduct } from "./dakio.js";
+import { performCreateOrder, type ChatOrderGatePayload } from "./actions.js";
 import { getStoreProfile } from "../lib/store.js";
 import { resolverAgent, resolverSchema, writerAgent, writerSystem } from "./agents.js";
 import { withGatewayRetry } from "../lib/gateway-retry.js";
@@ -42,8 +43,15 @@ import { withGatewayRetry } from "../lib/gateway-retry.js";
  * shadow-diff dataset still gets the deterministic half of the turn (intent,
  * rung, action, state delta) when no gateway credential is present.
  *
- * `live`: today's behavior, byte-for-byte — the order gate executes and model
- * failures throw. Call sites must opt in explicitly (workflow.ts does).
+ * `live`: the order gate really fires and model failures throw. Since phase D
+ * unit 1 the gate is APPROVAL-AWARE (the way nova-ai does it): a decided
+ * CREATE_ORDER consults the store's autonomy/authority through
+ * `performCreateOrder` (actions.ts). On the auto tier it calls
+ * `createChatOrder` exactly as before; on the approval tier (the shipping
+ * default — `inbox.orderAuto` FALSE) it files the fully-prepared action +
+ * Decision for the founder and the reply says honestly that the shop confirms
+ * the order first (FD-3: the normal flow, never an apology). Call sites must
+ * opt in explicitly (workflow.ts does).
  */
 export type TurnMode = "shadow" | "live";
 
@@ -57,11 +65,13 @@ export interface TurnResult {
   reply: string;
   intent: Intent;
   rung: 0 | 1;
-  action: NextAction | "ORDER_CONFIRMED";
+  action: NextAction | "ORDER_CONFIRMED" | "ORDER_PENDING_APPROVAL";
   stage: string;
   missing: string[];
   stateCard: string;
   order?: { orderNumber: string; total: number };
+  /** Live, approval tier: the prepared `create_order_from_chat` action on the founder's desk. */
+  pendingActionId?: string;
   timings: Record<string, number>;
   cacheHits: number;
   version: number;
@@ -235,12 +245,15 @@ async function executeTurn(
   timings.validatedMs = Date.now() - t0;
 
   // ---- Mutation gate: CREATE_ORDER ------------------------------------------
-  // `createChatOrder` is the ONE write in this pipeline that goes beyond
-  // drafting, and this branch is its only call site (via
-  // `hardValidateAndCreate`). SHADOW never enters the gate: the decided
-  // placement is recorded as `wouldHaveDone` and the turn stops there — no
-  // dakio-api write, no invented order number, no confirmation draft.
+  // The ONE write in this pipeline that goes beyond drafting, and this branch
+  // is its only call site (via `hardValidateAndCreate` → `performCreateOrder`).
+  // SHADOW never enters the gate: the decided placement is recorded as
+  // `wouldHaveDone` and the turn stops there — no dakio-api write, no invented
+  // order number, no confirmation draft. LIVE consults autonomy/authority:
+  // auto tier executes (today's path), approval tier files the prepared
+  // action/Decision and the reply carries FD-3 honestly.
   let order: TurnResult["order"];
+  let pendingActionId: string | undefined;
   let facts = "";
   let draftSuppressed = false;
   if (action === "CREATE_ORDER") {
@@ -260,9 +273,19 @@ async function executeTurn(
     } else {
       const gate = await hardValidateAndCreate(ctx);
       if (gate.ok) {
-        order = { orderNumber: gate.orderNumber!, total: gate.total! };
+        if (gate.orderNumber !== undefined && gate.total !== undefined) {
+          order = { orderNumber: gate.orderNumber, total: gate.total };
+          facts = `Order #${gate.orderNumber} created — total ৳${gate.total} COD (product ৳${gate.subtotal} + delivery ৳${gate.shipping}).`;
+        } else {
+          // Replayed execution whose row predates the snapshot: the ledger's
+          // own outcome line still names the order and the total.
+          facts = gate.reason;
+        }
         action = "ORDER_CONFIRMED" as never;
-        facts = `Order #${gate.orderNumber} created — total ৳${gate.total} COD (product ৳${gate.subtotal} + delivery ৳${gate.shipping}).`;
+      } else if (gate.pending) {
+        pendingActionId = gate.actionId;
+        action = "ORDER_PENDING_APPROVAL" as never;
+        facts = gate.reason;
       } else {
         action = gate.fallback;
         facts = gate.reason;
@@ -271,7 +294,7 @@ async function executeTurn(
   }
 
   // ---- Reducer-derived stage + NBA persistence ------------------------------
-  if (action === ("ORDER_CONFIRMED" as never)) {
+  if (action === ("ORDER_CONFIRMED" as never) || action === ("ORDER_PENDING_APPROVAL" as never)) {
     ctx.conversation.stage = "ordered";
   } else if (action === "ESCALATE") {
     ctx.conversation.stage = "escalated";
@@ -332,6 +355,7 @@ async function executeTurn(
     missing: computeMissing(ctx),
     stateCard: renderStateCard(ctx),
     order,
+    ...(pendingActionId ? { pendingActionId } : {}),
     timings,
     cacheHits,
     version: ctx.version,
@@ -349,6 +373,9 @@ async function executeTurn(
 
 interface GateResult {
   ok: boolean;
+  /** Approval tier: the order is filed, not placed — `actionId` names the card. */
+  pending?: boolean;
+  actionId?: string;
   orderNumber?: string;
   total?: number;
   subtotal?: number;
@@ -359,7 +386,9 @@ interface GateResult {
 
 /**
  * HARD validation before the only mutation: stock ✓ price ✓ delivery ✓ — all
- * LIVE reads (never the cache), then the server-priced order create.
+ * LIVE reads (never the cache) — then the authority-gated order pipeline
+ * (`performCreateOrder`): auto tier executes the server-priced create exactly
+ * as before; approval tier files the prepared action + Decision instead.
  */
 async function hardValidateAndCreate(ctx: NovaLiveContext): Promise<GateResult> {
   const focusId = ctx.products.focusId;
@@ -391,10 +420,16 @@ async function hardValidateAndCreate(ctx: NovaLiveContext): Promise<GateResult> 
 
   const zone = p.zone;
   const inside = zone.toLowerCase().includes("dhaka") || zone.includes("ঢাকা");
-  const result = await createChatOrder(ctx.storeId, {
-    // Deterministic per Nth order of this conversation: a retried turn replays
-    // the same order instead of creating a second parcel at a real doorstep.
-    novaActionId: `nm:${ctx.convId}:order-${ctx.orders.length}`,
+  const qty = p.qty;
+  const variant = p.variant;
+
+  // Byte-compatible with nova-ai's createOrderFromChatPayload: no price
+  // fields, `confirmedByCustomer` the literal true, `productName` per item for
+  // the founder's no-touch locks. `novaActionId` is deterministic per Nth
+  // order of this conversation (placed + pending both count) so a retried
+  // turn replays instead of double-filing or double-ordering.
+  const payload: ChatOrderGatePayload = {
+    novaActionId: `nm:${ctx.convId}:order-${ctx.orders.length + (ctx.pendingOrders?.length ?? 0)}`,
     conversationId: ctx.convId,
     customerName: ctx.customer.name?.value ?? "Messenger Customer",
     customerPhone: ctx.customer.phone.value,
@@ -404,14 +439,74 @@ async function hardValidateAndCreate(ctx: NovaLiveContext): Promise<GateResult> 
     items: [
       {
         productId: product.id,
-        variantId: variantIdFor(product, p.variant),
+        variantId: variantIdFor(product, variant),
         productName: product.name,
-        qty: p.qty,
+        qty,
       },
     ],
     confirmedByCustomer: true,
+  };
+
+  // The turn-authored half of the E-8 receipt: deterministic, grounded in the
+  // live read this function just made. Estimates only — the server prices the
+  // final figures, which is the whole safety argument.
+  const fee = ctx.purchase.fee?.value;
+  const estimate = product.price * qty + (fee ?? 0);
+  const gate = await performCreateOrder(ctx.storeId, {
+    payload,
+    receipt: {
+      reason:
+        `Customer confirmed the itemized order in this thread: ${product.name}` +
+        `${variant ? ` ${variant}` : ""} × ${qty} to ${zone}. Phone and delivery address were given in the thread.`,
+      expectedImpact: `≈৳${estimate} COD order (server prices finally${fee === undefined ? "; delivery not yet quoted" : ""}).`,
+      confidence: 0.9,
+      evidence: [
+        { source: "conversation", note: "customer replied yes to the final order summary", metric: "confirmSent", value: "true" },
+        {
+          source: "list_products",
+          note: `live read: ${product.name} price ৳${product.price}, stock ${stock}`,
+          metric: "stock",
+          value: stock,
+        },
+      ],
+    },
   });
-  ctx.toolLedger.push({ tool: "create_chat_order", args: { productId: product.id, qty: p.qty }, raw: result, calledAt: Date.now(), ok: true });
+
+  if (gate.status === "blocked") {
+    // Founder-facing rule stays on the ledger row; the customer never hears it
+    // (register discipline — locks and dials are the shop's own business).
+    ctx.toolLedger.push({ tool: "create_order_from_chat", args: { productId: product.id, qty, gate: "blocked", rule: gate.rule }, raw: gate.detail, calledAt: Date.now(), ok: false });
+    return { ok: false, actionId: gate.actionId, reason: "the shop needs to handle this order directly", fallback: "ESCALATE" };
+  }
+
+  if (gate.status === "prepared") {
+    ctx.toolLedger.push({ tool: "create_order_from_chat", args: { productId: product.id, qty, gate: "prepared", rule: gate.rule }, raw: gate.actionId, calledAt: Date.now(), ok: true });
+    // FILED: the product leaves tracking and lives in pendingOrders[] — no
+    // order number, no total, because no order exists yet (FD-3).
+    delete ctx.products.tracked[focusId];
+    delete ctx.products.items[focusId];
+    (ctx.pendingOrders ??= []).push({ actionId: gate.actionId, title: product.name });
+    ctx.purchase.confirmSent = false;
+    ctx.purchase.qty = undefined;
+    ctx.purchase.variant = undefined;
+    addMemo(ctx, `order filed for shop confirm: ${product.name} × ${qty}`);
+    return {
+      ok: false,
+      pending: true,
+      actionId: gate.actionId,
+      reason: `order request recorded (${product.name}${variant ? ` ${variant}` : ""} × ${qty}, COD ≈৳${estimate}) — the shop confirms it before dispatch`,
+      fallback: "PRESENT_SUMMARY",
+    };
+  }
+
+  // Auto tier (or a replayed execution) — same ledger entry and state moves as
+  // the pre-gate live path.
+  const result = gate.order;
+  ctx.toolLedger.push({ tool: "create_chat_order", args: { productId: product.id, qty }, raw: result ?? gate.detail, calledAt: Date.now(), ok: true });
+  if (!result) {
+    // Replay without a snapshot: the outcome line still names the order.
+    return { ok: true, actionId: gate.actionId, reason: gate.detail, fallback: "PRESENT_SUMMARY" };
+  }
 
   // ORDERED: the product leaves tracking and lives in orders[].
   delete ctx.products.tracked[focusId];
@@ -424,6 +519,7 @@ async function hardValidateAndCreate(ctx: NovaLiveContext): Promise<GateResult> 
 
   return {
     ok: true,
+    actionId: gate.actionId,
     orderNumber: result.orderNumber,
     total: result.total,
     subtotal: result.total - result.shippingCharge,
@@ -471,6 +567,13 @@ function buildActionLine(ctx: NovaLiveContext, action: string, facts: string): s
     case "DECLINE_DISCOUNT_ONCE":
       bits.push("politely hold the price (no discount authority); do not repeat an apology");
       break;
+    case "ORDER_PENDING_APPROVAL":
+      // FD-3 stance: the normal flow, never an apology — and never a number
+      // for an order that does not exist yet.
+      bits.push(
+        "confirm warmly that the order is being placed — the shop double-checks every chat order before dispatch and will confirm shortly; this is the normal flow, not a problem, so no apology; do NOT invent an order number or a final total",
+      );
+      break;
     case "ESCALATE":
       bits.push("tell the customer a person from the shop will take over shortly; one line, then stop");
       break;
@@ -489,9 +592,17 @@ function buildActionLine(ctx: NovaLiveContext, action: string, facts: string): s
     case "ASK_PHONE_ADDR":
       bits.push("ask for delivery details in ONE natural ask: name if unknown, phone, full address with thana/district");
       break;
-    case "ANSWER_ORDER_STATUS":
-      bits.push(ctx.orders.length ? `orders on file: ${ctx.orders.map((o) => `#${o.no}`).join(", ")} — status lookup not wired yet, be honest` : "no order found in this conversation — ask for the order number");
+    case "ANSWER_ORDER_STATUS": {
+      const pending = ctx.pendingOrders ?? [];
+      if (ctx.orders.length) {
+        bits.push(`orders on file: ${ctx.orders.map((o) => `#${o.no}`).join(", ")} — status lookup not wired yet, be honest`);
+      } else if (pending.length) {
+        bits.push(`order (${pending.map((o) => o.title).join(", ")}) is with the shop for confirmation — normal flow, no order number yet, be honest`);
+      } else {
+        bits.push("no order found in this conversation — ask for the order number");
+      }
       break;
+    }
   }
   return bits.filter(Boolean).join(" · ");
 }

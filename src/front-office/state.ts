@@ -163,6 +163,18 @@ export interface NovaLiveContext {
 
   orders: Array<{ no: string; title: string; total: number }>;
 
+  /**
+   * Orders filed for the shop's approval but not yet placed (phase D unit 1 —
+   * the approval-gated live tier). Each row is a prepared `create_order_from_chat`
+   * action sitting on the founder's Decision desk; it holds NO order number and
+   * NO total because no order exists yet — the server prices at approve time.
+   * Optional and absent on legacy persisted state (shadow-only histories never
+   * grow it), so old rows load byte-identically. The length also feeds the
+   * `nm:<conv>:order-<n>` idempotency key so a SECOND product sold while the
+   * first awaits approval mints a fresh key instead of deduping into the first.
+   */
+  pendingOrders?: Array<{ actionId: string; title: string }>;
+
   /** Observation cache backing store — raw payloads, timestamped. */
   toolLedger: ToolLedgerEntry[];
 
