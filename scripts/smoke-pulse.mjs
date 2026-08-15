@@ -184,15 +184,41 @@ try {
   const opening = await senseStore(STORE_ID);
   drainedEventIds = opening.inbox.ok ? opening.inbox.value.map((e) => e.id) : [];
   const products = opening.products.ok ? opening.products.value : [];
+  const couriers = opening.courier.ok ? opening.courier.value.couriers : [];
   console.log(
     `\nSENSE: products ${opening.products.ok ? products.length : "UNREADABLE"} · ` +
       `sales7d ${opening.sales.ok ? opening.sales.value.revenue7d : "UNREADABLE"} vs prior ${opening.sales.ok ? opening.sales.value.revenuePrior7d : "?"} · ` +
       `carts ${opening.carts.ok ? opening.carts.value.count : "UNREADABLE"} · ` +
       `suppliers ${opening.suppliers.ok ? opening.suppliers.value.length : "UNREADABLE"} · ` +
+      `couriers ${opening.courier.ok ? couriers.length : "UNREADABLE"} · ` +
       `unprocessed events ${opening.inbox.ok ? opening.inbox.value.length : "UNREADABLE"}`,
   );
   assert(senseFailures(opening).length === 0, `every sense read answered: ${senseFailures(opening).join("; ")}`);
-  ok("the sense layer read all five sources off the live backend");
+  ok("the sense layer read all SIX sources off the live backend — courier included");
+
+  // ---- The sixth sense, and the rules it must obey on LIVE data ------------
+  //
+  // This tenant may have booked no parcels at all in the window, and that is a
+  // legitimate outcome with its own honesty requirement: an empty scorecard is
+  // "no parcels", never "a perfect record". Whatever rows exist, the four rules
+  // hold — no rate without the source's own evidence flag, no number out of a
+  // null, no on-time claim ever.
+  assert(opening.courier.ok, "the courier read answered (it was a hardcoded `couriers: []` before dakio-api fbba817)");
+  console.log(
+    `   courier window: ${opening.courier.value.windowDays} days, dispatch-dated · ` +
+      `${couriers.length} courier(s)${opening.courier.value.truncated ? " · TRUNCATED (rows are the most recent dispatches)" : ""}` +
+      (couriers.length === 0
+        ? " — this tenant booked no parcels in the window, so the domain is READ and SILENT, which is not the same as clean"
+        : `: ${couriers.map((c) => `${c.name} (${c.basis}${c.sufficientEvidence ? "" : ", NOT evidence"})`).join(", ")}`),
+  );
+  for (const c of couriers) {
+    assert(c.onTimeRate === null, `${c.name}: onTimeRate must be null — Dakio records no promised-delivery date`);
+    assert(
+      c.resolved > 0 || c.rtoRate === null,
+      `${c.name}: nothing resolved, so every rate must be null rather than 0`,
+    );
+  }
+  ok("courier rows carry a null on-time rate and no rate over a zero base");
   const withVelocity = products.filter((p) => p.velocity !== null).length;
   console.log(
     `   velocity known for ${withVelocity}/${products.length} products — dakio-api answers ` +
@@ -260,8 +286,12 @@ try {
 
   const report = (await client.listReports({ kind: "pulse", limit: 1 }))[0];
   assert(report, "one consolidated report was filed");
-  assert(/Not checked: ads, courier, support/.test(report.body), "and it states what Nova never looked at");
-  ok(`run 3: ONE report filed (${report.id}), naming the three domains Nova makes no claim about`);
+  // TWO domains now, not three. Courier left `SENSE_GAPS` the day dakio-api's
+  // `GET /couriers` became a real aggregate, and this footer is derived from
+  // that list — so a stale disclaimer here would mean a stale gap list there.
+  assert(/Not checked: ads, support/.test(report.body), "and it states what Nova never looked at");
+  assert(!/Not checked:[^\n]*courier/.test(report.body), "courier is checked now — the footer must not still disclaim it");
+  ok(`run 3: ONE report filed (${report.id}), naming the two domains Nova makes no claim about`);
 
   // ---- run 4: back to quiet ----------------------------------------------
   const again = await pulse("run 4 · nothing changed again");

@@ -20,6 +20,7 @@ import type {
   ActivityEntry,
   Campaign,
   CampaignDayStat,
+  Courier,
   Customer,
   CustomerMessage,
   Discount,
@@ -37,6 +38,7 @@ import type {
   TrendingProduct,
 } from "./types.js";
 import type { Guardrails } from "./types.js";
+import { courierRow } from "./seed.js";
 
 const DAY = 86_400_000;
 const HOUR = 3_600_000;
@@ -196,23 +198,36 @@ export function createBeaconSeed(nowMs: number): StoreSeed {
     },
   ];
 
-  // ---- Couriers (3) — freight/LTL -------------------------------------------
+  // ---- Couriers (3) — freight/LTL, as a parcel history ----------------------
+  //
+  // Deliberately UNLIKE Aurora's, the way everything else in this seed is: a
+  // B2B freight book is low-volume and low-RTO (a facilities buyer does not
+  // refuse a pallet at the door), so nothing here crosses the pulse's RTO
+  // threshold and the store's courier domain is quiet — which is itself worth
+  // having a fixture for. `courierRow` is imported from Aurora's seed rather
+  // than re-typed: one arithmetic for what a rate means, two demo stores.
+  //
+  // MetroVan is the thin-evidence row here: 4 resolved parcels, so its numbers
+  // are an observation and never a verdict.
 
-  const couriers = [
-    {
-      id: "bcour-ridgeline", name: "Ridgeline Freight", costPerShipment: 2220, avgDeliveryDays: 3.1,
-      onTimeRate: 0.95, rtoRate: 0.01, regions: ["northeast", "midwest", "southeast"],
-    },
-    {
-      id: "bcour-haulpro", name: "HaulPro LTL", costPerShipment: 1704, avgDeliveryDays: 4.6,
-      onTimeRate: 0.81, rtoRate: 0.06, regions: ["midwest", "southeast", "west"],
-    },
-    {
-      id: "bcour-metrovan", name: "MetroVan Same-Day", costPerShipment: 3120, avgDeliveryDays: 1.2,
-      onTimeRate: 0.97, rtoRate: 0.02, regions: ["northeast"],
-    },
+  const couriers: Courier[] = [
+    courierRow({
+      id: "bcour-ridgeline", name: "Ridgeline Freight",
+      delivered: 44, rto: 1, failed: 1, cancelled: 2, inFlight: 7, inFlightStagnant: 0,
+      avgDaysToDeliver: 3.1, deliveryTimeSample: 41,
+    }),
+    courierRow({
+      id: "bcour-haulpro", name: "HaulPro LTL",
+      delivered: 26, rto: 2, failed: 1, cancelled: 1, inFlight: 5, inFlightStagnant: 1,
+      avgDaysToDeliver: 4.6, deliveryTimeSample: 24,
+    }),
+    courierRow({
+      id: "bcour-metrovan", name: "MetroVan Same-Day",
+      delivered: 4, rto: 0, failed: 0, cancelled: 0, inFlight: 2, inFlightStagnant: 0,
+      avgDaysToDeliver: 1.2, deliveryTimeSample: 4,
+    }),
   ];
-  const courierDays = new Map(couriers.map((c) => [c.id, c.avgDeliveryDays]));
+  const courierDays = new Map(couriers.map((c) => [c.id, c.avgDaysToDeliver ?? 3]));
 
   // ---- Customers (8) — facilities & businesses ------------------------------
 

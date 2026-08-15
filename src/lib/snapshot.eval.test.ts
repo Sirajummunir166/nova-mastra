@@ -39,7 +39,7 @@ import {
   velocityWeeksOf,
 } from "./snapshot.js";
 import type { StoreClient } from "../store/client.js";
-import type { AbandonedCart, InboxEvent, Order, Product, Supplier } from "../store/types.js";
+import type { AbandonedCart, Courier, CourierScorecard, InboxEvent, Order, Product, Supplier } from "../store/types.js";
 
 const AT = "2026-08-15T09:00:00.000Z";
 const DAY = 86_400_000;
@@ -80,12 +80,76 @@ function cart(patch: Partial<AbandonedCart> & { id: string }): AbandonedCart {
   } as AbandonedCart;
 }
 
+/**
+ * One courier scorecard row, real-shaped: the counts are the input and the
+ * rates fall out of them, exactly as dakio-api's `courierScorecard` computes
+ * them. A case that wants a null rate gets it by resolving nothing, never by
+ * typing `rtoRate: null` beside `resolved: 40` — a fixture that can express an
+ * impossible row proves nothing about a layer that reads real ones.
+ */
+function courier(patch: {
+  id: string;
+  name?: string;
+  delivered?: number;
+  rto?: number;
+  failed?: number;
+  cancelled?: number;
+  inFlight?: number;
+  inFlightStagnant?: number;
+  avgDaysToDeliver?: number | null;
+  deliveryTimeSample?: number;
+}): Courier {
+  const delivered = patch.delivered ?? 0;
+  const rto = patch.rto ?? 0;
+  const failed = patch.failed ?? 0;
+  const cancelled = patch.cancelled ?? 0;
+  const inFlight = patch.inFlight ?? 0;
+  const resolved = delivered + rto + failed;
+  const parcels = resolved + inFlight + cancelled;
+  const rate = (n: number) => (resolved > 0 ? Math.round((n / resolved) * 10000) / 10000 : null);
+  return {
+    id: patch.id,
+    name: patch.name ?? `Courier ${patch.id}`,
+    parcels, resolved, delivered, rto, failed, cancelled, inFlight,
+    inFlightStagnant: patch.inFlightStagnant ?? 0,
+    deliveredRate: rate(delivered),
+    rtoRate: rate(rto),
+    failedRate: rate(failed),
+    // Null forever: the schema records no promised-delivery date.
+    onTimeRate: null,
+    onTimeBasis: "unavailable: Dakio records no promised-delivery date",
+    avgDaysToDeliver: patch.avgDaysToDeliver ?? null,
+    deliveryTimeSample: patch.deliveryTimeSample ?? 0,
+    sufficientEvidence: resolved >= 25,
+    basis: `${resolved} resolved of ${parcels} dispatched`,
+  };
+}
+
+/** The scorecard envelope around some rows — `truncated` is the case's to set. */
+function scorecard(couriers: Courier[], opts: { truncated?: boolean; days?: number } = {}): CourierScorecard {
+  const total = (pick: (c: Courier) => number) => couriers.reduce((s, c) => s + pick(c), 0);
+  return {
+    couriers,
+    window: { days: opts.days ?? 30, since: AT, until: AT, basedOn: "dispatch" },
+    totals: {
+      parcels: total((c) => c.parcels),
+      resolved: total((c) => c.resolved),
+      inFlight: total((c) => c.inFlight),
+      cancelled: total((c) => c.cancelled),
+      orphaned: 0,
+    },
+    truncated: opts.truncated === true,
+    notes: [],
+  };
+}
+
 /** A client that answers exactly what a case says, and throws where it says to. */
 function client(parts: {
   products?: Product[] | Error;
   suppliers?: Supplier[] | Error;
   orders?: Order[] | Error;
   carts?: AbandonedCart[] | Error;
+  couriers?: CourierScorecard | Error;
   events?: InboxEvent[] | Error;
   at?: string;
 }): StoreClient {
@@ -99,6 +163,7 @@ function client(parts: {
     listSuppliers: answer(parts.suppliers, []),
     listOrders: answer(parts.orders, []),
     listAbandonedCarts: answer(parts.carts, []),
+    listCouriers: answer(parts.couriers, scorecard([])),
     listInboxEvents: answer(parts.events, []),
   } as unknown as StoreClient;
 }
@@ -243,6 +308,119 @@ test("carts are one page of leads of ANY status — the unrecovered subset says 
 });
 
 // ---------------------------------------------------------------------------
+// Courier — the sixth sense, and the unknowns that arrive with it
+// ---------------------------------------------------------------------------
+
+test("courier is SENSED from a real-shaped payload — counts, rates and the evidence flag survive intact", async () => {
+  // The exact shape `GET /api/v1/store/couriers` emits. Nothing here is
+  // re-derived by the sense layer: the route counted the parcels, so the route
+  // owns what a rate over them means.
+  const sense = await senseStore("s", client({
+    couriers: scorecard([
+      courier({ id: "steadfast", name: "Steadfast", delivered: 27, rto: 13, failed: 2, cancelled: 3, inFlight: 9, inFlightStagnant: 4, avgDaysToDeliver: 5.4, deliveryTimeSample: 25 }),
+      courier({ id: "redx", name: "RedX", delivered: 71, rto: 3, failed: 1, cancelled: 4, inFlight: 12, avgDaysToDeliver: 2.1, deliveryTimeSample: 68 }),
+    ]),
+  }));
+
+  assert.ok(sense.courier.ok, "the domain answered");
+  const [steadfast, redx] = sense.courier.value.couriers;
+  assert.equal(sense.courier.value.windowDays, 30);
+  assert.equal(sense.courier.value.truncated, false);
+
+  assert.equal(steadfast!.resolved, 42, "the denominator is delivered + rto + failed");
+  assert.equal(steadfast!.parcels, 54, "in-flight and cancelled parcels are counted, just not rated");
+  assert.equal(steadfast!.rtoRate, 0.3095);
+  assert.equal(steadfast!.sufficientEvidence, true);
+  assert.equal(steadfast!.basis, "42 resolved of 54 dispatched", "the base travels in words");
+  assert.equal(steadfast!.inFlightStagnant, 4);
+  assert.equal(steadfast!.avgDaysToDeliver, 5.4);
+  assert.equal(redx!.rtoRate, 0.04);
+
+  // And the domain is one of the six the all-blind guard asks about.
+  assert.ok(SENSE_DOMAINS.includes("courier"));
+  assert.equal(senseFailures(sense).length, 0);
+});
+
+test("onTimeRate is NULL and stays null — there is no promised-delivery date to be on time against", async () => {
+  const sense = await senseStore("s", client({
+    couriers: scorecard([courier({ id: "c1", delivered: 40, rto: 2, deliveryTimeSample: 40, avgDaysToDeliver: 3 })]),
+  }));
+  assert.ok(sense.courier.ok);
+  const c = sense.courier.value.couriers[0]!;
+
+  // THE REGRESSION THIS PINS: `onTimeRate: number` on the client type, and any
+  // `?? 0`/`Number(...)` normalization behind it. A zero here reads as "this
+  // courier delivers 0% of parcels on time" — the most alarming possible
+  // sentence — about a measurement that cannot exist.
+  assert.equal(c.onTimeRate, null);
+  assert.notEqual(c.onTimeRate, 0);
+  assert.match(c.onTimeBasis, /no promised-delivery date/i, "the reason travels with the null");
+
+  // And the honest substitute is there, with its own base.
+  assert.equal(c.avgDaysToDeliver, 3);
+  assert.equal(c.deliveryTimeSample, 40);
+
+  // A route build that sent something non-numeric is UNKNOWN, never a number.
+  const junk = await senseStore("s", client({
+    couriers: scorecard([{
+      ...courier({ id: "c2", delivered: 30, rto: 1 }),
+      onTimeRate: "0.9" as unknown as number,
+      rtoRate: NaN,
+    }]),
+  }));
+  assert.ok(junk.courier.ok);
+  assert.equal(junk.courier.value.couriers[0]!.onTimeRate, null);
+  assert.equal(junk.courier.value.couriers[0]!.rtoRate, null, "NaN would compare against every threshold");
+});
+
+test("a courier with nothing resolved has NULL rates, and it is named as a blind spot — not read as a clean record", async () => {
+  const sense = await senseStore("s", client({
+    couriers: scorecard([
+      courier({ id: "fresh", name: "Fresh Courier", inFlight: 6, cancelled: 1 }),
+      courier({ id: "thin", name: "Thin Courier", delivered: 1, rto: 1, inFlight: 3 }),
+    ]),
+  }));
+  assert.ok(sense.courier.ok);
+  const [fresh, thin] = sense.courier.value.couriers;
+
+  assert.equal(fresh!.rtoRate, null, "0/0 is unknown; `0` would be a perfect record");
+  assert.equal(fresh!.deliveredRate, null);
+  assert.equal(fresh!.sufficientEvidence, false);
+
+  // The thin one has REAL arithmetic — 50% RTO — over two parcels. Honest as a
+  // number, useless as a verdict, and the flag is what says which.
+  assert.equal(thin!.rtoRate, 0.5);
+  assert.equal(thin!.sufficientEvidence, false);
+  assert.equal(thin!.basis, "2 resolved of 5 dispatched");
+
+  const keys = blindSpots(sense).map((b) => b.key);
+  assert.ok(keys.includes("field:courierEvidence"), "silence about a 2-parcel courier is not a good record");
+  assert.ok(keys.includes("field:courierUnresolved"));
+  const evidence = blindSpots(sense).find((b) => b.key === "field:courierEvidence")!;
+  assert.match(evidence.detail, /2 resolved of 5 dispatched/, "the blind spot quotes the base, not a percentage");
+
+  // AND THE ON-TIME GAP IS NOT ONE OF THESE. It can never close, so it would
+  // re-announce daily forever and block every quiet pulse; it is stated in the
+  // report body wherever a courier claim is made instead (see pulse.ts).
+  assert.equal(keys.includes("field:courierOnTime"), false);
+});
+
+test("a truncated courier window is a floor — the rows are the most recent dispatches, not the period", async () => {
+  const sense = await senseStore("s", client({
+    couriers: scorecard(
+      [courier({ id: "c1", delivered: 4000, rto: 900, failed: 100, inFlight: 50, deliveryTimeSample: 4000, avgDaysToDeliver: 3.2 })],
+      { truncated: true },
+    ),
+  }));
+  assert.ok(sense.courier.ok);
+  assert.equal(sense.courier.value.truncated, true, "the envelope's flag is the whole reason this seam returns one");
+
+  const spot = blindSpots(sense).find((b) => b.key === "page:couriers");
+  assert.ok(spot, "a capped read that looks like a total is exactly what this list is for");
+  assert.match(spot!.detail, /not the period's totals/);
+});
+
+// ---------------------------------------------------------------------------
 // Blindness, at both granularities
 // ---------------------------------------------------------------------------
 
@@ -275,20 +453,32 @@ test("a read that SUCCEEDS but drops a load-bearing field is a blind spot, not a
 test("a dark read names itself, and 'all of them dark' is asked of the sense list, not of the number 5", async () => {
   const boom = new Error("dakio-api 503");
   const sense = await senseStore("s", client({
-    products: boom, suppliers: boom, orders: boom, carts: boom, events: boom,
+    products: boom, suppliers: boom, orders: boom, carts: boom, couriers: boom, events: boom,
   }));
 
   assert.equal(senseFailures(sense).length, SENSE_DOMAINS.length, "every sense is guarded, by name");
   assert.equal(allSensesDark(sense), true);
   assert.equal(blindSpots(sense).length, SENSE_DOMAINS.length);
 
-  // The guard is a question about SENSE_DOMAINS. A sixth sense joins the count
-  // automatically instead of silently switching the all-blind check off.
-  assert.equal(SENSE_DOMAINS.length, 5);
-  assert.deepEqual([...SENSE_DOMAINS], ["products", "sales", "carts", "suppliers", "inbox"]);
+  // ── THE SIXTH SENSE ARRIVED, AND THE GUARD SURVIVED IT ──────────────────
+  //
+  // This is the property the list-derived form was written for, now tested
+  // against the event it was written for: `courier` joined SENSE_DOMAINS and
+  // `allSensesDark` picked it up with no edit. A hard-coded `dark.length === 5`
+  // in pulse.ts would have become unreachable the moment a sixth read existed —
+  // silently, with the all-blind guard switched off and a fully blind store
+  // completing its job row as "quiet".
+  assert.equal(SENSE_DOMAINS.length, 6);
+  assert.deepEqual([...SENSE_DOMAINS], ["products", "sales", "carts", "suppliers", "courier", "inbox"]);
 
   const partial = await senseStore("s", client({ products: boom }));
   assert.equal(allSensesDark(partial), false, "one dark sense is a degrade, not a blind pulse");
+  // FIVE of six dark is still not all six. The guard must not round up.
+  const five = await senseStore("s", client({
+    products: boom, suppliers: boom, orders: boom, carts: boom, couriers: boom,
+  }));
+  assert.equal(allSensesDark(five), false, "one sense still answering is not a blind pulse");
+  assert.equal(senseFailures(five).length, 5);
 });
 
 test("a product that sells nothing has no days of cover — Infinity would sort like a number", async () => {

@@ -76,11 +76,11 @@
 
 import type { NovaDepartment } from "../store/types.js";
 import { LIST_PAGE_CAP } from "../lib/snapshot.js";
-import type { BlindSpot, ProductSignal, StoreSense } from "../lib/snapshot.js";
+import type { BlindSpot, CourierSignal, ProductSignal, StoreSense } from "../lib/snapshot.js";
 import type { BlindSpotState, OpenCondition, PulseSnapshot, ProductState } from "./pulse-state.js";
 
-/** The five domains the sense layer actually reads. Nothing else may appear. */
-export type PulseDomain = "inventory" | "sales" | "carts" | "margin" | "supplier";
+/** The domains the sense layer actually reads. Nothing else may appear. */
+export type PulseDomain = "inventory" | "sales" | "carts" | "margin" | "supplier" | "courier";
 
 /**
  * The thresholds, in one place because they are product decisions, not
@@ -103,6 +103,57 @@ export const PULSE_THRESHOLDS = {
    * fires on the moves a founder would want interrupted for.
    */
   materialChangePct: 25,
+
+  // ── Courier (the sixth sense) ─────────────────────────────────────────────
+  //
+  // These three are Nova's product decisions, not dakio-api's. What is NOT a
+  // decision here is the base every one of them is judged over: the route
+  // computes rates across RESOLVED parcels only and ships `sufficientEvidence`
+  // (resolved ≥ 25) beside them, and `courierConditions` refuses to build any
+  // rate finding without it. A threshold is a line drawn on a measurement; it
+  // cannot create the measurement.
+
+  /**
+   * RTO share of resolved parcels that is worth a founder's attention.
+   *
+   * 20% is high on purpose. Bangladeshi COD commerce lives with double-digit
+   * RTO as a normal cost of doing business — the merchant screens themselves
+   * call 10-15% ordinary — so a threshold tuned to a card-payment market would
+   * fire on every store, every window, and teach the founder to skip the
+   * courier section. One in five parcels coming back is the level at which the
+   * courier, not the market, is the story.
+   */
+  courierRtoRatePct: 20,
+  /**
+   * Mean dispatch→delivery days at which a courier is SLOW, not merely slower.
+   *
+   * Dhaka-inside next-day and nationwide 2-3 days is what the three providers
+   * sell; five days average is a different service than the one the customer
+   * was told about when they ordered. This is NOT an on-time measure and must
+   * never be worded as one — there is no promised date to miss.
+   */
+  courierSlowDeliveryDays: 5,
+  /**
+   * The smallest delivery-time sample Nova will state a mean over.
+   *
+   * `sufficientEvidence` is about RESOLVED parcels, and a courier can clear it
+   * while only a handful of its parcels carry both a dispatch and a delivery
+   * stamp (a hand-marked delivery contributes to `delivered` and to no
+   * duration). A mean over three parcels is an anecdote wearing a decimal
+   * point, so the sample carries its own floor and its size is always in the
+   * evidence line.
+   */
+  courierDeliverySample: 10,
+  /**
+   * How many in-flight parcels must be stagnant before it is a finding.
+   *
+   * Each one is already established fact — the scorecard uses `novaJourney`'s
+   * OWN stagnation thresholds, so these are parcels the journey has raised to
+   * `at_risk` — which is why this floor is a spam guard and not an evidence
+   * gate. One stuck parcel is the courier lane's business; three at one courier
+   * is a pattern the founder should hear about once.
+   */
+  courierStagnantParcels: 3,
 } as const;
 
 /**
@@ -479,6 +530,147 @@ function supplierConditions(suppliers: { id: string; name: string; currentDelayD
   return out;
 }
 
+/**
+ * Courier — what the parcels did, over the base they were counted on.
+ *
+ * ── THE FOUR RULES, AND WHY EACH ONE COSTS A FINDING SOMEWHERE ─────────────
+ *
+ *  1. NO RATE WITHOUT `sufficientEvidence`. The route computes rates over
+ *     resolved parcels at ANY base and says separately whether that base is
+ *     evidence (resolved ≥ 25). The demo seed carries a courier whose RTO rate
+ *     is 50% over TWO parcels: arithmetically the worst number in the store,
+ *     and reporting it would tell a founder to fire a courier over one return.
+ *     That row produces nothing here, forever, until it has a base.
+ *  2. NULL IS NOT A NUMBER. `rtoRate === null` means nothing resolved — never
+ *     "0% RTO, excellent". Every branch below tests for null explicitly rather
+ *     than letting `null < threshold` coerce its way to a verdict.
+ *  3. NOTHING FROM A TRUNCATED WINDOW IS A PERIOD TOTAL. When the read came
+ *     back capped, the rows are the most recent N dispatches; counts are worded
+ *     "at least" and every evidence line says what the numbers are over. The
+ *     rates survive — a rate over the most recent parcels is a real rate, and
+ *     unlike the week-over-week case its denominator is not systematically the
+ *     part that fell off — but they may not be dated to the window.
+ *  4. THE EVIDENCE LINE NAMES THE BASIS, NEVER A BARE PERCENTAGE. "31% RTO" is
+ *     a claim a founder cannot check; "31% RTO over 42 resolved parcels (13 of
+ *     42 came back)" is one they can hold up against their own courier ledger.
+ *
+ * ── WHAT IS DELIBERATELY NOT A CONDITION HERE ─────────────────────────────
+ *
+ *  · ON-TIME RATE. `onTimeRate` is `null` on every response dakio-api can
+ *    produce, because the schema records no promised-delivery date anywhere. It
+ *    is not a threshold nobody has set; it is a measurement that cannot exist.
+ *    `blindSpots` says so out loud rather than this file quietly having no rule.
+ *  · DELIVERED RATE. `delivered = resolved − rto − failed`, so a "delivery
+ *    success is down" finding is the RTO finding again in a friendlier voice,
+ *    counted on the same base, waking the same department twice.
+ *  · CANCELLATION RATE. A cancelled order is a merchant or customer decision;
+ *    the route keeps it out of every denominator for exactly that reason, and
+ *    charging it to a courier would make a store with a lot of order-cancels
+ *    look like it has a shipping problem.
+ *  · COST PER PARCEL / RATE COMPARISON. There is no cost on the wire. The old
+ *    `Courier` type had `costPerShipment`, invented in the demo seed, and a
+ *    "switch to the cheaper courier" finding built on it would have been Nova
+ *    reading its own fixture back to the founder.
+ *  · FAILED RATE ON ITS OWN. `failed` means "ended without delivering and no
+ *    raw string says it came back" — the honest reading is uncertainty, and a
+ *    finding whose whole content is "we do not know what happened to these"
+ *    belongs in the blind-spot list, not in the alarm.
+ */
+function courierConditions(window: { couriers: CourierSignal[]; truncated: boolean }): Condition[] {
+  const out: Condition[] = [];
+  const { truncated } = window;
+  /** Said on every line from a capped read, so no count reads as a period total. */
+  const scope = truncated
+    ? " — counted over the most recent dispatches only, so this is a floor, not the period's total"
+    : "";
+  const atLeast = truncated ? "at least " : "";
+
+  for (const c of window.couriers) {
+    // RULE 1 + 2, in one line: a rate that is unknown, or real but not yet
+    // evidence, produces NOTHING. Not a quieter finding — nothing.
+    if (c.rtoRate !== null && c.sufficientEvidence) {
+      const rtoPct = c.rtoRate * 100;
+      if (rtoPct >= PULSE_THRESHOLDS.courierRtoRatePct) {
+        out.push({
+          key: `courier:rto:${c.id}`,
+          domain: "courier",
+          department: "shipping",
+          severity: "warning",
+          subject: c.id,
+          title: `${c.name} is returning ${Math.round(rtoPct)}% of the parcels it resolves`,
+          metric: "rtoRatePct",
+          value: round(rtoPct, 1),
+          worseWhen: "higher",
+          // THE BASIS, ALWAYS. `c.basis` is the route's own sentence about the
+          // denominator ("42 resolved of 54 dispatched"), so the founder is
+          // never handed a percentage without the parcels behind it.
+          evidence: (prior) =>
+            `${round(rtoPct, 1)}% RTO over ${c.resolved} resolved parcel${c.resolved === 1 ? "" : "s"} ` +
+            `(${c.rto} came back, ${c.basis}; ${c.inFlight} still in flight and ${c.cancelled} cancelled are ` +
+            `excluded from the rate)` +
+            scope +
+            sinceLine(prior, (v) => `${round(v, 1)}%`),
+        });
+      }
+    }
+
+    // A MEAN NEEDS ITS OWN BASE. `sufficientEvidence` is about resolved
+    // parcels; this average is over the ones that carried both a dispatch and
+    // a delivery stamp, and that sample is usually smaller. Both floors apply.
+    if (
+      c.avgDaysToDeliver !== null &&
+      c.sufficientEvidence &&
+      c.deliveryTimeSample >= PULSE_THRESHOLDS.courierDeliverySample &&
+      c.avgDaysToDeliver >= PULSE_THRESHOLDS.courierSlowDeliveryDays
+    ) {
+      out.push({
+        key: `courier:slow:${c.id}`,
+        domain: "courier",
+        department: "shipping",
+        severity: "info",
+        subject: c.id,
+        // NOT "late". Nothing was promised, so nothing was missed — this is
+        // how long parcels took, which is a different sentence.
+        title: `${c.name} is taking ${round(c.avgDaysToDeliver, 1)} days to deliver`,
+        metric: "avgDaysToDeliver",
+        value: round(c.avgDaysToDeliver, 1),
+        worseWhen: "higher",
+        evidence: (prior) =>
+          `${round(c.avgDaysToDeliver!, 1)} days from dispatch to delivery, averaged over ` +
+          `${c.deliveryTimeSample} delivered parcel${c.deliveryTimeSample === 1 ? "" : "s"} ` +
+          `(${c.basis}). No delivery promise is recorded anywhere in the store, so this is how long parcels ` +
+          `took — not how late they were` +
+          scope +
+          sinceLine(prior, (v) => `${round(v, 1)} days`),
+      });
+    }
+
+    // A COUNT, NOT A RATE, so the evidence floor does not apply — each of these
+    // parcels was raised by `novaJourney`'s own stagnation thresholds, which
+    // the scorecard reads rather than restating. What applies instead is the
+    // truncation rule: on a capped read this is "at least N".
+    if (c.inFlightStagnant >= PULSE_THRESHOLDS.courierStagnantParcels) {
+      out.push({
+        key: `courier:stagnant:${c.id}`,
+        domain: "courier",
+        department: "shipping",
+        severity: "warning",
+        subject: c.id,
+        title: `${atLeast}${c.inFlightStagnant} ${c.name} parcels have stopped moving`,
+        metric: "inFlightStagnant",
+        value: c.inFlightStagnant,
+        worseWhen: "higher",
+        evidence: (prior) =>
+          `${atLeast}${c.inFlightStagnant} of ${c.inFlight} in-flight parcel${c.inFlight === 1 ? "" : "s"} at ` +
+          `${c.name} have not had a courier scan in long enough for the delivery journey to flag them` +
+          scope +
+          sinceLine(prior, (v) => `${v}`),
+      });
+    }
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // COMPARE
 // ---------------------------------------------------------------------------
@@ -501,6 +693,7 @@ export function comparePulse(sense: StoreSense, prior: PulseSnapshot | null): Pu
   if (sense.sales.ok) conditions.push(...salesConditions(sense.sales.value));
   if (sense.carts.ok) conditions.push(...cartConditions(sense.carts.value));
   if (sense.suppliers.ok) conditions.push(...supplierConditions(sense.suppliers.value));
+  if (sense.courier.ok) conditions.push(...courierConditions(sense.courier.value));
 
   const priorOpen = prior?.openFindings ?? null;
   const findings: PulseFinding[] = [];
@@ -627,6 +820,32 @@ export function undeterminableKeys(sense: StoreSense, priorKeys: readonly string
     }
   }
 
+  // ── Courier: the read answered, the ROW could not decide ─────────────────
+  //
+  // Three ways a courier condition is unknown rather than solved, and all three
+  // are the ordinary state of a small store: the rate is null (nothing
+  // resolved), the base is below the evidence floor, or the delivery-time
+  // sample is too thin for a mean. Without this, a courier that crossed 20% RTO
+  // last week and has since had its parcels drop under the floor would leave
+  // the open set as though the returns had stopped — and re-announce itself as
+  // a "(first sighting)" the next time it has 25 resolved parcels.
+  //
+  // A courier that vanished from the list entirely is NOT here: it booked
+  // nothing in the window, which is a real change of state, and its condition
+  // closing is honest. This is only about rows that answered and could not say.
+  if (sense.courier.ok) {
+    for (const c of sense.courier.value.couriers) {
+      if (c.rtoRate === null || !c.sufficientEvidence) out.add(`courier:rto:${c.id}`);
+      if (
+        c.avgDaysToDeliver === null ||
+        !c.sufficientEvidence ||
+        c.deliveryTimeSample < PULSE_THRESHOLDS.courierDeliverySample
+      ) {
+        out.add(`courier:slow:${c.id}`);
+      }
+    }
+  }
+
   // A revenue comparison that cannot be computed (truncated page, or no prior
   // week) leaves the condition where it was rather than closing it.
   if (sense.sales.ok && (sense.sales.value.partial || sense.sales.value.revenuePrior7d <= 0)) {
@@ -655,7 +874,7 @@ function withinDismissalWindow(state: OpenCondition, at: string): boolean {
 /** The domain a condition key belongs to — the prefix before the first colon. */
 function domainOfKey(key: string): PulseDomain | null {
   const head = key.split(":")[0];
-  return (["inventory", "sales", "carts", "margin", "supplier"] as const).find((d) => d === head) ?? null;
+  return (["inventory", "sales", "carts", "margin", "supplier", "courier"] as const).find((d) => d === head) ?? null;
 }
 
 /** Did the sense that produces this domain's conditions answer this pass? */
@@ -670,6 +889,8 @@ function domainAnswered(sense: StoreSense, domain: PulseDomain | null): boolean 
       return sense.carts.ok;
     case "supplier":
       return sense.suppliers.ok;
+    case "courier":
+      return sense.courier.ok;
     default:
       // An unrecognised key belongs to no domain this build knows about — a
       // snapshot written by a newer version, or a renamed condition. Treat it

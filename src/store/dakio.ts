@@ -21,8 +21,11 @@
  * read-only product decision; the rest have no ticket-status store or
  * customer↔Meta-conversation link to write through). A mis-configured
  * autonomy level fails loudly on these rather than pretending to act. Gap
- * groups with no live source yet (couriers, trending, campaign insights) read
- * as empty. See `docs/blueprint/02-findings-live-dakio.md`.
+ * groups with no live source yet (trending, campaign insights) read as empty.
+ * COURIERS ARE NO LONGER ONE OF THEM: `GET /couriers` is a real aggregate over
+ * `CourierConsignment` + `Order.courierStatus/At` (dakio-api fbba817), and
+ * `listCouriers` returns its whole envelope — see the method for why the
+ * envelope, not the rows. See `docs/blueprint/02-findings-live-dakio.md`.
  *
  * Auth: a per-tenant Nova service token (Bearer). Tenancy is enforced server-
  * side from the token; this client never sends a store id in the body.
@@ -43,6 +46,7 @@ import type {
   ContentDraftInput,
   ContentItem,
   Courier,
+  CourierScorecard,
   CouponValidation,
   CreateDiscountInput,
   Customer,
@@ -650,13 +654,26 @@ export class DakioStoreClient implements StoreClient {
     });
   }
 
-  async listCouriers(): Promise<Courier[]> {
-    const { couriers } = await this.get<{ couriers: Courier[] }>("/api/v1/store/couriers");
-    return couriers;
+  /**
+   * The courier scorecard, whole. NOT `couriers` alone.
+   *
+   * This used to unwrap the array and throw the envelope away, back when the
+   * route was a hardcoded `{ couriers: [] }` and there was nothing in the
+   * envelope to lose. There is now: `truncated` says the rows are the most
+   * recent N dispatches rather than the window's parcels, and `window` is the
+   * period the counts belong to. Both are what stop a caller — the pulse, most
+   * of all — presenting a capped read as a period total, so they travel.
+   *
+   * The route's own `notes` ride along rather than being re-stated here: they
+   * are the source's caveats about its own numbers, and a copy in this file
+   * would be the second place they could drift.
+   */
+  async listCouriers(opts?: { days?: number }): Promise<CourierScorecard> {
+    return this.get<CourierScorecard>("/api/v1/store/couriers", { days: opts?.days });
   }
 
   async getCourier(id: string): Promise<Courier | null> {
-    const couriers = await this.listCouriers();
+    const { couriers } = await this.listCouriers();
     return couriers.find((c) => c.id === id) ?? null;
   }
 

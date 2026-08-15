@@ -25,6 +25,7 @@ import type {
   ChatOrderRequest,
   ChatOrderResult,
   Courier,
+  CourierScorecard,
   CouponRefusal,
   CouponValidation,
   CreateDiscountInput,
@@ -926,8 +927,44 @@ export class DemoStore implements StoreClient {
     return po;
   }
 
-  async listCouriers(): Promise<Courier[]> {
-    return this.data.couriers;
+  /**
+   * The demo scorecard, in the SAME envelope dakio-api emits.
+   *
+   * The seeds carry the rows (one per courier, with a plausible parcel history
+   * — including a courier with too few resolved parcels to judge, so the
+   * evidence gradient is exercised offline); the envelope is computed here, the
+   * way the route computes it, so a caller cannot accidentally depend on demo
+   * data being shaped more conveniently than the wire.
+   *
+   * `truncated` is false and stays false: the demo store holds tens of parcels,
+   * not the 5,000 that cap a real request. The truncated path is exercised by
+   * a literal client in the suites rather than faked here — a demo backend that
+   * lied about being capped would be the only place that behaviour existed.
+   */
+  async listCouriers(opts?: { days?: number }): Promise<CourierScorecard> {
+    const couriers = this.data.couriers;
+    const days = opts?.days ?? 30;
+    const until = new Date(this.now());
+    const since = new Date(until.getTime() - days * 86_400_000);
+    const total = (pick: (c: Courier) => number) => couriers.reduce((sum, c) => sum + pick(c), 0);
+    return {
+      couriers,
+      window: { days, since: since.toISOString(), until: until.toISOString(), basedOn: "dispatch" },
+      totals: {
+        parcels: total((c) => c.parcels),
+        resolved: total((c) => c.resolved),
+        inFlight: total((c) => c.inFlight),
+        cancelled: total((c) => c.cancelled),
+        orphaned: 0,
+      },
+      truncated: false,
+      notes: [
+        "Rates are over resolved parcels only (delivered + rto + failed). In-flight and cancelled parcels are excluded from every denominator and reported separately.",
+        "No rate is returned over a zero base — a courier with nothing resolved yet has null rates, never 0.",
+        "onTimeRate is null: Dakio records no promised-delivery date. Use avgDaysToDeliver, whose base is deliveryTimeSample.",
+        "Treat a row with sufficientEvidence:false as an observation, not a verdict.",
+      ],
+    };
   }
 
   async getCourier(id: string): Promise<Courier | null> {

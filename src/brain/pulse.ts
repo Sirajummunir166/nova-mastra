@@ -15,9 +15,11 @@
  * ── THE LOOP ────────────────────────────────────────────────────────────────
  *
  *   SENSE    `senseStore` (lib/snapshot.ts) — one round of parallel reads,
- *            each independently guarded. Four honest domains plus supplier
- *            delay; ads/courier/support are NOT sensed and `SENSE_GAPS` says
- *            why, in the code, where a reader trips over it.
+ *            each independently guarded. Six domains now: inventory, sales,
+ *            carts, margin, supplier delay and — since dakio-api's
+ *            `GET /couriers` became a real aggregate — COURIER. Ads and support
+ *            are still NOT sensed and `SENSE_GAPS` says why, in the code, where
+ *            a reader trips over it.
  *   COMPARE  `comparePulse` (pulse-compare.ts) — pure, edge-triggered. Nothing
  *            crossed a threshold ⇒ STOP: write the snapshot, return, spend
  *            nothing. SILENCE IS THE DESIGNED SUCCESS OF THIS LANE, and a
@@ -46,7 +48,10 @@
  *     ({@link boundJudgeText}) — but it cannot become the line the founder
  *     reads first, because that line once read "⚠ Sales are down because your
  *     courier is losing parcels and ad spend is wasted" on a report that
- *     disclaims courier and ads in its own footer.
+ *     disclaimed courier and ads in its own footer. (Half of that sentence is
+ *     now measurable and the vocabulary bound has let go of the word
+ *     "courier" — see {@link UNKNOWABLE_VOCABULARY}. The title rule has not
+ *     moved an inch: a measured domain does not earn model prose a headline.)
  *  2. A CONDITION IS "OPEN" ONLY IF IT REACHED THE FOUNDER. The snapshot's
  *     `announced` flag is set from a filed report or a Decision card on the
  *     desk — not from "we derived it". One `worthWaking: false`, or one 500 on
@@ -64,6 +69,12 @@
  * pulse can propose (reorder, clearance, reprice, switch supplier, recover a
  * cart) belongs to a duty this lane does not hold — they live with `night_ops`,
  * `cart_sweep`, or nowhere at all (registry's `UNCLAIMED`).
+ *
+ * The courier sense arrived without moving that line: the pulse lane declares
+ * NO shipping duty (checked, not assumed — `registry.ts`'s pulse entry is
+ * `ceo.risk_alerts`, `ceo.department_oversight`, `inventory.stock_monitoring`,
+ * `inventory.low_stock_alerts`), so the one courier remedy that has a verb
+ * behind it surfaces as a capability gap like every other row in the table.
  *
  * So on a real store today the pulse NOTICES and REPORTS, and acts on nothing.
  * That is a capability gap, and this file's job is to make it visible rather
@@ -282,12 +293,37 @@ export function changeCard(input: {
  *
  * Deliberately wide (a false positive costs a nice sentence; a false negative
  * costs a fabricated cause in the founder's headline) and keyed by the same
- * three domains {@link SENSE_GAPS} names, so a domain that gains a real read
- * has exactly one place to be deleted from.
+ * domains {@link SENSE_GAPS} names, so a domain that gains a real read has
+ * exactly one place to be deleted from.
+ *
+ * ── THE COURIER ENTRY IS GONE, AND THAT WAS THE DESIGN WORKING ────────────
+ *
+ * It read:
+ *
+ *     courier: /\b(courier\w*|deliver\w*|shipp?\w*|parcel\w*|rto|…)\b/i
+ *
+ * and it existed because the probe that built this wall produced *"Sales are
+ * down because your courier is losing parcels"* from a judge that had never
+ * seen a parcel. The judge now can: `senseStore` reads the courier scorecard,
+ * the change card carries RTO counts and dispatch-to-delivery days, and a
+ * sentence about parcels is a sentence about a measurement. Keeping the regex
+ * would have censored the courier department's own findings — the ONE
+ * department whose card is entirely about parcels — and replaced every line the
+ * judge wrote about them with the fallback.
+ *
+ * WHAT STILL STOPS THE ORIGINAL LIE is the other half of {@link boundJudgeText},
+ * which never depended on this table: every NUMBER in the prose must appear in
+ * the card it was judging. An inventory judge that reaches for a courier cause
+ * cannot bring a courier number with it, and the fabricated *cause* it can
+ * still write is bounded by the card's own "use only what the card says" and by
+ * the fact that no model prose has been the report's TITLE since D1.
+ *
+ * The `Record<(typeof SENSE_GAPS)[number]["domain"], …>` key type is what made
+ * the deletion mandatory rather than optional: removing courier from
+ * `SENSE_GAPS` failed this object literal to compile.
  */
 const UNKNOWABLE_VOCABULARY: Record<(typeof SENSE_GAPS)[number]["domain"], RegExp> = {
   ads: /\b(ads?|advert\w*|campaign\w*|roas|cpa|cpm|ctr|boost\w*|retarget\w*|ad[- ]?spend|facebook|meta|instagram)\b/i,
-  courier: /\b(courier\w*|deliver\w*|shipp?\w*|parcel\w*|rto|logistic\w*|pathao|steadfast|redx|consignment\w*)\b/i,
   support: /\b(support|ticket\w*|complaint\w*|helpdesk|refund[- ]?request\w*)\b/i,
 };
 
@@ -428,6 +464,26 @@ export type RemedyFn = (finding: PulseFinding, sense: StoreSense) => Remedy | nu
  *  · revenue drop → NO remedy at all. There is no verb in `ActionType` that
  *                   fixes a week-over-week decline; the judgement belongs to
  *                   `weekly_strategy`. A report is the honest whole response.
+ *  · stagnant     → `flag_courier_issue` under `shipping.delay_chasing`.
+ *    parcels       Governing (VERB_DUTIES), held by `courier_intervention`,
+ *                  not by this lane. OUT OF LANE — the newest row, and the
+ *                  first one the courier sense made possible.
+ *  · courier RTO  → NO remedy, and this one is worth reading twice, because
+ *    / slow          "no remedy" here is not the same shape of gap as the
+ *    delivery        revenue drop's. The founder's roster HAS a duty for it:
+ *                  `shipping.rto_reduction` (RTO Analytics door, minLevel 2),
+ *                  which registry.ts's UNCLAIMED list rules out for a reason
+ *                  that this work just made stale — "the pulse's courier domain
+ *                  is DEAD AT THE SOURCE (the route returns `couriers: []`), so
+ *                  nothing reads RTO". Something reads it now. What is still
+ *                  missing is a VERB: `ActionType` has nothing that changes
+ *                  which courier a store routes to. `assign_courier` books ONE
+ *                  parcel's pickup — booking a parcel is not changing a policy,
+ *                  and filing it against a scorecard finding would be the
+ *                  laundering `VERB_DUTIES` exists to stop. So the report is
+ *                  the whole response, and the gap is written down where the
+ *                  people who can close it will read it (registry.ts is not
+ *                  this stream's to edit).
  */
 export const productionRemedy: RemedyFn = (finding, sense) => {
   const product = sense.products.ok ? sense.products.value.find((p) => p.id === finding.subject) : null;
@@ -485,6 +541,40 @@ export const productionRemedy: RemedyFn = (finding, sense) => {
       title: finding.title,
       paramsLine: finding.observation.evidence,
       payload: { supplierId: finding.subject },
+    };
+  }
+  // ── Courier: ONE of the three conditions has a verb behind it ────────────
+  //
+  // Stagnant parcels are a thing a person can act on today — someone rings the
+  // courier about parcels that have stopped scanning — and `flag_courier_issue`
+  // is exactly that act: it changes nothing at the courier (Dakio cannot hold,
+  // redirect or reschedule a parcel), it assembles the facts and puts them in
+  // front of the person who can pick up a phone.
+  //
+  // NO `trackingId`, deliberately. The verb's payload carries one because its
+  // native caller (`courier_intervention`) works ONE parcel; this finding is a
+  // pattern across a courier's whole in-flight book, and inventing a
+  // representative parcel id would put a specific tracking number on a card
+  // about a general problem. The courier and the count are the honest facts.
+  //
+  // The other two courier conditions (RTO rate, slow delivery) fall through to
+  // `return null` — see the table header: the roster has the duty
+  // (`shipping.rto_reduction`) and `ActionType` has no verb.
+  if (finding.key.startsWith("courier:stagnant:")) {
+    const courier = sense.courier.ok
+      ? sense.courier.value.couriers.find((c) => c.id === finding.subject)
+      : null;
+    return {
+      type: "flag_courier_issue",
+      dutyKey: "shipping.delay_chasing",
+      department: "shipping",
+      title: finding.title,
+      paramsLine: finding.observation.evidence,
+      payload: {
+        courierType: courier?.name ?? finding.subject,
+        reason: finding.observation.evidence,
+        recommendation: "Chase the courier for a scan on these parcels before the customers ask.",
+      },
     };
   }
   if (finding.domain === "carts") {
@@ -1380,6 +1470,27 @@ function pulseBody(input: {
       `**Inbox queue**: ${drainFailures.length} event(s) could not be marked as seen — Nova will re-read them ` +
         `next pass.`,
       ...drainFailures.map((f) => `- ${f}`),
+      "",
+    );
+  }
+  // ── THE ON-TIME FOOTNOTE, said where a courier claim is actually made ────
+  //
+  // Courier is sensed now, so it is not in the "Not checked" line below — but
+  // ONE thing inside it can never be measured: Dakio's schema records no
+  // promised-delivery date anywhere, so "was this courier late?" has no answer
+  // at all. A founder reading "5.4 days to deliver" with nothing beside it may
+  // reasonably hear "and that is within the promise", which is a sentence
+  // nobody is entitled to.
+  //
+  // It is a footnote and not a blind spot on purpose (see `blindSpots` in
+  // snapshot.ts): a blind spot re-announces daily forever and blocks a quiet
+  // pulse, and this fact will be equally true tomorrow and next year. So it
+  // appears exactly when the report carries a courier finding, which is exactly
+  // when it could mislead.
+  if (settled.some((s) => s.finding.domain === "courier")) {
+    lines.push(
+      "_On-time delivery is not measured anywhere above: the store records no promised-delivery date, so Nova " +
+        "reports how long parcels took, never whether they were late._",
       "",
     );
   }

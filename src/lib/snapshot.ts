@@ -22,12 +22,21 @@
  * domain is its own {@link DomainRead}, and an unreadable one carries its
  * reason while the others still answer.
  *
- * ── THE FOUR HONEST DOMAINS, AND THE THREE THAT ARE NOT SENSED ─────────────
+ * ── THE HONEST DOMAINS, AND THE TWO THAT ARE NOT SENSED ────────────────────
  *
  * See {@link SENSE_GAPS}. `analytics.ts` also scanned ads, courier ("logistics"
- * on its side) and support. Against a real dakio tenant today all three are
- * dead at the source, so anything this layer said about them would be a lie
- * dressed as a metric. They are named there rather than silently missing.
+ * on its side) and support. Two of those three are still dead at the source, so
+ * anything this layer said about them would be a lie dressed as a metric; they
+ * are named there rather than silently missing.
+ *
+ * COURIER IS NO LONGER ONE OF THEM. dakio-api's `GET /couriers` stopped being a
+ * hardcoded `{ couriers: [] }` and became a real aggregate over
+ * `CourierConsignment` + `Order.courierStatus/At`, so {@link StoreSense.courier}
+ * is the sixth sense and the gap entry is deleted. What arrives with it is a
+ * whole vocabulary of unknowns that must NOT be read as zeros — a rate over
+ * nothing resolved, a mean over one delivery, an on-time figure that can never
+ * exist — and every one of them is carried as `null` here and refused a finding
+ * in `pulse-compare.ts`.
  *
  * ── AND THREE FIELDS THAT ARE DEAD INSIDE A LIVE DOMAIN ────────────────────
  *
@@ -356,6 +365,72 @@ export interface SupplierSignal {
   hasOffers: boolean;
 }
 
+/**
+ * ONE COURIER, AS THE PULSE MAY REASON ABOUT IT.
+ *
+ * A near-passthrough of dakio-api's scorecard row, and deliberately so: the
+ * route already did the honest arithmetic (rates over RESOLVED parcels only,
+ * `null` rather than `0` on a zero base, an evidence floor, stagnation read off
+ * `novaJourney`'s own thresholds). Re-deriving any of it here would be a second
+ * opinion about the same parcels.
+ *
+ * WHAT THIS LAYER ADDS is normalization of the two fields a caller can be
+ * fooled by:
+ *
+ *  · every rate is coerced to `number | null` — a non-numeric value from an
+ *    older route build becomes UNKNOWN, never a number that compares against a
+ *    threshold;
+ *  · {@link CourierSignal.onTimeRate} is carried as-is and is `null` forever
+ *    today, with {@link CourierSignal.onTimeBasis} saying why. It exists on
+ *    this shape so {@link blindSpots} can say out loud that on-time performance
+ *    cannot be judged — an absent field would just look like nobody asked.
+ */
+export interface CourierSignal {
+  id: string;
+  name: string;
+  parcels: number;
+  /** The only legitimate rate denominator: delivered + rto + failed. */
+  resolved: number;
+  delivered: number;
+  rto: number;
+  failed: number;
+  cancelled: number;
+  inFlight: number;
+  /** Stagnant by `novaJourney`'s thresholds — parcels it has already raised. */
+  inFlightStagnant: number;
+  /** 0-1 over `resolved`. NULL = nothing resolved; a finding may not be built on it. */
+  rtoRate: number | null;
+  deliveredRate: number | null;
+  failedRate: number | null;
+  /** NULL always, today. Dakio records no promised-delivery date. */
+  onTimeRate: number | null;
+  onTimeBasis: string;
+  /** Mean dispatch→delivery days, over {@link CourierSignal.deliveryTimeSample}. */
+  avgDaysToDeliver: number | null;
+  deliveryTimeSample: number;
+  /** `resolved >= 25`, as the ROUTE computed it. Never re-derived here. */
+  sufficientEvidence: boolean;
+  /** "6 resolved of 9 dispatched" — the base, in the words a founder reads. */
+  basis: string;
+}
+
+/**
+ * The courier domain, sensed: the rows plus the two envelope facts that decide
+ * how they may be worded.
+ *
+ * `truncated` is not a detail. It means the window held more parcels than one
+ * request reads, so the rows describe the MOST RECENT N dispatches — quoting
+ * them as the period's totals would be a number the founder can check against
+ * their own courier ledger and find wrong.
+ */
+export interface CourierWindow {
+  couriers: CourierSignal[];
+  /** The rolling dispatch-dated window these counts belong to. */
+  windowDays: number;
+  /** The rows are the most recent N dispatches, NOT the window's parcels. */
+  truncated: boolean;
+}
+
 /** One unprocessed store event — awareness, never a finding of its own. */
 export interface InboxEventSignal {
   id: string;
@@ -379,6 +454,15 @@ export interface StoreSense {
   sales: DomainRead<SalesWindow>;
   carts: DomainRead<CartTotals>;
   suppliers: DomainRead<SupplierSignal[]>;
+  /**
+   * THE SIXTH SENSE, and the first one to leave {@link SENSE_GAPS} rather than
+   * being added beside them. dakio-api's `GET /couriers` was a hardcoded
+   * `{ couriers: [] }` until it became a real aggregate over
+   * `CourierConsignment` + `Order.courierStatus/At`; the entry that named
+   * courier unknowable was deleted the day the read landed, which is exactly
+   * what that list is for.
+   */
+  courier: DomainRead<CourierWindow>;
   inbox: DomainRead<InboxEventSignal[]>;
   /**
    * Which reads came back on a page that hit dakio-api's row cap. A capped page
@@ -392,8 +476,13 @@ export interface StoreSense {
  * The senses, by name. ONE list, so "did every sense go dark?" is a question
  * about this array rather than a hard-coded `=== 5` that a sixth sense would
  * silently walk past.
+ *
+ * The sixth sense has now arrived (`courier`), which is the first time that
+ * property was worth anything: `allSensesDark` and `blindSpots` picked it up
+ * without an edit, and the all-blind guard in `pulse.ts` still asks this list
+ * rather than counting to five.
  */
-export const SENSE_DOMAINS = ["products", "sales", "carts", "suppliers", "inbox"] as const;
+export const SENSE_DOMAINS = ["products", "sales", "carts", "suppliers", "courier", "inbox"] as const;
 
 export type SenseDomain = (typeof SENSE_DOMAINS)[number];
 
@@ -406,22 +495,29 @@ export type SenseDomain = (typeof SENSE_DOMAINS)[number];
  * cannot know. Exported (and asserted on) so a reader meets the gap instead of
  * assuming we forgot, and so the day a real read lands, the entry has to be
  * deleted on purpose.
+ *
+ * ── ONE ENTRY HAS NOW LEFT THIS LIST, WHICH IS THE POINT OF KEEPING IT ─────
+ *
+ * `courier` was here, and its reason ended "Until then: no shipping finding,
+ * ever." dakio-api answered it: `GET /couriers` is a real aggregate over
+ * `CourierConsignment` + `Order.courierStatus/At` — the months of per-parcel
+ * outcomes the entry pointed at — so the domain is sensed
+ * ({@link StoreSense.courier}) and the entry is deleted rather than left as a
+ * disclaimer the code has outgrown. Everything keyed on this list moved with
+ * it in one step: the report footer's "Not checked:" line, the change card's
+ * "NOVA CANNOT SEE" line, and the judge's vocabulary bound, which now permits a
+ * sentence about couriers because there is finally a measurement behind it.
+ *
+ * The two that remain are still dead, and courier leaving is not evidence that
+ * they are close to living.
  */
-export const SENSE_GAPS: readonly { domain: "ads" | "courier" | "support"; reason: string }[] = [
+export const SENSE_GAPS: readonly { domain: "ads" | "support"; reason: string }[] = [
   {
     domain: "ads",
     reason:
       "dakio-api's ads route returns `campaigns: []` — it reports the Meta connection STATUS and nothing " +
       "else. Burn, CPA and ROAS have no source, so no ad finding can be made. (nova-ai's ads scan runs " +
       "against demo-seeded campaigns, which is why it looks alive there.)",
-  },
-  {
-    domain: "courier",
-    reason:
-      "The courier route returns `couriers: []` — on-time rate and RTO have no source today. The fix is a " +
-      "product, not plumbing: `CourierConsignment` + `Order.courierStatus/At` already hold months of " +
-      "per-parcel outcomes written every 5 minutes by courierSync, and one aggregating read would serve " +
-      "this sense AND ship doc 07's Tier-2 courier scorecard. Until then: no shipping finding, ever.",
   },
   {
     domain: "support",
@@ -452,6 +548,16 @@ const DAY_MS = 86_400_000;
 
 function sum(values: number[]): number {
   return values.reduce((total, v) => total + v, 0);
+}
+
+/**
+ * A number, or UNKNOWN. The `null`s dakio-api sends deliberately (`rtoRate`
+ * over a zero base, `onTimeRate` always) survive as `null`, and so does
+ * anything non-numeric an older or broken build might send. Nothing here ever
+ * becomes `0`: that is the mistake this whole file is a list of.
+ */
+function numberOrNull(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 /** Orders that count toward revenue: everything a customer did not un-buy. */
@@ -554,7 +660,7 @@ export async function senseStore(storeId: string, client: StoreClient = storeFor
   const at = client.now();
   const nowMs = Date.parse(at);
 
-  const [products, suppliers, orders14, cartPage, events] = await Promise.all([
+  const [products, suppliers, orders14, cartPage, courierPage, events] = await Promise.all([
     sense(storeId, "products", () => client.listProducts({ status: "active" })),
     sense(storeId, "suppliers", () => client.listSuppliers()),
     sense(storeId, "orders", () => client.listOrders({ sinceDays: 14 })),
@@ -564,6 +670,11 @@ export async function senseStore(storeId: string, client: StoreClient = storeFor
     // "were there more leads than fit?" is unanswerable from a filtered slice,
     // and that is exactly the question a cart TOTAL depends on.
     sense(storeId, "carts", () => client.listAbandonedCarts()),
+    // ONE read, the route's DEFAULT window (30 days back from dispatch). The
+    // default is not passed explicitly: the window is the route's product
+    // decision and it ships `window.days` in the response, so restating "30"
+    // here would be a second copy of it that could silently disagree.
+    sense(storeId, "couriers", () => client.listCouriers()),
     sense(storeId, "inbox_events", () => client.listInboxEvents({ processed: false })),
   ]);
 
@@ -656,12 +767,56 @@ export async function senseStore(storeId: string, client: StoreClient = storeFor
       })()
     : cartPage;
 
+  // ── courier: the scorecard, normalized and not re-derived ─────────────────
+  //
+  // A rate that is not a finite number becomes `null` (UNKNOWN), never a value
+  // that would compare against a threshold. Everything else — the counts, the
+  // evidence flag, the basis line — is the route's own and is carried, because
+  // the route computed it over the parcels and this layer did not see them.
+  const courier: DomainRead<CourierWindow> = courierPage.ok
+    ? {
+        ok: true as const,
+        value: {
+          couriers: (courierPage.value.couriers ?? []).map((c) => ({
+            id: c.id,
+            name: c.name,
+            parcels: c.parcels,
+            resolved: c.resolved,
+            delivered: c.delivered,
+            rto: c.rto,
+            failed: c.failed,
+            cancelled: c.cancelled,
+            inFlight: c.inFlight,
+            inFlightStagnant: c.inFlightStagnant,
+            rtoRate: numberOrNull(c.rtoRate),
+            deliveredRate: numberOrNull(c.deliveredRate),
+            failedRate: numberOrNull(c.failedRate),
+            // Carried, and carried as unknown. It is `null` on every response
+            // dakio-api can currently produce, and a caller that turns it into
+            // a number is claiming a promise date the schema does not hold.
+            onTimeRate: numberOrNull(c.onTimeRate),
+            onTimeBasis: c.onTimeBasis ?? "unavailable",
+            avgDaysToDeliver: numberOrNull(c.avgDaysToDeliver),
+            deliveryTimeSample: Number.isFinite(c.deliveryTimeSample) ? c.deliveryTimeSample : 0,
+            // The ROUTE decides what counts as evidence; `=== true` so a
+            // response missing the field reads as "not evidence", never as
+            // evidence by default.
+            sufficientEvidence: c.sufficientEvidence === true,
+            basis: c.basis ?? `${c.resolved} resolved of ${c.parcels} dispatched`,
+          })),
+          windowDays: courierPage.value.window?.days ?? 0,
+          truncated: courierPage.value.truncated === true,
+        },
+      }
+    : courierPage;
+
   return {
     storeId,
     at,
     products: productSignals,
     sales: salesWindow,
     carts,
+    courier,
     partial: {
       products: products.ok && products.value.length >= LIST_PAGE_CAP,
       orders: orders14.ok && orders14.value.length >= LIST_PAGE_CAP,
@@ -826,6 +981,63 @@ export function blindSpots(sense: StoreSense): BlindSpot[] {
         detail:
           `${sense.carts.value.unpriced} abandoned cart(s) carry no value — counted, but left out of the money ` +
           `figure instead of being added at ৳0`,
+      });
+    }
+  }
+
+  if (sense.courier.ok) {
+    const { couriers, truncated, windowDays } = sense.courier.value;
+    if (couriers.length > 0) {
+      // ── WHY `onTimeRate: null` IS NOT ONE OF THESE ────────────────────────
+      //
+      // It is the most tempting candidate on this shape and it is deliberately
+      // absent. A blind spot in this list is EDGE-TRIGGERED and re-announced
+      // every 24h for as long as it lasts (`BLIND_REANNOUNCE_MS`), and
+      // `pulse.ts` cannot answer `quiet: true` while one is unreported — so
+      // listing "the schema has no promised-delivery date" here would file a
+      // report every single day, on every store, forever, with the identical
+      // sentence and nothing any founder could ever do about it. That is the
+      // definition of the spam this lane exists not to send.
+      //
+      // The other blind spots earn their re-announcement because they can
+      // CLOSE: a velocity source can be built, a courier accumulates parcels, a
+      // page stops being capped. A promise date that does not exist in the data
+      // model is a standing fact, and standing facts belong in the footnote,
+      // not the alarm. It is stated wherever a courier claim is actually
+      // made — in the slow-delivery finding's own evidence line, and as a
+      // footnote in the report body under the courier section (`pulse.ts`) —
+      // so the founder meets it exactly where it could otherwise mislead.
+
+      // ── WHAT IS HERE: a rate that is real arithmetic and not yet evidence.
+      // Silence about these couriers is a small sample, not a clean record —
+      // and unlike the on-time gap, it closes on its own as parcels resolve.
+      const thin = couriers.filter((c) => !c.sufficientEvidence);
+      if (thin.length > 0) {
+        out.push({
+          key: "field:courierEvidence",
+          detail:
+            `${thin.length} of ${couriers.length} courier(s) have too few resolved parcels to judge ` +
+            `(${thin.map((c) => `${c.name}: ${c.basis}`).join("; ")}) — Nova makes no claim about their rates, ` +
+            `and a small sample is not a good record`,
+        });
+      }
+      // Nothing has finished yet: rates are null for these, by design.
+      const unresolved = couriers.filter((c) => c.resolved === 0);
+      if (unresolved.length > 0) {
+        out.push({
+          key: "field:courierUnresolved",
+          detail:
+            `${unresolved.length} of ${couriers.length} courier(s) have no resolved parcel in the window — ` +
+            `every rate for them is unknown, not 0`,
+        });
+      }
+    }
+    if (truncated) {
+      out.push({
+        key: "page:couriers",
+        detail:
+          `the courier read came back capped, so the rows cover only the most recent dispatches inside the ` +
+          `${windowDays}-day window — the counts are a floor, not the period's totals`,
       });
     }
   }

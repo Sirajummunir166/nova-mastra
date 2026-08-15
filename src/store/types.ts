@@ -472,16 +472,126 @@ export interface PurchaseOrder {
   expectedAt: string;
 }
 
+/**
+ * ONE COURIER'S SCORECARD ROW, exactly as `GET /api/v1/store/couriers` emits it.
+ *
+ * ── WHAT THIS REPLACED, AND WHY IT MATTERED ────────────────────────────────
+ *
+ * This interface used to declare `costPerShipment`, `avgDeliveryDays`,
+ * `onTimeRate: number`, `rtoRate: number` and `regions: string[]` — a shape
+ * invented for the demo seed while the route returned a hardcoded
+ * `{ couriers: [] }`. Not one of those five fields is on the wire today, and
+ * three of them were the dangerous kind of wrong:
+ *
+ *  · `onTimeRate: number` promised a fraction that CAN NEVER EXIST. Dakio's
+ *    schema records no promised-delivery date anywhere — not on `Order`, not on
+ *    `CourierConsignment`, not on `Tenant` — so the route ships `onTimeRate:
+ *    null` forever and says why in {@link Courier.onTimeBasis}. A non-nullable
+ *    number here is a standing invitation for a caller to write
+ *    `courier.onTimeRate * 100` and tell a founder a courier missed a promise
+ *    nobody ever made. Use {@link Courier.avgDaysToDeliver}, whose base is
+ *    {@link Courier.deliveryTimeSample}.
+ *  · `rtoRate: number` hid the zero-base case. Rates are computed over RESOLVED
+ *    parcels only (`delivered + rto + failed`), and when nothing has resolved
+ *    every rate is `null` — never `0`. "No evidence yet" and "a perfect record"
+ *    must not be the same value.
+ *  · `costPerShipment`/`regions` have no source at all; a caller comparing
+ *    couriers on price would have been comparing seed fiction.
+ *
+ * ── THE EVIDENCE GRADIENT ──────────────────────────────────────────────────
+ *
+ * {@link Courier.sufficientEvidence} (resolved ≥ 25) and the plain-English
+ * {@link Courier.basis} exist so 2 parcels cannot be read as 300. A rate is real
+ * arithmetic at any base; it is EVIDENCE only above the floor, and the pulse
+ * gates every rate claim on it.
+ */
 export interface Courier {
   id: string;
   name: string;
-  costPerShipment: number;
-  avgDeliveryDays: number;
-  /** 0-1 fraction delivered within promise. */
-  onTimeRate: number;
-  /** 0-1 fraction returned to origin. */
-  rtoRate: number;
-  regions: string[];
+  /** Parcels dispatched in the window — resolved + inFlight + cancelled. */
+  parcels: number;
+  /** The rate denominator: `delivered + rto + failed`. Never in-flight or cancelled. */
+  resolved: number;
+  delivered: number;
+  /** Came back: the merchant's own RTO reconciliation, or a return scan. */
+  rto: number;
+  /** Ended without delivering, with no raw string saying it returned. */
+  failed: number;
+  /** A merchant/customer decision — reported, and charged to no rate. */
+  cancelled: number;
+  /** Still moving: excluded from every rate rather than dragging them to zero. */
+  inFlight: number;
+  /**
+   * In-flight parcels stagnant by `novaJourney`'s OWN thresholds, which the
+   * route imports rather than restates — so the scorecard can never call
+   * healthy a parcel the journey has already raised to `at_risk`.
+   */
+  inFlightStagnant: number;
+  /** 0-1 over `resolved`. NULL when `resolved === 0` — never 0. */
+  deliveredRate: number | null;
+  /** 0-1 over `resolved`. NULL when `resolved === 0` — never 0. */
+  rtoRate: number | null;
+  /** 0-1 over `resolved`. NULL when `resolved === 0` — never 0. */
+  failedRate: number | null;
+  /**
+   * NULL, ALWAYS, TODAY. There is no promised-delivery date in Dakio's schema,
+   * so there is nothing to be on time against. Typed nullable rather than
+   * removed because the field is genuinely on the wire and a caller must see
+   * the null; typed `number | null` rather than `null` so the day a promise
+   * date exists, this shape does not have to change to carry it.
+   */
+  onTimeRate: number | null;
+  /** Why {@link Courier.onTimeRate} is null, in words the founder can read. */
+  onTimeBasis: string;
+  /** Mean dispatch→delivery days. NULL when no parcel carried both stamps. */
+  avgDaysToDeliver: number | null;
+  /** How many parcels that mean is over. 0 ⇒ `avgDaysToDeliver` is null. */
+  deliveryTimeSample: number;
+  /** `resolved >= 25`. False ⇒ an observation, not a verdict. */
+  sufficientEvidence: boolean;
+  /** e.g. "6 resolved of 9 dispatched" — the base, in words. */
+  basis: string;
+}
+
+/** The window a {@link CourierScorecard} was computed over. */
+export interface CourierScorecardWindow {
+  days: number;
+  since: string;
+  until: string;
+  /**
+   * Always "dispatch". A delivery-dated window would silently drop every parcel
+   * that never arrived — i.e. hide exactly what the scorecard is for.
+   */
+  basedOn: string;
+}
+
+/**
+ * The whole `GET /couriers` response — the ENVELOPE, not just the rows.
+ *
+ * `listCouriers` returns this rather than `Courier[]` because two fields
+ * outside the array are honesty-critical and a seam that dropped them would let
+ * a caller quote a capped read as a period total:
+ *
+ *  · {@link CourierScorecard.truncated} — the window held more parcels than one
+ *    request reads, so the rows describe the MOST RECENT N dispatches only.
+ *  · {@link CourierScorecard.window} — the period the counts belong to. A count
+ *    with no window is a number with no meaning.
+ */
+export interface CourierScorecard {
+  couriers: Courier[];
+  window: CourierScorecardWindow;
+  totals: {
+    parcels: number;
+    resolved: number;
+    inFlight: number;
+    cancelled: number;
+    /** Consignments whose Order row is gone — counted, never rated. */
+    orphaned: number;
+  };
+  /** True ⇒ the rows are the most recent N dispatches, NOT the period's totals. */
+  truncated: boolean;
+  /** The route's own caveats, carried so a reader meets them at the seam. */
+  notes: string[];
 }
 
 // ---------------------------------------------------------------------------

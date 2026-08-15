@@ -375,7 +375,18 @@ test("a BUILT founder-plane lane runs and completes — and reports what it cost
   // first pulse has real findings, so this one is not zero — the ZERO case is
   // pinned in pulse.eval.test.ts, which owns the pulse's own contract.
   assert.equal(typeof job?.modelCalls, "number");
-  assert.deepEqual(job?.blindSpots, [], "the seeded store can be seen in full, and the row says so explicitly");
+  // The row carries what the pulse could NOT see, by key. It used to be `[]` —
+  // the seeded store was fully sighted. It no longer is, and the change is data
+  // rather than plumbing: the courier sense landed (dakio-api's `GET /couriers`
+  // became a real aggregate), and Aurora's seed deliberately carries a courier
+  // with two resolved parcels, whose rates are arithmetic but not evidence. The
+  // property under test is unchanged — the dispatcher forwards the pulse's
+  // blind spots onto the job row instead of dropping them.
+  assert.deepEqual(
+    job?.blindSpots,
+    ["field:courierEvidence"],
+    "the row says explicitly what the pulse could not judge",
+  );
 });
 
 /**

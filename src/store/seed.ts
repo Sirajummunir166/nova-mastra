@@ -13,7 +13,9 @@
  *  - stockout risks (blender, yoga mat) incl. a delayed supplier + a cheaper
  *    alternative supplier (prepared PO action-8002 queued, over the ৳3,00,000 cap)
  *  - dead stock (ceramic vase set), a thin-margin product (carafe set)
- *  - a bad courier (SwiftShip: 79% on-time, 11% RTO)
+ *  - a bad courier (SwiftShip: 13 of 42 resolved parcels came back, 5.4 days
+ *    to deliver, 4 parcels stagnant in transit) beside one whose 50% RTO is
+ *    over TWO parcels and may therefore be reported to nobody
  *  - an overdue refund ticket (>12h), pre-seeded memory, overnight activity
  *
  * Note: orders are a representative sample (base rows + one echo clone per
@@ -27,6 +29,7 @@ import type {
   ActivityEntry,
   Campaign,
   CampaignDayStat,
+  Courier,
   Customer,
   CustomerMessage,
   Discount,
@@ -47,6 +50,71 @@ import { DEFAULT_GUARDRAILS } from "./autonomy.js";
 
 const DAY = 86_400_000;
 const HOUR = 3_600_000;
+
+/** dakio-api's own evidence floor (`COURIER_MIN_EVIDENCE`), mirrored for the seed. */
+const COURIER_MIN_EVIDENCE = 25;
+
+/**
+ * Build ONE courier scorecard row from a parcel history, with dakio-api's
+ * arithmetic — not with hand-typed rates.
+ *
+ * WHY THE COUNTS ARE THE INPUT AND THE RATES ARE DERIVED. A seed that typed
+ * `rtoRate: 0.11` beside `resolved: 2` would be internally impossible, and the
+ * two rules the pulse must obey — no rate over a zero base, and a rate is not
+ * evidence below the floor — would then be testable only against fixtures that
+ * agree with them by hand. Here they fall out of the same three lines the route
+ * runs (`novaStore.js` → `courierScorecard`): a courier with nothing resolved
+ * gets `null` rates rather than a perfect record, and `sufficientEvidence` is
+ * arithmetic over `resolved`, never an opinion.
+ *
+ * `onTimeRate` is hard-coded `null` here for the same reason it is null there:
+ * Dakio's schema has no promised-delivery date, so there is no promise to be on
+ * time against. The seed does not get to invent one for its own convenience.
+ *
+ * Exported because `seed-beacon.ts` needs the same arithmetic, and a second
+ * copy is how two demo stores would come to disagree about what a rate means.
+ */
+export function courierRow(input: {
+  id: string;
+  name: string;
+  delivered: number;
+  rto: number;
+  failed: number;
+  cancelled: number;
+  inFlight: number;
+  inFlightStagnant: number;
+  /** The mean this courier really posts, or null when nothing timed-stamped. */
+  avgDaysToDeliver: number | null;
+  deliveryTimeSample: number;
+}): Courier {
+  const { delivered, rto, failed, cancelled, inFlight } = input;
+  const resolved = delivered + rto + failed;
+  const parcels = resolved + inFlight + cancelled;
+  // Never a NaN, never a rate over a zero base — the route's `courierRate`.
+  const rate = (n: number): number | null =>
+    resolved > 0 ? Math.round((n / resolved) * 10000) / 10000 : null;
+  return {
+    id: input.id,
+    name: input.name,
+    parcels,
+    resolved,
+    delivered,
+    rto,
+    failed,
+    cancelled,
+    inFlight,
+    inFlightStagnant: input.inFlightStagnant,
+    deliveredRate: rate(delivered),
+    rtoRate: rate(rto),
+    failedRate: rate(failed),
+    onTimeRate: null,
+    onTimeBasis: "unavailable: Dakio records no promised-delivery date",
+    avgDaysToDeliver: input.deliveryTimeSample > 0 ? input.avgDaysToDeliver : null,
+    deliveryTimeSample: input.deliveryTimeSample,
+    sufficientEvidence: resolved >= COURIER_MIN_EVIDENCE,
+    basis: `${resolved} resolved of ${parcels} dispatched`,
+  };
+}
 
 export function createSeed(nowMs: number): StoreSeed {
   const iso = (daysAgo: number, hour = 12, minute = 0): string => {
@@ -297,27 +365,50 @@ export function createSeed(nowMs: number): StoreSeed {
     },
   ];
 
-  // ---- Couriers (4) --------------------------------------------------------
+  // ---- Couriers (4) — a parcel history, not a rating card -------------------
+  //
+  // These rows are {@link courierRow}'s output: counts in, the route's own
+  // arithmetic out. They used to be five invented fields (`costPerShipment`,
+  // `onTimeRate: 0.79`, `regions`) that dakio-api has never emitted and, in
+  // `onTimeRate`'s case, never can — the schema records no promised-delivery
+  // date anywhere. The narrative is unchanged (SwiftShip is the bad courier);
+  // what changed is that it is now told in the only currency the real route
+  // has: parcels that resolved, and how.
+  //
+  // THE GRADIENT IS THE POINT. ZipParcel's RTO rate is 50% — the worst number
+  // in the seed — over TWO resolved parcels, and no honest reader may report
+  // it. It is here so the evidence floor is exercised offline, every run.
 
-  const couriers = [
-    {
-      id: "cour-swift", name: "SwiftShip", costPerShipment: 588, avgDeliveryDays: 4.2,
-      onTimeRate: 0.79, rtoRate: 0.11, regions: ["west", "south"],
-    },
-    {
-      id: "cour-meridian", name: "Meridian Express", costPerShipment: 936, avgDeliveryDays: 2.1,
-      onTimeRate: 0.96, rtoRate: 0.02, regions: ["west", "east", "midwest", "south"],
-    },
-    {
-      id: "cour-atlas", name: "Atlas Post", costPerShipment: 672, avgDeliveryDays: 3.4,
-      onTimeRate: 0.9, rtoRate: 0.05, regions: ["east", "midwest", "south"],
-    },
-    {
-      id: "cour-zip", name: "ZipParcel", costPerShipment: 768, avgDeliveryDays: 2.8,
-      onTimeRate: 0.93, rtoRate: 0.04, regions: ["west", "east"],
-    },
+  const couriers: Courier[] = [
+    // The bad courier: 31% RTO over 42 resolved parcels, and slow with it.
+    courierRow({
+      id: "cour-swift", name: "SwiftShip",
+      delivered: 27, rto: 13, failed: 2, cancelled: 3, inFlight: 9, inFlightStagnant: 4,
+      avgDaysToDeliver: 5.4, deliveryTimeSample: 25,
+    }),
+    // The good one, and the busiest — 4% RTO over 75.
+    courierRow({
+      id: "cour-meridian", name: "Meridian Express",
+      delivered: 71, rto: 3, failed: 1, cancelled: 4, inFlight: 12, inFlightStagnant: 0,
+      avgDaysToDeliver: 2.1, deliveryTimeSample: 68,
+    }),
+    // Ordinary: 11% RTO over 38 — real evidence, below every threshold.
+    courierRow({
+      id: "cour-atlas", name: "Atlas Post",
+      delivered: 33, rto: 4, failed: 1, cancelled: 2, inFlight: 6, inFlightStagnant: 1,
+      avgDaysToDeliver: 3.4, deliveryTimeSample: 30,
+    }),
+    // TOO FEW PARCELS TO JUDGE: 1 delivered, 1 returned. The rate is 50% and it
+    // is not evidence of anything — `sufficientEvidence` is false and nothing
+    // downstream may build a finding on it.
+    courierRow({
+      id: "cour-zip", name: "ZipParcel",
+      delivered: 1, rto: 1, failed: 0, cancelled: 1, inFlight: 3, inFlightStagnant: 0,
+      avgDaysToDeliver: 2.8, deliveryTimeSample: 1,
+    }),
   ];
-  const courierDays = new Map(couriers.map((c) => [c.id, c.avgDeliveryDays]));
+  /** Transit days for the order fixtures below — the mean this courier really posts. */
+  const courierDays = new Map(couriers.map((c) => [c.id, c.avgDaysToDeliver ?? 3]));
 
   // ---- Customers (24) ------------------------------------------------------
 

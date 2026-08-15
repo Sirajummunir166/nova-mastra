@@ -35,6 +35,7 @@ import type {
   ContentDraftInput,
   ContentItem,
   Courier,
+  CourierScorecard,
   CouponValidation,
   CreateDiscountInput,
   Customer,
@@ -287,7 +288,15 @@ export interface StoreClient {
     po: Omit<PurchaseOrder, "id" | "createdAt" | "total">,
   ): Promise<PurchaseOrder>;
   updatePurchaseOrder(id: string, patch: { status: PurchaseOrder["status"] }): Promise<PurchaseOrder>;
-  listCouriers(): Promise<Courier[]>;
+  /**
+   * The courier scorecard — the ENVELOPE, not the rows alone.
+   *
+   * `truncated` and `window` live outside the array and are the two facts that
+   * stop a caller quoting a capped read as a period total, so this seam carries
+   * them. `days` is the rolling dispatch-dated window (1..180; the route 422s
+   * anything else rather than silently clamping).
+   */
+  listCouriers(opts?: { days?: number }): Promise<CourierScorecard>;
   getCourier(id: string): Promise<Courier | null>;
 
   // Finance

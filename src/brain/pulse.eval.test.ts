@@ -15,9 +15,13 @@
  *  · a failed read degrades ONE domain — the reason this repo grew
  *    `snapshot.ts` into a sense layer instead of porting nova-ai's
  *    `analytics.ts`, whose single `Promise.all` fails the entire scan;
- *  · no finding is EVER produced for ads, courier or support, and the pulse
- *    does not even read them (they are dead at the source; a finding would be
- *    a lie);
+ *  · no finding is EVER produced for ads or support, and the pulse does not
+ *    even read them (they are dead at the source; a finding would be a lie).
+ *    COURIER used to be third on that list and is not any more: dakio-api's
+ *    `GET /couriers` became a real aggregate, so the domain is sensed — under
+ *    four rules pinned at the bottom of this file (no rate without the source's
+ *    own evidence flag, no number out of a null, no period claim from a capped
+ *    window, no on-time claim ever);
  *  · a finding whose remedy needs a duty this lane does not hold SURFACES
  *    rather than acts — which today is every remedy there is;
  *  · autonomy decides: a gated action becomes a Decision card, and an allowed
@@ -46,6 +50,7 @@ import {
 import { loadPulseState, resetPulseState } from "./pulse-state.js";
 import { blindSpotNews, comparePulse, PULSE_THRESHOLDS, type PulseFinding } from "./pulse-compare.js";
 import { LIST_PAGE_CAP, senseStore, SENSE_GAPS } from "../lib/snapshot.js";
+import type { CourierSignal, StoreSense } from "../lib/snapshot.js";
 import type { AbandonedCart, Order, Product, Supplier } from "../store/types.js";
 import { storeFor, resetStores } from "../store/resolve.js";
 import { laneFor } from "./registry.js";
@@ -283,7 +288,11 @@ test("a pulse that can see NOTHING refuses — a blind watchdog is not a quiet b
   const blind = async () => {
     throw new Error("dakio-api is down");
   };
-  for (const method of ["listProducts", "listSuppliers", "listOrders", "listAbandonedCarts", "listInboxEvents"]) {
+  // SIX reads now, not five: `listCouriers` joined the sense layer, and a store
+  // where five of six answer is a DEGRADE, not a blind pulse. Leaving it out
+  // here is what makes this case honest — the guard asks `SENSE_DOMAINS`, so
+  // the list is what has to be exhausted, not a number.
+  for (const method of ["listProducts", "listSuppliers", "listOrders", "listAbandonedCarts", "listCouriers", "listInboxEvents"]) {
     stub(A, method, blind);
   }
   await assert.rejects(
@@ -316,19 +325,26 @@ test("a blind domain REMEMBERS: the next healthy pulse does not re-alert everyth
 // Honesty — the three domains that are NOT sensed
 // ---------------------------------------------------------------------------
 
-test("no finding is ever produced for ads, courier or support — and the pulse does not even read them", async () => {
-  const touched = watch(A, ["listCampaigns", "listCouriers", "listSupportTickets"]);
+test("no finding is ever produced for ads or support — and the pulse does not even read them", async () => {
+  // COURIER LEFT THIS LIST, and that is the news. It used to be watched here
+  // beside campaigns and tickets, with `listCouriers` asserted NEVER CALLED —
+  // correct while the route was a hardcoded `{ couriers: [] }`, and precisely
+  // wrong now that it aggregates real parcels. Ads and support are unchanged:
+  // still dead at the source, still never read.
+  const touched = watch(A, ["listCampaigns", "listSupportTickets"]);
   const result = await runPulse(A, { decide: countingJudge().decide });
 
   assert.ok(result.findings.length > 0, "precondition: this pass found things, so the check is not vacuous");
-  const honest = new Set(["inventory", "sales", "carts", "margin", "supplier"]);
+  const honest = new Set(["inventory", "sales", "carts", "margin", "supplier", "courier"]);
   for (const f of result.findings) {
     assert.ok(honest.has(f.finding.domain), `${f.finding.domain} is not a domain this layer senses`);
   }
   assert.deepEqual([...touched], [], "the dead sources are not read at all — an empty [] is not a measurement");
 
-  // The gap is written down where a reader trips over it, with a reason each.
-  assert.deepEqual(SENSE_GAPS.map((g) => g.domain).sort(), ["ads", "courier", "support"]);
+  // The gap is written down where a reader trips over it, with a reason each —
+  // and the entry for a domain that gained a real read is DELETED, not left
+  // standing as a disclaimer the code has outgrown.
+  assert.deepEqual(SENSE_GAPS.map((g) => g.domain).sort(), ["ads", "support"]);
   for (const gap of SENSE_GAPS) assert.ok(gap.reason.length > 60, `${gap.domain} names WHY, not "TODO"`);
 });
 
@@ -375,7 +391,7 @@ test("a finding whose remedy needs a duty this lane does not hold SURFACES — i
   assert.ok(result.reportId, "the pulse filed ONE report");
   const [report] = await client.listReports({ kind: "pulse" });
   assert.match(report!.body, /needs the duty/);
-  assert.match(report!.body, /Not checked: ads, courier, support/);
+  assert.match(report!.body, /Not checked: ads, support/, "courier is checked now, so the footer no longer disclaims it");
 });
 
 test("the production remedy table proposes real verbs — the gap is the DUTY, not a missing idea", async () => {
@@ -897,13 +913,32 @@ test("nothing the judge writes reaches a founder unchecked", () => {
 
   for (const [line, domain] of [
     ["Sales are down because ad spend is wasted", "ads"],
-    ["Your courier is losing parcels", "courier"],
     ["Support tickets are piling up", "support"],
   ] as const) {
     const rejected = bound(line);
     assert.match(rejected.rejected!, new RegExp(domain), `${domain} has no data source — it may not be named`);
     assert.equal(rejected.text, fallback, "and the measurement replaces it");
   }
+
+  // ── AND THE BOUND LET GO OF ONE WORD ────────────────────────────────────
+  //
+  // "Your courier is losing parcels" was rejected here, and had to be: nobody
+  // was measuring couriers, so the sentence came from the model's imagination.
+  // The scorecard read exists now, so the vocabulary bound must not censor the
+  // one department whose findings are entirely about parcels — a judge whose
+  // every line was replaced by the fallback is a judge nobody is buying.
+  //
+  // The wall that caught the original lie is still standing, and it is the one
+  // that never depended on this table: a NUMBER the card does not carry is
+  // still refused, whatever domain it belongs to.
+  const permitted = bound("Your courier is losing parcels");
+  assert.equal(permitted.rejected, null, "courier is measured now — naming it is not a fabrication");
+  assert.equal(permitted.text, "Your courier is losing parcels");
+  assert.match(
+    bound("Your courier returned 31% of parcels").rejected!,
+    /cites 31/,
+    "but a courier NUMBER that is not in the card is refused exactly like any other",
+  );
 
   assert.match(bound("x".repeat(HEADLINE_MAX_CHARS + 1)).rejected!, /over 120 characters/);
   assert.match(bound("   ").rejected!, /empty/);
@@ -922,7 +957,8 @@ test("the change card tells the judge which domains are UNKNOWABLE, not only thi
   // The same instruction, on the function, so it cannot be an accident of this
   // store's data.
   const bare = changeCard({ department: "sales", findings: [], eventsSeen: 0, senseDark: [] });
-  assert.match(bare, /NOVA CANNOT SEE \(no data source[^)]*\): ads, courier, support/);
+  assert.match(bare, /NOVA CANNOT SEE \(no data source[^)]*\): ads, support/);
+  assert.doesNotMatch(bare, /: ads, courier/, "a domain with a real read is not declared off-limits to the judge");
 });
 
 /**
@@ -936,11 +972,16 @@ test("a judge line naming an unmeasured domain never reaches a Decision card —
   const { sense, finding } = await coverFinding();
   const card = changeCard({ department: "inventory", findings: [finding], eventsSeen: 0, senseDark: [] });
 
+  // ADS, not courier: courier is a measured domain now and its vocabulary is no
+  // longer fenced off (see the bound's own test above). The property under test
+  // was never about the word "courier" — it is that a line reaching for a
+  // domain with NO data source never reaches a founder's Decision card, and ads
+  // is exactly such a domain.
   const bounded = boundJudgement(
     {
       worthWaking: true,
-      headline: "Stock is fine, the courier is the problem",
-      note: "Sales are down because your courier is losing parcels — switch courier before reordering.",
+      headline: "Stock is fine, the ad campaigns are the problem",
+      note: "Sales are down because ad spend is wasted — pause the campaigns before reordering.",
     },
     { department: "inventory", findings: [finding], card },
   );
@@ -953,7 +994,7 @@ test("a judge line naming an unmeasured domain never reaches a Decision card —
   const outcome = await settleFinding(client, finding, sense, reorderRemedy, scopeJudgement(bounded, "inventory", 1), "night_ops");
   const row = (await client.listActions()).find((a) => a.id === (outcome as { actionId: string }).actionId)!;
 
-  assert.doesNotMatch(row.receipt.expectedImpact, /courier/i, "the card carries no cause Nova cannot see");
+  assert.doesNotMatch(row.receipt.expectedImpact, /ad spend|campaign/i, "the card carries no cause Nova cannot see");
   assert.match(row.receipt.expectedImpact, /the measurement stands/);
   assert.match(row.receipt.reason, /days of cover/, "the reason is still the observation");
 
@@ -1099,7 +1140,40 @@ test("four of five senses dark is NOT a quiet pulse — a blind store must not l
   const again = await runPulse(A, { decide: countingJudge().decide });
   assert.equal(again.quiet, true);
   assert.equal(again.reportId, undefined);
-  assert.equal(again.blindSpots.length, 4, "still blind, and the result still says so to whoever is watching");
+  assert.equal(
+    again.blindSpots.length,
+    5,
+    "still blind, and the result still says so to whoever is watching — four dark reads plus the seeded " +
+      "courier whose two resolved parcels are not evidence of anything",
+  );
+});
+
+/**
+ * THE SIXTH SENSE AND THE ALL-BLIND GUARD, together.
+ *
+ * `pulse.ts` used to ask `dark.length === 5`. It asks `allSensesDark(sense)`
+ * now, which is a question about `SENSE_DOMAINS` — and the day courier joined
+ * that list is the day the old form would have gone quietly unreachable: five
+ * dark reads out of six, guard off, a fully blind store completing its job row
+ * as "quiet". Both halves are pinned here because only one of them fails
+ * loudly.
+ */
+test("with SIX senses, five dark still degrades and six still refuses", async () => {
+  const blind = async () => {
+    throw new Error("dakio-api 503");
+  };
+  const all = ["listProducts", "listSuppliers", "listOrders", "listAbandonedCarts", "listCouriers", "listInboxEvents"];
+
+  for (const method of all.slice(0, 5)) stub(A, method, blind);
+  const degraded = await runPulse(A, { decide: countingJudge().decide });
+  assert.equal(degraded.senseFailures.length, 5, "five senses are gone");
+  assert.equal(degraded.quiet, false, "and the founder is told, loudly");
+  assert.ok(degraded.reportId, "but the pulse RAN — one sense answering is not a blind watchdog");
+
+  await resetPulseState(A);
+  resetStores();
+  for (const method of all) stub(A, method, blind);
+  await assert.rejects(() => runPulse(A, { decide: countingJudge().decide }), /could not read ANY sense/);
 });
 
 test("blindness is news when it appears, again after a day, and silent in between", () => {
@@ -1386,4 +1460,270 @@ test("'was X' names WHEN X was measured — never a pulse that did not observe i
   assert.equal(finding!.observation.priorMeasuredAt, measuredAt);
   assert.match(finding!.observation.evidence, /was 30 days, measured 2026-08-01/);
   assert.doesNotMatch(finding!.observation.evidence, /at the last pulse/);
+});
+
+// ---------------------------------------------------------------------------
+// COURIER — the sixth sense, and the four rules that keep it honest
+// ---------------------------------------------------------------------------
+
+/**
+ * A `StoreSense` with only the courier domain answering.
+ *
+ * Every other domain is `ok: false`, which is exactly right for these cases:
+ * `comparePulse` must produce courier findings from a courier read alone, and
+ * an inventory condition leaking into a courier assertion would make the count
+ * assertions below meaningless. It also proves the degradation contract from
+ * the new side — five dark domains do not stop the sixth from being sensed.
+ */
+function courierSense(
+  couriers: CourierSignal[],
+  opts: { truncated?: boolean; at?: string } = {},
+): StoreSense {
+  const dark = { ok: false as const, reason: "not part of this case" };
+  return {
+    storeId: A,
+    at: opts.at ?? "2026-08-15T09:00:00.000Z",
+    products: dark,
+    sales: dark,
+    carts: dark,
+    suppliers: dark,
+    inbox: dark,
+    courier: {
+      ok: true,
+      value: { couriers, windowDays: 30, truncated: opts.truncated === true },
+    },
+    partial: { products: false, orders: false, carts: false },
+  };
+}
+
+/** One sensed courier row, built from counts the way the route builds them. */
+function courierSignal(patch: {
+  id: string;
+  name?: string;
+  delivered?: number;
+  rto?: number;
+  failed?: number;
+  cancelled?: number;
+  inFlight?: number;
+  inFlightStagnant?: number;
+  avgDaysToDeliver?: number | null;
+  deliveryTimeSample?: number;
+}): CourierSignal {
+  const delivered = patch.delivered ?? 0;
+  const rto = patch.rto ?? 0;
+  const failed = patch.failed ?? 0;
+  const cancelled = patch.cancelled ?? 0;
+  const inFlight = patch.inFlight ?? 0;
+  const resolved = delivered + rto + failed;
+  const parcels = resolved + inFlight + cancelled;
+  const rate = (n: number) => (resolved > 0 ? Math.round((n / resolved) * 10000) / 10000 : null);
+  return {
+    id: patch.id,
+    name: patch.name ?? `Courier ${patch.id}`,
+    parcels, resolved, delivered, rto, failed, cancelled, inFlight,
+    inFlightStagnant: patch.inFlightStagnant ?? 0,
+    rtoRate: rate(rto),
+    deliveredRate: rate(delivered),
+    failedRate: rate(failed),
+    onTimeRate: null,
+    onTimeBasis: "unavailable: Dakio records no promised-delivery date",
+    avgDaysToDeliver: patch.avgDaysToDeliver ?? null,
+    deliveryTimeSample: patch.deliveryTimeSample ?? 0,
+    sufficientEvidence: resolved >= 25,
+    basis: `${resolved} resolved of ${parcels} dispatched`,
+  };
+}
+
+test("an RTO rate over enough resolved parcels FIRES — and the evidence line names the basis, never a bare percentage", async () => {
+  const sense = courierSense([
+    courierSignal({ id: "steadfast", name: "Steadfast", delivered: 27, rto: 13, failed: 2, cancelled: 3, inFlight: 9 }),
+  ]);
+  const findings = comparePulse(sense, null).findings.filter((f) => f.domain === "courier");
+
+  assert.equal(findings.length, 1, "one condition crossed: 31% of resolved parcels came back");
+  const rto = findings[0]!;
+  assert.equal(rto.key, "courier:rto:steadfast");
+  assert.equal(rto.department, "shipping", "shipping is where a founder answers a courier question");
+  assert.equal(rto.severity, "warning");
+  assert.equal(rto.trigger, "crossed");
+  assert.equal(rto.observation.metric, "rtoRatePct");
+  assert.equal(rto.observation.value, 31);
+
+  // THE HONESTY RULE, and the reason this test exists: a percentage a founder
+  // cannot check is a percentage they will one day catch being wrong. The line
+  // carries the numerator, the denominator, and what was left out of it.
+  const evidence = rto.observation.evidence;
+  assert.match(evidence, /31(\.0)?% RTO over 42 resolved parcels/);
+  assert.match(evidence, /13 came back/);
+  assert.match(evidence, /42 resolved of 54 dispatched/, "the route's own basis sentence travels");
+  assert.match(evidence, /9 still in flight and 3 cancelled are excluded from the rate/);
+
+  // And the threshold is a line on a measurement, not a mood: 19% is not news.
+  const under = comparePulse(
+    courierSense([courierSignal({ id: "redx", delivered: 41, rto: 9 })]),
+    null,
+  ).findings.filter((f) => f.domain === "courier");
+  assert.deepEqual(under, [], "18% over 50 resolved is below the threshold and says nothing");
+});
+
+test("a courier with 2 resolved parcels produces NO rate finding — 50% RTO over two parcels is not evidence", async () => {
+  // THE REGRESSION THIS PINS: dropping `sufficientEvidence` from the guard. The
+  // arithmetic is real — one of this courier's two finished parcels came back,
+  // which IS 50% — and it is the worst-looking number a small store can
+  // produce. Reporting it tells a founder to fire a courier over one return.
+  const thin = courierSignal({ id: "zip", name: "ZipParcel", delivered: 1, rto: 1, inFlight: 3, cancelled: 1 });
+  assert.equal(thin.rtoRate, 0.5, "precondition: the rate really is 50%");
+  assert.equal(thin.sufficientEvidence, false, "and it really is not evidence");
+
+  const findings = comparePulse(courierSense([thin]), null).findings;
+  assert.deepEqual(findings, [], "no finding at any severity, not a quieter one");
+
+  // Nor may it be reported once it has a base of NON-resolved parcels: 24
+  // resolved is still under the floor, however many are in flight.
+  const almost = courierSignal({ id: "zip", delivered: 12, rto: 12, inFlight: 400 });
+  assert.equal(almost.sufficientEvidence, false);
+  assert.deepEqual(comparePulse(courierSense([almost]), null).findings, []);
+
+  // One parcel over the floor, same 50%, and now it is news. The gate is the
+  // BASE, not the number.
+  const enough = courierSignal({ id: "zip", delivered: 13, rto: 12 });
+  assert.equal(enough.sufficientEvidence, true);
+  const fired = comparePulse(courierSense([enough]), null).findings;
+  assert.equal(fired.length, 1);
+  assert.match(fired[0]!.observation.evidence, /over 25 resolved parcels/);
+
+  // AND THE THIN ROW IS NOT SOLVED, IT IS UNKNOWN. Without this, a courier that
+  // crossed 20% last week and has since dropped under the floor would leave the
+  // open set as though its returns had stopped — and announce itself as a
+  // "(first sighting)" the next time it has 25 parcels.
+  const prior = {
+    at: "2026-08-14T09:00:00.000Z",
+    products: null, supplierDelayDays: null, revenue7d: null, revenuePrior7d: null, carts: null,
+    inboxCursor: null,
+    openFindings: {
+      "courier:rto:zip": { since: "2026-08-01T09:00:00.000Z", metric: 42, measuredAt: "2026-08-14T09:00:00.000Z", announced: true, dismissedAt: null },
+    },
+    blindSpots: null,
+  };
+  const carried = comparePulse(courierSense([thin]), prior);
+  assert.ok(carried.open["courier:rto:zip"], "the condition is carried forward, not closed");
+  assert.equal(carried.open["courier:rto:zip"]!.metric, 42, "with the last REAL measurement, undated by this pass");
+});
+
+test("a null rate never becomes a number, and a null onTimeRate never becomes a finding", async () => {
+  // A courier whose parcels are all still moving: every rate is null, because
+  // nothing has resolved. `0` here would read as a flawless record.
+  const fresh = courierSignal({ id: "fresh", inFlight: 40, cancelled: 2 });
+  assert.equal(fresh.rtoRate, null);
+  assert.equal(fresh.deliveredRate, null);
+  assert.deepEqual(comparePulse(courierSense([fresh]), null).findings, [], "no rate, no finding — in either direction");
+
+  // ON-TIME IS THE PERMANENT NULL. There is no promised-delivery date anywhere
+  // in Dakio's schema, so no threshold, no condition and no sentence may exist
+  // about lateness — not even on a courier with hundreds of resolved parcels.
+  const busy = courierSignal({
+    id: "busy", name: "Busy Courier", delivered: 300, rto: 20, avgDaysToDeliver: 6.2, deliveryTimeSample: 280,
+  });
+  assert.equal(busy.onTimeRate, null, "precondition: null on the wire");
+  const findings = comparePulse(courierSense([busy]), null).findings;
+  for (const f of findings) {
+    assert.notEqual(f.observation.metric, "onTimeRate", "no condition may be built on a measurement that cannot exist");
+    assert.doesNotMatch(f.observation.evidence, /on[- ]time/i, "and no line may imply one was");
+    assert.doesNotMatch(f.title, /\blate\b/i, "'slow' is a duration; 'late' is a missed promise nobody made");
+  }
+  // What it says instead: how long parcels took, over how many of them.
+  const slow = findings.find((f) => f.key === "courier:slow:busy");
+  assert.ok(slow, "the honest substitute still fires");
+  assert.equal(slow!.observation.metric, "avgDaysToDeliver");
+  assert.match(slow!.observation.evidence, /averaged over 280 delivered parcels/);
+  assert.match(slow!.observation.evidence, /No delivery promise is recorded/);
+
+  // A mean over a thin SAMPLE is an anecdote, whatever the resolved count says.
+  const anecdote = courierSignal({ id: "anec", delivered: 60, rto: 2, avgDaysToDeliver: 9, deliveryTimeSample: 3 });
+  assert.equal(anecdote.sufficientEvidence, true, "resolved is over the floor…");
+  assert.equal(
+    comparePulse(courierSense([anecdote]), null).findings.some((f) => f.key.startsWith("courier:slow:")),
+    false,
+    "…but three timed deliveries is not a delivery time",
+  );
+});
+
+test("a truncated courier window makes no claim about a period — counts become floors and say so", async () => {
+  const rows = [
+    courierSignal({ id: "steadfast", name: "Steadfast", delivered: 2600, rto: 900, failed: 100, inFlight: 400, inFlightStagnant: 55 }),
+  ];
+  const capped = comparePulse(courierSense(rows, { truncated: true }), null).findings;
+  const whole = comparePulse(courierSense(rows), null).findings;
+
+  assert.equal(capped.length, whole.length, "a capped read still reports — it words itself differently");
+
+  const stagnant = capped.find((f) => f.key.startsWith("courier:stagnant:"))!;
+  // THE RULE: the rows are the most recent N dispatches, so 55 stagnant parcels
+  // is a FLOOR. A founder who reads it as "55 in the last 30 days" has been
+  // handed a total that was never counted.
+  assert.match(stagnant.title, /^at least 55 /);
+  assert.match(stagnant.observation.evidence, /^at least 55 /);
+  for (const f of capped) {
+    assert.match(
+      f.observation.evidence,
+      /most recent dispatches only, so this is a floor, not the period's total/,
+      `${f.key} must disclose that its window was capped`,
+    );
+  }
+
+  // The uncapped pass says none of that, because none of it is true there.
+  for (const f of whole) {
+    assert.doesNotMatch(f.observation.evidence, /floor/);
+    assert.doesNotMatch(f.title, /at least/);
+  }
+});
+
+test("the demo store's courier history flows end to end — one department, one judgement, gaps surfaced", async () => {
+  // Through `runPulse` on the seeded backend rather than a literal sense, so
+  // the whole chain is exercised: DemoStore's envelope → senseStore → compare →
+  // one judgement for the shipping department → the remedy table → the report.
+  const judge = countingJudge();
+  const result = await runPulse(A, { decide: judge.decide });
+
+  const courier = result.findings.filter((f) => f.finding.domain === "courier");
+  assert.ok(courier.length > 0, "the seed carries a courier with 13 of 42 resolved parcels returned");
+  assert.ok(
+    result.departments.includes("shipping"),
+    "and it wakes the shipping department, which no pulse could do before the read existed",
+  );
+  assert.equal(
+    courier.every((f) => f.finding.subject !== "cour-zip"),
+    true,
+    "but never the 2-parcel courier, whose 50% RTO is the worst number in the store",
+  );
+
+  // The remedy that exists is out of lane, exactly like every other row.
+  const stagnant = courier.find((f) => f.finding.key.startsWith("courier:stagnant:"));
+  assert.ok(stagnant, "SwiftShip has 4 parcels that have stopped moving");
+  assert.equal(stagnant!.outcome.kind, "capability_gap");
+  const gap = result.capabilityGaps.find((g) => g.findingKey === stagnant!.finding.key)!;
+  assert.equal(gap.verb, "flag_courier_issue");
+  assert.equal(gap.kind, "out_of_lane");
+  assert.equal(gap.wantedDuty, "shipping.delay_chasing");
+  assert.ok(
+    dutyGovernsVerb(gap.verb, gap.wantedDuty!),
+    "the gap names a duty that GOVERNS the verb, not the one that would be judged most leniently",
+  );
+  assert.equal(laneFor("pulse")!.duties.includes(gap.wantedDuty!), false, "and the pulse lane genuinely does not hold it");
+
+  // The RTO finding has NO remedy at all: the roster has a duty for it
+  // (`shipping.rto_reduction`) and `ActionType` has no verb that changes which
+  // courier a store routes to. The report is the whole response.
+  const rto = courier.find((f) => f.finding.key.startsWith("courier:rto:"))!;
+  assert.equal(rto.outcome.kind, "reported");
+  assert.equal(productionRemedy(rto.finding, await senseStore(A)), null);
+
+  // And the footer no longer disclaims a domain Nova now measures — while the
+  // one thing inside it that cannot be measured is stated where it could
+  // otherwise mislead.
+  const report = await reportOf(result);
+  assert.match(report.body, /Not checked: ads, support/);
+  assert.doesNotMatch(report.body, /Not checked:[^\n]*courier/);
+  assert.match(report.body, /On-time delivery is not measured/);
+  assert.match(report.body, /13 came back/, "the measurement itself is in the body");
 });
