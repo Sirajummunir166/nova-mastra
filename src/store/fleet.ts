@@ -27,6 +27,7 @@
 import { ensureTenant, isTenantActive, listTenants, type TenantRecord } from "./tenants.js";
 import { mintFleetToken } from "../lib/service-token.js";
 import { storeBackendMode } from "./mode.js";
+import { dakioBaseUrl } from "../lib/dakio-base.js";
 
 /** Re-fetch cadence. The dispatcher ticks every minute; a fresh-enough fleet
  * once a minute is plenty, and one fleet call per tick is the worst case. */
@@ -50,8 +51,14 @@ export interface FleetOptions {
 }
 
 async function fetchFleetIds(opts: FleetOptions): Promise<string[] | null> {
-  const baseUrl = process.env.DAKIO_API_URL;
-  if (!baseUrl) return null;
+  // `dakioBaseUrl()` and not the raw variable — a Railway/Vercel dashboard
+  // shows a service domain with NO scheme, and pasting that gives every call
+  // an opaque `TypeError: Invalid URL` at fetch time rather than a config
+  // error at boot. Measured on the live instance: DAKIO_API_URL was
+  // `dakio-api-production.up.railway.app` and NOTHING that touched a store
+  // worked, with an error message that named neither the variable nor the fix.
+  if (!process.env.DAKIO_API_URL?.trim()) return null;
+  const baseUrl = dakioBaseUrl();
   const doFetch = opts.fetchImpl ?? fetch;
   try {
     const response = await doFetch(`${baseUrl}/api/v1/store/fleet`, {

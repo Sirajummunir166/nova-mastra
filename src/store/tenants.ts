@@ -23,6 +23,7 @@
 
 import { serviceTokenFor } from "../lib/service-token.js";
 import { storeBackendMode } from "./mode.js";
+import { dakioBaseUrl } from "../lib/dakio-base.js";
 
 export type TenantStatus = "active" | "paused";
 
@@ -295,8 +296,9 @@ function staleOrNull(storeId: string, nowMs: number, error: unknown): TenantReco
 }
 
 async function fetchStoreProfile(storeId: string): Promise<Response> {
-  const baseUrl = process.env.DAKIO_API_URL;
-  if (!baseUrl) throw new Error("NOVA_STORE_BACKEND=dakio requires DAKIO_API_URL");
+  // See the note in fleet.ts: normalized once, centrally, so a scheme-less
+  // paste from a hosting dashboard cannot silently break every store read.
+  const baseUrl = dakioBaseUrl();
   return fetch(`${baseUrl}/api/v1/store/profile`, {
     headers: { Authorization: `Bearer ${serviceTokenFor(storeId)}` },
     signal: AbortSignal.timeout(PROFILE_TIMEOUT_MS),

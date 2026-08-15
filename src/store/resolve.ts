@@ -28,6 +28,7 @@ import { serviceTokenFor } from "../lib/service-token.js";
 import { storeBackendMode } from "./mode.js";
 import { createSeed } from "./seed.js";
 import { createBeaconSeed } from "./seed-beacon.js";
+import { dakioBaseUrl } from "../lib/dakio-base.js";
 
 /** Per-tenant seed builders, keyed by store id (see `tenants.ts` registry). */
 const SEEDERS: Record<string, (nowMs: number) => StoreSeed> = {
@@ -50,8 +51,9 @@ const instances = new Map<string, StoreClient>();
 
 /** Build the live Dakio HTTP client for a tenant, pinned to THAT tenant's own service token. */
 function makeDakioClient(storeId: string): DakioStoreClient {
-  const baseUrl = process.env.DAKIO_API_URL;
-  if (!baseUrl) throw new Error("NOVA_STORE_BACKEND=dakio requires DAKIO_API_URL");
+  // See the note in fleet.ts. `dakioBaseUrl()` throws its own "not set"
+  // error, so the guard that used to live here is not lost.
+  const baseUrl = dakioBaseUrl();
   // Token resolved lazily per request: explicit env token, else self-minted.
   return new DakioStoreClient(storeId, { baseUrl, token: () => serviceTokenFor(storeId) });
 }
