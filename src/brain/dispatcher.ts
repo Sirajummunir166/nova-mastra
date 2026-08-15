@@ -88,6 +88,8 @@ import { turnRunRecorder } from "./runs.js";
 import { planJob, routeJob, ServerSweepError, type JobPlan } from "./router.js";
 import { runInstructedTurn } from "../front-office/turn.js";
 import { runPulse } from "./pulse.js";
+import { runCourierIntervention } from "./lanes/courier-intervention.js";
+import { runRestockCheck } from "./lanes/restock-check.js";
 
 /** Same as nova-ai. The server caps a claim at 50; 10 keeps a tick bounded. */
 export const JOBS_PER_TENANT_PER_TICK = 10;
@@ -329,7 +331,76 @@ const FOUNDER_PLANE_RUNNERS: Record<string, (storeId: string, job: NovaJob) => P
       blindSpots: result.blindSpots.map((b) => b.key),
     };
   },
+
+  /**
+   * A parcel stopped moving (dakio-api's stagnation edge minted this row).
+   *
+   * IDS ONLY off the payload, and every one of them is re-read by the lane —
+   * the whole point of the job carrying ids is that a parcel can move between
+   * the mint and the run, and a lane that answered from the payload would put a
+   * founder on the phone about a delivery that already happened.
+   */
+  "brain-courier-intervention": async (storeId, job) => {
+    const payload = job.payload ?? {};
+    const result = await runCourierIntervention(
+      storeId,
+      {
+        orderId: payloadString(payload.orderId) ?? "",
+        journeyId: payloadString(payload.journeyId),
+        conversationId: payloadString(payload.conversationId),
+        riskReason: payloadString(payload.riskReason),
+      },
+      { dedupeKey: job.dedupeKey, jobId: job.id },
+    );
+    return {
+      modelCalls: result.modelCalls,
+      // `quiet` here means "nothing reached the founder": the parcel moved, or
+      // the order is finished. It is NOT "nothing went wrong" — a run that
+      // could not read the parcel throws and releases.
+      quiet: result.quiet,
+      blindSpots: result.blindSpots.map((b) => b.key),
+    };
+  },
+
+  /**
+   * A customer started waiting for stock (a NEW `restock_wait` case).
+   *
+   * Zero model calls by construction — see the lane's header: the honesty fork
+   * is arithmetic over open purchase orders, and a model invited to word a
+   * supply position it cannot check is how "next week" gets invented.
+   */
+  "brain-restock-check": async (storeId, job) => {
+    const payload = job.payload ?? {};
+    const result = await runRestockCheck(
+      storeId,
+      {
+        caseId: payloadString(payload.caseId) ?? "",
+        productId: payloadString(payload.productId),
+        conversationId: payloadString(payload.conversationId),
+        customerId: payloadString(payload.customerId),
+      },
+      { dedupeKey: job.dedupeKey, jobId: job.id },
+    );
+    return {
+      modelCalls: result.modelCalls,
+      quiet: result.quiet,
+      blindSpots: result.blindSpots.map((b) => b.key),
+    };
+  },
 };
+
+/**
+ * One payload field, as a string or `null`.
+ *
+ * The lanes take `string | null | undefined` and decide for themselves what a
+ * missing id means (an absent `conversationId` is legal and common on both new
+ * lanes; an absent `orderId`/`caseId` is a malformed producer and throws). This
+ * helper exists so THIS file never decides that — it only stops a number or an
+ * object reaching a lane's string field.
+ */
+function payloadString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
 
 /**
  * Do one claimed job. Resolves with what happened; REJECTS when the job did not

@@ -224,7 +224,12 @@ test("every UNBUILT founder-plane kind routes to a typed NOT-BUILT outcome namin
   assert.ok(founderKinds.length >= 9, "the cadenced six plus the event lanes");
   // A lane with no `workflow` id in the registry is one nobody has built.
   const unbuilt = founderKinds.filter((l) => !l.workflow);
-  assert.ok(unbuilt.length >= 8, "phase E has only built the pulse so far");
+  // The cadenced five that are still to come (morning_report, weekly_strategy,
+  // night_ops, reflection, cart_sweep) plus catalog_vision. The pulse and the
+  // two event lanes (courier_intervention, restock_check) are built, so they
+  // are deliberately NOT in this set — a lane leaves it by acquiring a
+  // `workflow` id in the registry, which is the only thing that says it exists.
+  assert.ok(unbuilt.length >= 6, `six founder-plane lanes are still unbuilt, got ${unbuilt.length}`);
   for (const lane of unbuilt) {
     const outcome = await routeJob(STORE, job(lane.kind));
     assert.equal(outcome.lane, "not_built", `${lane.kind} must not claim to have run`);
