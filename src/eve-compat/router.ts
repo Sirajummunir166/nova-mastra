@@ -14,7 +14,7 @@
 
 import { Router, type Request, type Response } from "express";
 import { verifyDakioJwt, extractBearerToken, type DakioClaims } from "../lib/dakio-jwt.js";
-import { createSession, getSession, SETTLE_TYPES, type EveSession, type EveEvent } from "./sessions.js";
+import { createSession, getOrRestoreSession, SETTLE_TYPES, type EveSession, type EveEvent } from "./sessions.js";
 import { runTurn, type TurnInput } from "./turn.js";
 
 function authenticate(req: Request, res: Response): DakioClaims | null {
@@ -26,11 +26,15 @@ function authenticate(req: Request, res: Response): DakioClaims | null {
   return claims;
 }
 
-/** Session lookup + tenant pinning: the token's store must own the session. */
-function authorizedSession(req: Request, res: Response): EveSession | null {
+/**
+ * Session lookup + tenant pinning: the token's store must own the session.
+ * Falls back to the pg row when the id isn't in memory (post-restart), so
+ * 404 means neither memory nor pg knows the session.
+ */
+async function authorizedSession(req: Request, res: Response): Promise<EveSession | null> {
   const claims = authenticate(req, res);
   if (!claims) return null;
-  const session = getSession(req.params.id as string);
+  const session = await getOrRestoreSession(req.params.id as string);
   if (!session) {
     res.status(404).json({ ok: false, error: "unknown session" });
     return null;
@@ -72,8 +76,8 @@ eveRouter.post("/session", (req, res) => {
   res.json({ ok: true, sessionId: session.id, continuationToken: session.continuationToken });
 });
 
-eveRouter.post("/session/:id", (req, res) => {
-  const session = authorizedSession(req, res);
+eveRouter.post("/session/:id", async (req, res) => {
+  const session = await authorizedSession(req, res);
   if (!session) return;
   const body = (req.body ?? {}) as TurnInput & { continuationToken?: string };
   if (body.continuationToken !== session.continuationToken) {
@@ -88,8 +92,8 @@ eveRouter.post("/session/:id", (req, res) => {
   res.json({ ok: true });
 });
 
-eveRouter.get("/session/:id/stream", (req, res) => {
-  const session = authorizedSession(req, res);
+eveRouter.get("/session/:id/stream", async (req, res) => {
+  const session = await authorizedSession(req, res);
   if (!session) return;
 
   const startIndex = Math.max(0, Number.parseInt(String(req.query.startIndex ?? "0"), 10) || 0);
@@ -100,7 +104,13 @@ eveRouter.get("/session/:id/stream", (req, res) => {
   // Pump pattern: drain the log from `next`, then sleep until the next
   // append wakes us. Single code path, no backfill/live race — an event
   // appended while we drain is picked up by the same while loop.
-  let next = startIndex;
+  //
+  // `eventBase` maps the client's cursor into this process's events array:
+  // the client counts every line it has ever consumed under this session id,
+  // but after a pg restore the array restarts empty. Its old cursor (==
+  // eventBase at last settle) lands on index 0 of the fresh array, exactly
+  // where the next turn's events will appear. 0 for non-restored sessions.
+  let next = Math.max(0, startIndex - session.eventBase);
   let closed = false;
 
   const wake = () => {

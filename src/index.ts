@@ -1,10 +1,16 @@
-import "dotenv/config";
+// FIRST, and it must stay first: loads .env and routes fetch through the
+// environment's proxy before any module that could make an outbound call is
+// evaluated. See src/boot.ts for why this is an import and not a call.
+import "./boot.js";
+
 import express, { type Request, type Response } from "express";
 import { MastraServer } from "@mastra/express";
 import { mastra } from "./mastra/index.js";
 import { getStoreProfile } from "./lib/store.js";
 import { novaInstructions } from "./lib/context.js";
+import { toolsForTurn } from "./tools/index.js";
 import { eveRouter } from "./eve-compat/router.js";
+import { inboxRouter } from "./inbox/ingress.js";
 import { withGatewayRetry } from "./lib/gateway-retry.js";
 import { createStudioRouter, hasValidStudioCookie } from "./studio.js";
 
@@ -75,6 +81,14 @@ app.use((req, res, next) => {
 const studioRouter = createStudioRouter(STUDIO_TOKEN);
 if (studioRouter) app.use("/studio", studioRouter);
 
+// Customer-message ingress (SHADOW) — POST /customer/message, the same root
+// path nova-ai exposes, so dakio-api's NOVA_AGENT_URL can point here with no
+// other change. Mounted BEFORE express.json(): the HMAC covers the raw bytes
+// (the router uses express.raw). Its auth is the x-nova-signature MAC, not
+// NOVA_STUDIO_TOKEN — the studio guard above only covers /api/* and /chat,
+// so this route rides its own fail-closed secret check.
+app.use(inboxRouter);
+
 app.use(express.json());
 
 // The eve protocol surface NovaChat speaks (novaAgentClient.js).
@@ -126,9 +140,13 @@ app.post("/chat", async (req: Request, res: Response) => {
     }
 
     const agent = mastra.getAgent("nova");
+    // Same rules-first tool selection the eve lane uses — /chat must not be a
+    // second, quietly different Nova.
+    const { toolsets } = toolsForTurn(storeId, message);
     const result = await withGatewayRetry(() =>
       agent.generate(message, {
         instructions: novaInstructions(store),
+        ...(toolsets ? { toolsets } : {}),
       }),
     );
 

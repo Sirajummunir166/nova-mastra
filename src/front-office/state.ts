@@ -98,6 +98,17 @@ export interface ChatTurnMessage {
   role: "customer" | "nova";
   text: string;
   at: number;
+  /**
+   * The STORE's own message ids this line was read from — set only by the
+   * instructed lane, which re-reads the thread and therefore knows them (the
+   * live ingress is handed text and no id). It is what "this thread has already
+   * absorbed that message" means when it is known: two messages with identical
+   * text are two messages, and deciding by text alone silently drops the
+   * second one ("hello" asked twice is one answered customer and one ignored).
+   * Optional, so persisted state written before it loads unchanged and the live
+   * lane keeps falling back to the text comparison.
+   */
+  ids?: string[];
 }
 
 export interface ToolLedgerEntry {
@@ -111,6 +122,15 @@ export interface ToolLedgerEntry {
 export interface NovaLiveContext {
   convId: string;
   storeId: string;
+  /**
+   * dakio-api's session roll (`InboxConversation.novaSessionEpoch`, read via
+   * `GET /conversations/:id/session-epoch`). Part of the STORAGE KEY — the
+   * same discipline as nova-ai's `inbox:<conv>:<model>:e<epoch>` continuation
+   * token: a rolled epoch starts a fresh context and never touches the old
+   * one. `0` is the pre-roll default, so legacy state (files without the
+   * field) keeps loading under the exact key it already had.
+   */
+  epoch: number;
   version: number;
   updatedAt: number;
 
@@ -154,6 +174,33 @@ export interface NovaLiveContext {
 
   orders: Array<{ no: string; title: string; total: number }>;
 
+  /**
+   * Orders filed for the shop's approval but not yet placed (phase D unit 1 —
+   * the approval-gated live tier). Each row is a prepared `create_order_from_chat`
+   * action sitting on the founder's Decision desk; it holds NO order number and
+   * NO total because no order exists yet — the server prices at approve time.
+   * Optional and absent on legacy persisted state (shadow-only histories never
+   * grow it), so old rows load byte-identically. The length also feeds the
+   * `nm:<conv>:order-<n>` idempotency key so a SECOND product sold while the
+   * first awaits approval mints a fresh key instead of deduping into the first.
+   *
+   * `state` is what the FOUNDER did with the card, reconciled from the action
+   * row on read (`reconcilePendingOrders` in turn.ts) — absent means the same
+   * as `pending`, so persisted rows written before this field load unchanged.
+   * Entries are never REMOVED once settled, and that is deliberate on two
+   * counts: this array's length is part of the order key (dropping a settled
+   * entry would re-mint a key the ledger already owns and replay it), and a
+   * rejected order is a fact about the conversation worth keeping.
+   */
+  pendingOrders?: Array<{
+    actionId: string;
+    title: string;
+    /** `placed` = the shop approved it; `closed` = rejected, blocked or undone. */
+    state?: "pending" | "placed" | "closed";
+    /** The order number, once one exists. Only ever set alongside `placed`. */
+    no?: string;
+  }>;
+
   /** Observation cache backing store — raw payloads, timestamped. */
   toolLedger: ToolLedgerEntry[];
 
@@ -168,10 +215,11 @@ export interface NovaLiveContext {
   recent: ChatTurnMessage[];
 }
 
-export function newLiveContext(convId: string, storeId: string, channel = "chat"): NovaLiveContext {
+export function newLiveContext(convId: string, storeId: string, channel = "chat", epoch = 0): NovaLiveContext {
   return {
     convId,
     storeId,
+    epoch,
     version: 0,
     updatedAt: Date.now(),
     customer: { lang: { pref: "bn", detected: "banglish", conf: 0.5 }, sentiment: "neutral", channel },
@@ -191,6 +239,25 @@ export function newLiveContext(convId: string, storeId: string, channel = "chat"
 
 const RECENT_MAX = 8;
 const MEMO_MAX_CHARS = 320; // ≈ 60-80 tokens
+
+// ---------------------------------------------------------------------------
+// Phone masking — THE one masker. The card's contract is "never full
+// phone/address", and it holds for every consumer of this state: the card
+// header AND anything folded into MEMO mask through these same helpers.
+// ---------------------------------------------------------------------------
+
+/** A Bangladeshi mobile in any wire form (+880…, 880…, 0…). */
+const BD_PHONE_RE = /(?:\+?880|0)1[3-9]\d{8}/g;
+
+/** Mask to the last 3 digits — the card's confirmation convention ("ending 689?"). */
+export function maskPhone(phone: string): string {
+  return `···${phone.slice(-3)}`;
+}
+
+/** Replace every full BD phone in free text with its masked form. */
+export function maskPhonesIn(text: string): string {
+  return text.replace(BD_PHONE_RE, (m) => maskPhone(m));
+}
 
 export function computeMissing(ctx: NovaLiveContext): MissingField[] {
   const missing: MissingField[] = [];
@@ -229,7 +296,9 @@ export function pushMessage(ctx: NovaLiveContext, msg: ChatTurnMessage): void {
     const old = ctx.recent.shift()!;
     // Never compress away: handled upstream — order details, promises, quoted
     // prices and corrections are written into MEMO explicitly by the reducer.
-    const line = `${old.role === "customer" ? "C" : "N"}: ${old.text.slice(0, 60)}`;
+    // Mask BEFORE folding: a phone that ages out of recent[] must ride MEMO
+    // masked, or the card leaks the full number on every later turn.
+    const line = `${old.role === "customer" ? "C" : "N"}: ${maskPhonesIn(old.text).slice(0, 60)}`;
     ctx.conversation.summary = `${ctx.conversation.summary} · ${line}`.slice(-MEMO_MAX_CHARS).replace(/^ · /, "");
   }
 }
