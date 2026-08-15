@@ -94,6 +94,53 @@ export interface TurnResult {
   modelFailure?: string;
 }
 
+/* ── At-most-once keys — ONE derivation per verb ────────────────────────────
+ *
+ * Shadow and live must agree on the key or the shadow dataset is a record of a
+ * write the live path would never have made. They drifted once already: the
+ * shadow branch counted `ctx.orders.length` while `hardValidateAndCreate`
+ * counted `ctx.orders.length + ctx.pendingOrders.length`, so the moment one
+ * order was awaiting the founder every shadow row named a `novaActionId` that
+ * belonged to an order already on the desk. These two functions are the only
+ * place either key is spelled, so the halves cannot drift again.
+ *
+ * THE EPOCH RIDES IN THE KEY. dakio-api's session roll partitions the context
+ * store (`context-store.ts`: the epoch is part of the primary key, and a rolled
+ * conversation loads a FRESH context). Without it here, a rolled thread starts
+ * counting orders from zero again and its first new order replays the previous
+ * session's row — and a thread handed back by the founder could never escalate
+ * a second time, because `nm:<conv>:handover` was constant for the life of the
+ * conversation. The suffix is omitted at epoch 0, mirroring `fileFor()` in the
+ * context store, so keys already in ledgers keep matching.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+function epochSuffix(ctx: NovaLiveContext): string {
+  const epoch = ctx.epoch ?? 0;
+  return epoch > 0 ? `:e${epoch}` : "";
+}
+
+/**
+ * The Nth chat order of this conversation. Placed AND pending both count: a
+ * second product sold while the first awaits approval must mint a fresh key
+ * rather than dedupe into the first.
+ */
+export function orderActionKey(ctx: NovaLiveContext): string {
+  return `nm:${ctx.convId}${epochSuffix(ctx)}:order-${ctx.orders.length + (ctx.pendingOrders?.length ?? 0)}`;
+}
+
+/**
+ * One hand-over per conversation PER SESSION.
+ *
+ * Constant within a session, so a redelivered turn dedupes; advanced by the
+ * session roll, so a thread the founder answered and handed back can be
+ * escalated again. dakio-api's one-open-card rule still dedupes inside a
+ * session — `handoverConversation` answers `alreadyEscalated` rather than
+ * raising a second card.
+ */
+export function handoverActionKey(ctx: NovaLiveContext): string {
+  return `nm:${ctx.convId}${epochSuffix(ctx)}:handover`;
+}
+
 export function runCustomerTurn(
   storeId: string,
   convId: string,
@@ -266,6 +313,12 @@ async function executeTurn(
   let handoverActionId: string | undefined;
   let facts = "";
   let draftSuppressed = false;
+  /**
+   * What the hand-over gate actually did, when it ran. `undefined` means it did
+   * not run (shadow, or no ESCALATE this turn) — which is NOT the same as
+   * "blocked", and the writer instruction below depends on the difference.
+   */
+  let handoverOutcome: "executed" | "blocked" | undefined;
   /** True when this turn's ESCALATE came from the order gate refusing, not from
    *  the customer asking — it decides the escalation reason below. */
   let orderGateBlocked = false;
@@ -273,7 +326,10 @@ async function executeTurn(
     if (mode === "shadow") {
       wouldHaveDone = {
         type: "create_chat_order",
-        novaActionId: `nm:${ctx.convId}:order-${ctx.orders.length}`,
+        // The SAME derivation the live path uses (`hardValidateAndCreate`) —
+        // a shadow row that named a different key would be a record of a write
+        // live never makes.
+        novaActionId: orderActionKey(ctx),
         productId: ctx.products.focusId ?? null,
         productName: ctx.hydrated.product?.value?.name ?? null,
         variant: ctx.purchase.variant ?? null,
@@ -319,7 +375,7 @@ async function executeTurn(
   // is recorded as `wouldHaveDone` and nothing is called.
   if (action === "ESCALATE") {
     const route = handoverRoute(classified.intent, orderGateBlocked);
-    const key = `nm:${ctx.convId}:handover`;
+    const key = handoverActionKey(ctx);
     if (mode === "shadow") {
       wouldHaveDone = {
         type: "escalate_conversation",
@@ -366,6 +422,7 @@ async function executeTurn(
         calledAt: Date.now(),
         ok: hand.status === "executed",
       });
+      handoverOutcome = hand.status === "executed" ? "executed" : "blocked";
       if (hand.status === "executed") {
         // The SERVER owns the holding line (a deterministic template chosen by
         // reason — and deliberately NO line at all for `fraud_risk`, where a
@@ -376,7 +433,9 @@ async function executeTurn(
       }
       // A BLOCKED handover is the other case: Nova is still on the thread and
       // still owes an answer, so the draft stands. The founder's rule stays on
-      // the ledger row — the customer never hears it.
+      // the ledger row — the customer never hears it — and, since NOTHING was
+      // handed over, the draft may not say a person is taking the thread. That
+      // is what `handoverOutcome` carries into `buildActionLine`.
     }
   }
 
@@ -404,7 +463,7 @@ async function executeTurn(
   }
 
   // ---- Writer: word the decided action (~300 tokens in) ---------------------
-  const actionLine = buildActionLine(ctx, action, facts);
+  const actionLine = buildActionLine(ctx, action, facts, { handoverOutcome });
   const card = renderStateCard(ctx);
   const genStart = Date.now();
   timings.genStartMs = genStart - t0;
@@ -517,7 +576,7 @@ async function hardValidateAndCreate(ctx: NovaLiveContext): Promise<GateResult> 
   // order of this conversation (placed + pending both count) so a retried
   // turn replays instead of double-filing or double-ordering.
   const payload: ChatOrderGatePayload = {
-    novaActionId: `nm:${ctx.convId}:order-${ctx.orders.length + (ctx.pendingOrders?.length ?? 0)}`,
+    novaActionId: orderActionKey(ctx),
     conversationId: ctx.convId,
     customerName: ctx.customer.name?.value ?? "Messenger Customer",
     customerPhone: ctx.customer.phone.value,
@@ -723,7 +782,26 @@ function factsCheckedFrom(ctx: NovaLiveContext): Array<{ source: string; note: s
 
 // ---------------------------------------------------------------------------
 
-function buildActionLine(ctx: NovaLiveContext, action: string, facts: string): string {
+/**
+ * The instruction the writer words the reply from — i.e. the last place this
+ * lane decides what a customer is going to be told.
+ *
+ * THE RULE IT ENFORCES: never assert an outcome that is not determined, never
+ * assert state that was not read, never imply queued work is under way. The
+ * prepared-tier lines in `actions.ts` answer to the same rule; this is its
+ * other half, because a `detail` string that is careful and an ACTION line
+ * that promises the world still ends in one over-promising bubble.
+ *
+ * Exported so the suite can assert on the wording directly. It has to be: the
+ * writer is a model call, so an end-to-end test cannot see the sentence, and
+ * the blocked-handover reply went untested for exactly that reason.
+ */
+export function buildActionLine(
+  ctx: NovaLiveContext,
+  action: string,
+  facts: string,
+  opts: { handoverOutcome?: "executed" | "blocked" } = {},
+): string {
   const focus = ctx.hydrated.product?.value;
   const bits: string[] = [action];
   if (facts) bits.push(facts);
@@ -762,12 +840,33 @@ function buildActionLine(ctx: NovaLiveContext, action: string, facts: string): s
     case "ORDER_PENDING_APPROVAL":
       // FD-3 stance: the normal flow, never an apology — and never a number
       // for an order that does not exist yet.
+      //
+      // NO TIMEFRAME. "will confirm shortly" was a promise about the founder's
+      // response time that nothing bounds: the card sits until they tap it or
+      // its TTL expires, and a customer told "shortly" who hears nothing for a
+      // day was mis-set by this line, not by the shop.
       bits.push(
-        "confirm warmly that the order is being placed — the shop double-checks every chat order before dispatch and will confirm shortly; this is the normal flow, not a problem, so no apology; do NOT invent an order number or a final total",
+        "confirm warmly that the order is being placed — the shop double-checks every chat order before dispatch; this is the normal flow, not a problem, so no apology; give NO timeframe for the shop's answer, and do NOT invent an order number or a final total",
       );
       break;
     case "ESCALATE":
-      bits.push("tell the customer a person from the shop will take over shortly; one line, then stop");
+      // Three states, and only one of them may promise a person.
+      if (opts.handoverOutcome === "blocked") {
+        // The hand-over was REFUSED (a founder's no-touch lock, a paused duty,
+        // an unavailable authority). Nobody has been told anything, no card
+        // exists, and Nova still owns the thread — so a line about someone
+        // taking over would be untrue on every clause. The rule that refused
+        // it is the shop's own business and never reaches the customer.
+        bits.push(
+          "the hand-off did not go through, so promise NO person, NO callback and NO answer from anyone else; answer the customer yourself from what the state above supports, say plainly if it is something you cannot settle here, and never mention the shop's internal rules",
+        );
+      } else {
+        // Executed hand-overs suppress the draft entirely (the server sends its
+        // own holding line), so this is the shadow lane's wording: what live
+        // WOULD have said if it drafted. No timeframe — nothing bounds when a
+        // person picks the thread up.
+        bits.push("tell the customer a person from the shop is taking this over; do not promise when; one line, then stop");
+      }
       break;
     case "ACKNOWLEDGE_REJECT":
       bits.push("accept gracefully, leave the door open, no pressure");

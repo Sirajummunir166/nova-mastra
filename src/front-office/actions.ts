@@ -62,7 +62,38 @@
  * a row executed via the APPROVE path was keyed `action.id` server-side, so
  * replaying `createChatOrder` with the `nm:` key would create a SECOND order.
  * Replays therefore answer from the ledger row and never re-call the write.
+ *
+ * ── What the key alone does NOT buy, and what carries the rest ─────────────
+ *
+ * A key is only half an idempotency story, and the missing halves are filed
+ * ON the row rather than assumed:
+ *
+ *  - PAYLOAD FINGERPRINT. `findByKey` matches `(type, novaActionId)`; it cannot
+ *    tell a redelivery from a DIFFERENT request that reused the key. Every row
+ *    this file writes therefore carries a `payload_fingerprint` evidence line,
+ *    and a key hit whose fingerprint disagrees is refused loudly instead of
+ *    answered from the older row's outcome (`assertSameRequest`).
+ *  - CLAIM ROWS. Where the write is irreversible AND the client sends no
+ *    server-side idempotency key, the ledger row is filed BEFORE the write and
+ *    finalized after it (`fileClaim` → write → `finalizeClaim`). That is the
+ *    discount path (`createDiscount` stamps a fresh uuid per POST) and the
+ *    cancel path (whose "before" snapshot is destroyed by its own write). The
+ *    order path needs none: `DakioStoreClient.createChatOrder` sends
+ *    `idempotencyKey: novaActionId`, so its write is already at-most-once and
+ *    the ledger row can follow it.
+ *  - DECISION HEALING. `addDecision` is best-effort after `addAction`, so a
+ *    prepared row can exist with no card. A replay that finds a prepared row
+ *    re-checks for the card and files the missing one (`healDecision`) rather
+ *    than returning a founder ask nobody can see.
+ *
+ * A server-side unique floor on `(tenant, novaActionId)` is being added in
+ * dakio-api in parallel. Nothing here assumes it: the claim rows and the
+ * fingerprint are the agent-side floor and compose with it (a server that
+ * refuses a duplicate key surfaces as a thrown write, which a claim row has
+ * already recorded).
  */
+
+import { createHash } from "node:crypto";
 
 import { storeFor } from "../store/resolve.js";
 import { evaluateAuthority } from "../store/authority.js";
@@ -162,6 +193,10 @@ export async function performCreateOrder(
   // blocked row per attempt for the same reason).
   const existing = await findByKey(client, VERB, payload.novaActionId);
   if (existing) {
+    // The key matched; the REQUEST still has to. A different payload under the
+    // same key is a caller bug, not a redelivery, and answering it from this
+    // row would report someone else's order as this customer's.
+    assertSameRequest(VERB, existing, payload as unknown as Record<string, unknown>);
     if (existing.status === "executed") {
       return {
         status: "executed",
@@ -171,6 +206,13 @@ export async function performCreateOrder(
         replayed: true,
       };
     }
+    // A prepared row with no Decision is work the founder cannot see. The
+    // replay is the only moment anything looks again, so it heals it.
+    await healDecision(client, existing, {
+      tag: DEPARTMENT,
+      door: "orders",
+      paramsLine: maskPhonesIn(orderParamsLine(existing.payload as unknown as ChatOrderGatePayload)),
+    });
     return {
       status: "prepared",
       actionId: existing.id,
@@ -187,13 +229,22 @@ export async function performCreateOrder(
     origin: "chat",
   });
 
-  const title = orderTitle(payload);
+  // THE MASKER RUNS HERE TOO. The other five verbs get it from `gateOrFile`;
+  // this one does not pass through that helper, and it is the ONE verb whose
+  // payload provably carries a customer phone and a street line — so the title
+  // rule below stayed a hope on exactly the path that needed it to be a rule.
+  // `orderTitle`/`orderParamsLine` compose from `customerCity`/`customerDistrict`,
+  // which are customer-typed free text ("Savar, ring me on 01…"), not a
+  // catalog constant.
+  const title = maskPhonesIn(orderTitle(payload));
   const gateEvidence: ReceiptEvidence = {
     source: "authority_gate",
     note: authority.explanation,
     metric: "rule",
     value: authority.rule,
   };
+  // The other half of at-most-once: WHICH request this key stands for.
+  const keyEvidence = fingerprintEvidence(payload as unknown as Record<string, unknown>);
 
   if (authority.verdict === "refuse") {
     // A refusal is an explained, receipted event — its evidence is the rule
@@ -204,7 +255,7 @@ export async function performCreateOrder(
       title,
       payload: payload as unknown as Record<string, unknown>,
       justification: justificationOf(receipt),
-      receipt: buildReceipt(receipt, null, null, [gateEvidence]),
+      receipt: buildReceipt(receipt, null, null, [gateEvidence, keyEvidence]),
       riskClass: authority.riskClass,
       status: "blocked",
       outcome: authority.explanation,
@@ -238,7 +289,7 @@ export async function performCreateOrder(
       title,
       payload: payload as unknown as Record<string, unknown>,
       justification: justificationOf(receipt),
-      receipt: buildReceipt(receipt, null, null, [gateEvidence]),
+      receipt: buildReceipt(receipt, null, null, [gateEvidence, keyEvidence]),
       riskClass: authority.riskClass,
       status: "prepared",
       outcome: authority.verdict === "suggest" ? "suggestion" : null,
@@ -311,7 +362,7 @@ export async function performCreateOrder(
         customerId: order.customerId,
         trackingUrl: order.trackingUrl,
       },
-      [gateEvidence],
+      [gateEvidence, keyEvidence],
     ),
     riskClass: authority.riskClass,
     status: "executed",
@@ -362,11 +413,19 @@ export function orderTitle(payload: ChatOrderGatePayload): string {
   return `Chat order: ${units} item${units === 1 ? "" : "s"} to ${payload.customerCity}, ${payload.customerDistrict}`;
 }
 
-/** FD-3 in one line — the normal flow, never an apology. */
+/**
+ * FD-3 in one line — the normal flow, never an apology.
+ *
+ * It does NOT say the order will be placed. The founder may reject it, and an
+ * unanswered Decision expires on its TTL (`TTL_HOURS`); the only determined
+ * fact at this moment is that the request is on their desk. "Will be placed as
+ * approved" read as a promise Nova has no standing to make, and the customer
+ * would have been told an order was coming that may never exist.
+ */
 function preparedDetail(): string {
   return (
     "The order is going in — the shop confirms each chat order before dispatch. " +
-    "It is fully prepared on the owner's desk and will be placed as approved."
+    "It is fully prepared and has gone to them for that confirmation."
   );
 }
 
@@ -414,6 +473,248 @@ async function findByKey(client: StoreClient, type: string, novaActionId: string
 function gateRuleOf(record: ActionRecord): string | null {
   const hit = record.receipt?.evidence?.find((e) => e.source === "authority_gate" && e.metric === "rule");
   return typeof hit?.value === "string" ? hit.value : null;
+}
+
+/* ── Idempotency floor, shared by every verb ─────────────────────────────────
+ *
+ * `findByKey` answers "has this key been used?". These three answer the
+ * questions a key alone cannot: was it used for the SAME request, did the row
+ * get the founder card it was supposed to, and did the irreversible write
+ * either side of the row actually happen.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** Evidence `source` for everything this floor stamps — one namespace to grep. */
+const IDEMPOTENCY_SOURCE = "idempotency";
+
+/** Key order does not change a request, so it must not change its fingerprint. */
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    const src = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(src).sort()) out[key] = canonicalize(src[key]);
+    return out;
+  }
+  return value;
+}
+
+/**
+ * WHICH request a `novaActionId` stands for.
+ *
+ * Exported for the suite that pins it. Truncated to 16 hex chars because this
+ * is an equality check between two rows of one tenant's ledger, not a security
+ * boundary — and it rides on a founder-readable receipt line.
+ */
+export function payloadFingerprint(payload: Record<string, unknown>): string {
+  return createHash("sha256").update(JSON.stringify(canonicalize(payload)) ?? "").digest("hex").slice(0, 16);
+}
+
+function fingerprintEvidence(payload: Record<string, unknown>): ReceiptEvidence {
+  return {
+    source: IDEMPOTENCY_SOURCE,
+    note: "fingerprint of the payload this at-most-once key was filed for",
+    metric: "payload_fingerprint",
+    value: payloadFingerprint(payload),
+  };
+}
+
+function fingerprintOf(record: ActionRecord): string | null {
+  const hit = record.receipt?.evidence?.find(
+    (e) => e.source === IDEMPOTENCY_SOURCE && e.metric === "payload_fingerprint",
+  );
+  return typeof hit?.value === "string" ? hit.value : null;
+}
+
+/**
+ * A key hit is only a replay if the REQUEST matches.
+ *
+ * `findByKey` compares `(type, novaActionId)` and nothing else, so a caller
+ * that reuses a key for a different payload — a redelivery composed from state
+ * that moved, a key derived from a counter that did not advance — would be
+ * handed the older row's outcome as if it were this request's answer, and the
+ * customer would be told about somebody else's order. There is no safe way to
+ * guess which of the two the caller meant, so this refuses loudly.
+ *
+ * Rows filed before the fingerprint existed carry none; those still replay,
+ * because refusing every pre-existing row would break more than the hole it
+ * closes. New rows all carry one.
+ */
+function assertSameRequest(verb: string, record: ActionRecord, payload: Record<string, unknown>): void {
+  const filed = fingerprintOf(record);
+  if (!filed) return;
+  const incoming = payloadFingerprint(payload);
+  if (filed === incoming) return;
+  throw new Error(
+    `${verb}: novaActionId ${String(payload.novaActionId)} was already filed for a DIFFERENT payload ` +
+      `(row ${record.id} fingerprint ${filed}, this request ${incoming}). An at-most-once key names ONE request; ` +
+      "refusing to answer this one from that row.",
+  );
+}
+
+/**
+ * The marker that says "this row was filed BEFORE its write, and the write may
+ * or may not have happened yet".
+ *
+ * It stays true after the row is finalized — it describes how the row was
+ * filed, not what state it is in — which is what lets `isClaimRow` be read
+ * together with `status` rather than being cleared by a patch the store's
+ * `updateAction` surface (src/store/client.ts) cannot express anyway.
+ */
+function claimEvidence(novaActionId: string): ReceiptEvidence {
+  return {
+    source: IDEMPOTENCY_SOURCE,
+    note: "row filed before the irreversible write and finalized after it — a crash cannot leave the write unrecorded",
+    metric: "claim",
+    value: novaActionId,
+  };
+}
+
+function isClaimRow(record: ActionRecord): boolean {
+  return (record.receipt?.evidence ?? []).some((e) => e.source === IDEMPOTENCY_SOURCE && e.metric === "claim");
+}
+
+/**
+ * File the claim row: everything known BEFORE the write, including the
+ * `before` snapshot the write is about to destroy.
+ *
+ * Status is `prepared` because the store's `ActionStatus` union has no
+ * in-flight member and inventing one belongs in `src/store/`, not here. A
+ * claim row is invisible on the founder's desk for the reason the file states
+ * elsewhere — the desk renders DECISIONS, and a claim files none.
+ */
+async function fileClaim(
+  client: StoreClient,
+  input: Omit<Parameters<StoreClient["addAction"]>[0], "status" | "outcome" | "executedAt" | "decidedAt">,
+): Promise<ActionRecord> {
+  return client.addAction({
+    ...input,
+    status: "prepared",
+    outcome: null,
+    decidedAt: client.now(),
+    executedAt: null,
+  });
+}
+
+/** Turn a claim row into the executed receipt, once the write has returned. */
+async function finalizeClaim(
+  client: StoreClient,
+  claim: ActionRecord,
+  patch: { outcome: string; undoable: boolean; undoData: Record<string, unknown> | null },
+): Promise<ActionRecord> {
+  return client.updateAction(claim.id, {
+    status: "executed",
+    outcome: patch.outcome,
+    undoable: patch.undoable,
+    undoData: patch.undoData,
+    executedAt: client.now(),
+  });
+}
+
+/**
+ * A prepared row the founder cannot see is work that silently never happened.
+ *
+ * `addDecision` is best-effort after `addAction` (deliberately — a desk-card
+ * failure must not lose the work), so the two can come apart. `findByKey`
+ * matches the row and returns, which means the replay is the ONLY moment
+ * anything looks at the pair again. It looks.
+ *
+ * Best-effort in both directions: a `listDecisions` that fails files nothing
+ * (a second card on a guess is worse than a late one), and a failed
+ * `addDecision` still returns the prepared outcome the caller already has.
+ */
+async function healDecision(
+  client: StoreClient,
+  record: ActionRecord,
+  shape: { tag: NovaDepartment; door: string; paramsLine: string },
+): Promise<void> {
+  const cards = await client.listDecisions().catch(() => null);
+  if (!cards) return;
+  if (cards.some((d) => d.actionId === record.id)) return;
+  // Blocked rows never reach a replay (`findByKey`), so a replayed row is
+  // always a draft/suggest one — `proposal`, never `escalation`.
+  await client
+    .addDecision(authorGateDecision(client, record, { verdict: "draft", riskClass: record.riskClass }, shape))
+    .catch(() => {});
+}
+
+/* ── Conversation scoping — the guarantee, made structural ──────────────────
+ *
+ * nova-ai pins the thread off an eve customer-session principal
+ * (`scopedConversationId`) so a crafted id cannot reach another buyer's
+ * parcel. That seam is NOT ported (see `src/store/inboxIntents.ts`), and the
+ * verbs that MUTATE a caller-named order — `cancel_order_from_chat` and
+ * `update_order_contact` — cannot rebuild it from a read either:
+ *
+ *   - `Order` (src/store/types.ts) has no conversation field, so `getOrder`
+ *     cannot say which thread an order belongs to. The WRITE records it
+ *     (`createChatOrder` sends `sourceConversationId`); no read returns it.
+ *   - `getOrderStatus(orderId)` is the customer-plane read and is scoped by
+ *     TENANT alone — it answers for any order in the shop.
+ *   - This lane's own state holds order NUMBERS (`ctx.orders[].no`) and
+ *     prepared action ids, never dakio Order ids.
+ *
+ * So there is nothing here that can verify the claim, and a comment asserting
+ * it would be exactly the kind of unenforced guarantee this file must not
+ * carry. What IS enforced instead: the two mutating verbs will not accept a
+ * bare string. They take a `ConversationOrderRef`, which can only be minted by
+ * `conversationOrderRef()` — and that mint refuses any id the caller cannot
+ * show among the ids THIS conversation owns. The proof obligation is moved to
+ * the caller and made checkable by the compiler.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** Not exported: an object with this key cannot be written outside this module. */
+const CONVERSATION_SCOPED: unique symbol = Symbol("nova.conversationOrderRef");
+
+/**
+ * An order id together with the conversation that was shown to own it.
+ *
+ * The two travel as ONE value on purpose: a branded id alone could be minted
+ * against thread A and filed with `conversationId` B, which is the very
+ * substitution the brand exists to prevent.
+ */
+export interface ConversationOrderRef {
+  readonly orderId: string;
+  readonly conversationId: string;
+  readonly [CONVERSATION_SCOPED]: true;
+}
+
+/**
+ * The ONLY way to make one.
+ *
+ * `conversationOrderIds` must be the dakio Order ids this conversation's own
+ * state holds — from the 360 block of `getInboxConversation(convId)`, or from
+ * orders this lane itself placed in this thread. It must NEVER be assembled
+ * from the customer's message text ("cancel order 1234") or from model output;
+ * dakio-api scopes the cancel by tenant alone, so an id from either source is
+ * a stranger's parcel destroyed on the word of someone who never bought it.
+ */
+export function conversationOrderRef(input: {
+  conversationId: string;
+  orderId: string;
+  conversationOrderIds: readonly string[];
+}): ConversationOrderRef {
+  const conversationId = input.conversationId?.trim() ?? "";
+  const orderId = input.orderId?.trim() ?? "";
+  if (!conversationId) throw new Error("conversationOrderRef: conversationId is required");
+  if (!orderId) throw new Error("conversationOrderRef: orderId is required");
+  if (!input.conversationOrderIds?.includes(orderId)) {
+    throw new Error(
+      `conversationOrderRef: order ${orderId} is not one of conversation ${conversationId}'s own orders — ` +
+        "a chat write may only touch an order this thread is known to own",
+    );
+  }
+  return { orderId, conversationId, [CONVERSATION_SCOPED]: true };
+}
+
+/** The runtime half of the brand, for callers that reach this file from JS. */
+function assertScopedOrder(verb: string, ref: ConversationOrderRef | undefined): ConversationOrderRef {
+  if (!ref || typeof ref !== "object" || (ref as { [CONVERSATION_SCOPED]?: unknown })[CONVERSATION_SCOPED] !== true) {
+    throw new Error(
+      `${verb}: order must be a ConversationOrderRef from conversationOrderRef() — ` +
+        "this verb mutates an order and will not take an id it cannot see scoped to a conversation",
+    );
+  }
+  return ref;
 }
 
 /**
@@ -491,7 +792,10 @@ function authorOrderDecision(
     // one verb. Every other verb in this file takes its door from the
     // department (`DOOR_BY_DEPARTMENT`) — do not copy this line.
     door: "orders",
-    paramsLine: orderParamsLine(action.payload as unknown as ChatOrderGatePayload),
+    // Masked for the same reason the title is, and by the same masker: the
+    // params line is the copy that gets logged and re-rendered where nobody
+    // re-audits it (see `gateOrFile`, which does this for the other five).
+    paramsLine: maskPhonesIn(orderParamsLine(action.payload as unknown as ChatOrderGatePayload)),
   });
 }
 
@@ -577,11 +881,14 @@ function authorGateDecision(
  *    customer-session principal so a crafted `conversationId` cannot reach
  *    another buyer's parcel or coupon. That seam was NOT ported (see
  *    `src/store/inboxIntents.ts`), and faking it with a no-op would read as a
- *    guard being present. The equivalent guarantee here is structural:
- *    `conversationId` MUST be `ctx.convId` — supplied by the HMAC-verified
- *    ingress as an argument of `runCustomerTurn(storeId, convId, …)` — and an
- *    `orderId` MUST come from this conversation's own state, never from
- *    customer free text and never from model output.
+ *    guard being present. What holds instead, stated as what the CODE does:
+ *    `conversationId` is supplied by the HMAC-verified ingress as an argument
+ *    of `runCustomerTurn(storeId, convId, …)`, and the two verbs that mutate a
+ *    caller-named order refuse a bare id — they take a `ConversationOrderRef`
+ *    that only `conversationOrderRef()` can mint, and that mint refuses any id
+ *    the caller cannot show among the ids the conversation owns. See the
+ *    "Conversation scoping" block above `conversationOrderRef` for why no read
+ *    in this repo can verify ownership server-side today.
  *  - `ExecutionContext.approvedActionId`. Nothing in this repo approves an
  *    action (the founder approves inside dakio-api), so the direct path keys
  *    every write on the deterministic `nm:<conv>:<verb>-<n>` id and says so
@@ -614,11 +921,25 @@ interface GateSpec {
   receipt: GateReceiptInput;
   /** FD-3 wording for the prepared tier — the honest thing to tell a customer. */
   preparedDetail: string;
+  /**
+   * How this verb resolves ITS OWN unfinished claim row (see `fileClaim`).
+   * Only verbs that file claims supply one; for everyone else a prepared row
+   * carrying the claim marker is impossible, and the absence is a throw rather
+   * than a shrug.
+   */
+  onClaimReplay?: (claim: ActionRecord) => Promise<SettledGateOutcome>;
 }
 
 type GateStep =
   | { proceed: false; outcome: SettledGateOutcome }
-  | { proceed: true; authority: AuthorityDecision; gateEvidence: ReceiptEvidence; title: string; paramsLine: string };
+  | {
+      proceed: true;
+      authority: AuthorityDecision;
+      /** Every evidence line the gate adds to whatever row the verb files. */
+      rowEvidence: ReceiptEvidence[];
+      title: string;
+      paramsLine: string;
+    };
 
 /**
  * Dedupe, judge, and file everything that is NOT an execution.
@@ -641,6 +962,8 @@ async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep
   // At-most-once. Blocked rows deliberately do NOT dedupe (see `findByKey`).
   const existing = await findByKey(client, spec.verb, key);
   if (existing) {
+    // Same key is not yet the same request — check WHICH request it was.
+    assertSameRequest(spec.verb, existing, spec.payload);
     if (existing.status === "executed") {
       return {
         proceed: false,
@@ -653,6 +976,24 @@ async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep
         },
       };
     }
+    // A prepared row carrying the claim marker is NOT a founder ask — it is a
+    // previous attempt that filed its row and then did or did not complete its
+    // write. Only the verb knows how to find out which.
+    if (isClaimRow(existing)) {
+      if (!spec.onClaimReplay) {
+        throw new Error(
+          `${spec.verb}: ${key} has an unfinished claim row (${existing.id}) and this verb files no claims — ` +
+            "refusing to guess whether its write landed",
+        );
+      }
+      return { proceed: false, outcome: await spec.onClaimReplay(existing) };
+    }
+    // A genuine prepared row: make sure the founder can actually see it.
+    await healDecision(client, existing, {
+      tag: spec.department,
+      door: spec.door,
+      paramsLine: maskPhonesIn(spec.paramsLine),
+    });
     return {
       proceed: false,
       outcome: {
@@ -679,12 +1020,15 @@ async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep
   // through. It is a floor, not a licence to put PII in a title.
   const title = maskPhonesIn(spec.title);
   const paramsLine = maskPhonesIn(spec.paramsLine);
-  const gateEvidence: ReceiptEvidence = {
-    source: "authority_gate",
-    note: authority.explanation,
-    metric: "rule",
-    value: authority.rule,
-  };
+  const rowEvidence: ReceiptEvidence[] = [
+    {
+      source: "authority_gate",
+      note: authority.explanation,
+      metric: "rule",
+      value: authority.rule,
+    },
+    fingerprintEvidence(spec.payload),
+  ];
 
   if (authority.verdict === "refuse") {
     const record = await client.addAction({
@@ -693,7 +1037,7 @@ async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep
       title,
       payload: spec.payload,
       justification: justificationOf(spec.receipt),
-      receipt: buildReceipt(spec.receipt, null, null, [gateEvidence]),
+      receipt: buildReceipt(spec.receipt, null, null, rowEvidence),
       riskClass: authority.riskClass,
       status: "blocked",
       outcome: authority.explanation,
@@ -728,7 +1072,7 @@ async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep
       title,
       payload: spec.payload,
       justification: justificationOf(spec.receipt),
-      receipt: buildReceipt(spec.receipt, null, null, [gateEvidence]),
+      receipt: buildReceipt(spec.receipt, null, null, rowEvidence),
       riskClass: authority.riskClass,
       status: "prepared",
       outcome: authority.verdict === "suggest" ? "suggestion" : null,
@@ -759,7 +1103,7 @@ async function gateOrFile(client: StoreClient, spec: GateSpec): Promise<GateStep
     };
   }
 
-  return { proceed: true, authority, gateEvidence, title, paramsLine };
+  return { proceed: true, authority, rowEvidence, title, paramsLine };
 }
 
 /** Read a field back off a replayed executed row's `receipt.after`. */
@@ -972,22 +1316,12 @@ export async function performOfferDiscount(
     payload: payload as unknown as Record<string, unknown>,
     receipt,
     preparedDetail: discountPreparedDetail(),
+    onClaimReplay: (claim) => resolveDiscountClaim(client, claim, payload),
   });
 
   if (!step.proceed) {
     const o = step.outcome;
-    if (o.status === "executed") {
-      const after = afterOf(o.record);
-      return {
-        status: "executed",
-        actionId: o.actionId,
-        detail: o.detail,
-        code: typeof after.code === "string" ? after.code : null,
-        discountId: String((o.record.undoData as Record<string, unknown> | null)?.couponId ?? "") || null,
-        expiresHours: payload.expiresHours,
-        replayed: true,
-      };
-    }
+    if (o.status === "executed") return executedDiscountOutcome(o.actionId, o.detail, o.record, payload, true);
     return o;
   }
 
@@ -998,50 +1332,161 @@ export async function performOfferDiscount(
   // already expired, and the customer would be sent a code that fails at
   // checkout with no explanation anyone could give them.
   const expiresAt = new Date(Date.parse(client.now()) + payload.expiresHours * 3600 * 1000).toISOString();
+  const { amount: resolvedAmount, evidence: amountEvidence } = await resolveDiscountAmount(client, payload);
 
-  let resolvedAmount: number | undefined;
-  if (payload.mechanism === "free_delivery") {
-    // A discount is offered mid-negotiation, BEFORE the address exists, so
-    // there is no district to look up. Covering the LARGER of the two charges
-    // means the promise holds wherever the customer turns out to live.
+  // ── Claim BEFORE the mint ────────────────────────────────────────────────
+  // Minting a coupon is irreversible (the inverse DEACTIVATES; it cannot
+  // un-issue) and `DakioStoreClient.createDiscount` sends a FRESH uuid
+  // `Idempotency-Key` per POST (src/store/dakio.ts) — unlike `createChatOrder`,
+  // which keys on `novaActionId`. So the ledger dedupe preceding the write is
+  // not enough: a crash between the mint and `addAction` left a live coupon
+  // with no record, and the next delivery of the same turn found no row and
+  // minted a SECOND one. The row is therefore filed FIRST, carrying the codes
+  // this attempt is allowed to use, and finalized after the mint returns.
+  //
+  // Codes are reserved up front rather than drawn inside the retry loop for
+  // exactly that reason: they are what makes the claim recoverable — a replay
+  // asks the store which of them exists (`resolveDiscountClaim`) instead of
+  // guessing whether the write landed.
+  const reservedCodes = Array.from({ length: CODE_MINT_ATTEMPTS }, () => mintChatDiscountCode());
+  const claim = await fileClaim(client, {
+    type: DISCOUNT_VERB,
+    department: DISCOUNT_DEPARTMENT,
+    title: step.title,
+    payload: payload as unknown as Record<string, unknown>,
+    justification: justificationOf(receipt),
+    receipt: buildReceipt(
+      receipt,
+      null,
+      // Everything about the coupon that is known BEFORE it exists. The code
+      // and the coupon id land on `undoData` at finalize time, because the
+      // store's `updateAction` patch surface (src/store/client.ts) cannot
+      // rewrite a receipt and `src/store/` is out of scope here.
+      {
+        mechanism: payload.mechanism,
+        percentOff: payload.percentOff ?? null,
+        amount: resolvedAmount ?? null,
+        expiresAt,
+        maxUses: 1,
+      },
+      [...step.rowEvidence, claimEvidence(payload.novaActionId), ...(amountEvidence ? [amountEvidence] : [])],
+    ),
+    riskClass: step.authority.riskClass,
+    undoable: false,
+    undoData: { kind: "chat_discount_claim", codes: reservedCodes },
+    actor: "nova",
+    // THE ONE COST OF CLAIMING FIRST, named rather than discovered later: the
+    // row is INSERTED before the coupon exists, so it cannot carry
+    // `coupon:<id>` — and nothing can add it afterwards. `updateAction`'s patch
+    // surface (src/store/client.ts) does not include `targetRef`, and neither
+    // does the route behind it: dakio-api's `PATCH /api/v1/agent-data/actions/:id`
+    // (src/routes/nova.js) whitelists status/outcome/undoData/undoable/
+    // decidedAt/executedAt and 409s anything frozen at insert.
     //
-    // DIVERGENCE, chosen on purpose: nova-ai's agent-side executor reads
-    // `deliveryOutsideDhaka` alone; dakio-api's approve path takes
-    // `Math.max(inside, outside)` because nothing stops a merchant setting them
-    // the other way round. `Math.max` is used here so the direct tier and the
-    // approve tier issue the SAME coupon for the same payload.
-    const settings = await client.getStoreSettings();
-    resolvedAmount = Math.max(settings.deliveryInsideDhaka ?? 0, settings.deliveryOutsideDhaka ?? 0);
-    if (!(resolvedAmount > 0)) {
-      throw new Error(
-        "this store has no delivery charge configured, so 'free delivery' would be a coupon worth nothing — set a delivery charge in Settings first",
-      );
-    }
-  } else if (payload.mechanism === "fixed") {
-    // Straight through, WHOLE TAKA. Introducing a ×100 here would give away a
-    // 100× discount.
-    resolvedAmount = payload.amount;
-  }
+    // What carries the link instead, both of them exercised below:
+    //  - `attributeDoorRecord("coupon:<id>", row.id)` stamps the DOOR record
+    //    itself, which is what renders the by:nova chip and the receipt drawer;
+    //    `targetRef` on the row is the denormalized copy, not the source.
+    //  - `undoData.couponId` — the field dakio-api's UNDO map actually reads
+    //    (`runUndo` dispatches on `undoData.kind`, never on `targetRef`).
+    // A live coupon nobody has a record of is the worse failure of the two.
+    targetRef: null,
+    agentId: null,
+    dutyRef: DISCOUNT_DUTY_REF,
+    undoDeadline: null,
+    undoneAt: null,
+  });
 
-  // Mint-and-retry. The IDEMPOTENCY note that matters: this repo's
-  // `DakioStoreClient.createDiscount` sends no `Idempotency-Key` (unlike
-  // `createChatOrder`, which keys on `novaActionId`), so a retried auto-tier
-  // discount could mint a SECOND coupon server-side. The chosen resolution is
-  // the second one the analysis offers — the ledger dedupe in `gateOrFile`
-  // strictly PRECEDES this write, so a redelivered turn never reaches here.
-  // The one-line client fix (passing `idempotencyKey: payload.novaActionId`)
-  // belongs in `src/store/dakio.ts` and is out of scope for this change.
-  let discount: Awaited<ReturnType<StoreClient["createDiscount"]>> | null = null;
-  let code = "";
+  const discount = await mintReservedCoupon(client, payload, {
+    codes: reservedCodes,
+    expiresAt,
+    amount: resolvedAmount,
+  });
+  return finalizeDiscount(client, claim, discount, payload, resolvedAmount);
+}
+
+/**
+ * The money figure on a `free_delivery` coupon, and why the agent computes one
+ * at all.
+ *
+ * THE FILE'S RULE IS "the server prices everything", and this is the one place
+ * that cannot honour it — not a licence, a named server gap:
+ *
+ *   dakio-api `POST /api/v1/store/discounts` (src/routes/novaStore.js
+ *   `createStoreDiscount`, mounted at `router.post('/discounts', …)`) accepts
+ *   `type` ∈ {PERCENT, FIXED} ONLY, and 422s a FIXED coupon without a positive
+ *   whole-taka `amount`. There is no free-delivery mechanism on that route, so
+ *   "send the mechanism and let the server resolve it" is not expressible on
+ *   the DIRECT tier. The APPROVE tier does exactly that — the prepared payload
+ *   carries `mechanism: "free_delivery"` and NO amount, and dakio-api's
+ *   `EXECUTORS.offer_chat_discount` (src/lib/novaExecutors.js) reads the
+ *   tenant's own `deliveryInsideDhaka`/`deliveryOutsideDhaka` and takes their
+ *   `Math.max`. This function reproduces that server-side arithmetic against
+ *   `getStoreSettings()` so the two tiers issue the SAME coupon.
+ *
+ * Two things follow, and both are enforced rather than trusted:
+ *  - the number is READ from the store, never estimated. There is no fallback
+ *    figure: an unconfigured delivery charge throws instead of guessing one.
+ *  - the receipt says so. The evidence line names `get_store_settings` as the
+ *    source and the route as the reason, so nobody reading the ledger later
+ *    concludes the server priced this coupon.
+ *
+ * Closing the gap properly means a `FREE_DELIVERY` kind on that route (or an
+ * `amount: null` + `mechanism` body it resolves itself); until then this stays
+ * the one agent-side money computation in the file, and it stays labelled.
+ */
+export async function resolveDiscountAmount(
+  client: StoreClient,
+  payload: ChatDiscountGatePayload,
+): Promise<{ amount: number | undefined; evidence: ReceiptEvidence | null }> {
+  if (payload.mechanism === "fixed") {
+    // Straight through, WHOLE TAKA. Introducing a ×100 here would give away a
+    // 100× discount. The founder chose this figure; nothing is computed.
+    return { amount: payload.amount, evidence: null };
+  }
+  if (payload.mechanism !== "free_delivery") return { amount: undefined, evidence: null };
+
+  const settings = await client.getStoreSettings();
+  const amount = Math.max(settings.deliveryInsideDhaka ?? 0, settings.deliveryOutsideDhaka ?? 0);
+  if (!(amount > 0)) {
+    throw new Error(
+      "this store has no delivery charge configured, so 'free delivery' would be a coupon worth nothing — set a delivery charge in Settings first",
+    );
+  }
+  return {
+    amount,
+    evidence: {
+      source: "tool:get_store_settings",
+      note:
+        "free delivery priced agent-side from the store's own two delivery charges (larger of the two, as dakio-api's approve executor does) — " +
+        "POST /api/v1/store/discounts takes PERCENT|FIXED only and has no free-delivery mechanism",
+      metric: "server_gap",
+      value: amount,
+    },
+  };
+}
+
+/**
+ * Mint against the RESERVED codes.
+ *
+ * A collision moves to the next reserved code rather than drawing a fresh one,
+ * so the claim row's list stays the complete set of codes this key could ever
+ * have created — which is the whole basis on which a replay can tell whether
+ * the write landed. A guardrail refusal is never retried (see `isCodeCollision`).
+ */
+async function mintReservedCoupon(
+  client: StoreClient,
+  payload: ChatDiscountGatePayload,
+  opts: { codes: string[]; expiresAt: string; amount: number | undefined },
+): Promise<Awaited<ReturnType<StoreClient["createDiscount"]>>> {
   let lastError: unknown = null;
-  for (let attempt = 0; attempt < CODE_MINT_ATTEMPTS; attempt += 1) {
-    code = mintChatDiscountCode();
+  for (const code of opts.codes) {
     try {
-      discount = await client.createDiscount({
+      return await client.createDiscount({
         code,
         type: payload.mechanism === "percent" ? "PERCENT" : "FIXED",
-        ...(payload.mechanism === "percent" ? { percentOff: payload.percentOff } : { amount: resolvedAmount }),
-        expiresAt,
+        ...(payload.mechanism === "percent" ? { percentOff: payload.percentOff } : { amount: opts.amount }),
+        expiresAt: opts.expiresAt,
         active: true,
         // NON-NEGOTIABLE, and it is how "issued to this customer" is expressed:
         // `Coupon` has NO customerId column, so a chat coupon any customer
@@ -1052,45 +1497,31 @@ export async function performOfferDiscount(
         // The frequency guard's identity key when there is no linked customer.
         conversationId: payload.conversationId,
       });
-      break;
     } catch (error) {
       lastError = error;
       if (!isCodeCollision(error)) throw error;
     }
   }
-  if (!discount) {
-    throw new Error(
-      `offer_chat_discount: could not mint a free coupon code after ${CODE_MINT_ATTEMPTS} attempts (${
-        lastError instanceof Error ? lastError.message : String(lastError)
-      })`,
-    );
-  }
+  throw new Error(
+    `offer_chat_discount: could not mint a free coupon code after ${opts.codes.length} attempts (${
+      lastError instanceof Error ? lastError.message : String(lastError)
+    })`,
+  );
+}
 
+/** Claim row + minted coupon → the executed receipt, the door stamp and the activity line. */
+async function finalizeDiscount(
+  client: StoreClient,
+  claim: ActionRecord,
+  discount: Awaited<ReturnType<StoreClient["createDiscount"]>>,
+  payload: ChatDiscountGatePayload,
+  resolvedAmount: number | undefined,
+): Promise<DiscountGateOutcome> {
   const mechanismNote =
     payload.mechanism === "free_delivery" ? `free delivery (৳${resolvedAmount} off)` : discountOffer(payload);
   const outcome = `Issued coupon ${discount.code} — ${mechanismNote}, one use, expires in ${payload.expiresHours}h. ${payload.reason}`;
 
-  const record = await client.addAction({
-    type: DISCOUNT_VERB,
-    department: DISCOUNT_DEPARTMENT,
-    title: step.title,
-    payload: payload as unknown as Record<string, unknown>,
-    justification: justificationOf(receipt),
-    receipt: buildReceipt(
-      receipt,
-      null,
-      {
-        code: discount.code,
-        mechanism: payload.mechanism,
-        percentOff: payload.percentOff ?? null,
-        amount: resolvedAmount ?? null,
-        expiresAt,
-        maxUses: 1,
-      },
-      [step.gateEvidence],
-    ),
-    riskClass: step.authority.riskClass,
-    status: "executed",
+  const record = await finalizeClaim(client, claim, {
     outcome,
     undoable: true,
     // WIRE CONTRACT: `couponId`, NOT this repo's usual `discountId`.
@@ -1099,15 +1530,12 @@ export async function performOfferDiscount(
     // twice. The inverse DEACTIVATES and never deletes: if the code was already
     // redeemed the discount happened, and erasing the row would erase the
     // receipt explaining a sale short by exactly that amount.
+    //
+    // It is also where the minted code lives: the claim row's receipt was
+    // written before the code existed and `updateAction` cannot rewrite a
+    // receipt, so `undoData.code` is the authoritative read (see
+    // `executedDiscountOutcome`).
     undoData: { kind: "deactivate_chat_discount", couponId: discount.id, code: discount.code },
-    actor: "nova",
-    targetRef: `coupon:${discount.id}`,
-    agentId: null,
-    dutyRef: DISCOUNT_DUTY_REF,
-    undoDeadline: null,
-    undoneAt: null,
-    decidedAt: client.now(),
-    executedAt: client.now(),
   });
 
   await client.attributeDoorRecord(`coupon:${discount.id}`, record.id).catch(() => {});
@@ -1115,7 +1543,7 @@ export async function performOfferDiscount(
     .addActivity({
       department: DISCOUNT_DEPARTMENT,
       kind: "action",
-      title: step.title,
+      title: record.title,
       detail: outcome,
       minutesSaved: 10,
       // A coupon sells nothing by existing. The order it may help close claims
@@ -1136,6 +1564,83 @@ export async function performOfferDiscount(
     discountId: discount.id,
     expiresHours: payload.expiresHours,
     replayed: false,
+  };
+}
+
+/**
+ * Read a settled discount row back into an outcome.
+ *
+ * `undoData.code` first: on a finalized claim row the receipt predates the
+ * code. `receipt.after.code` is the fallback for rows filed by the pre-claim
+ * shape, which are still in ledgers.
+ */
+function executedDiscountOutcome(
+  actionId: string,
+  detail: string,
+  record: ActionRecord,
+  payload: ChatDiscountGatePayload,
+  replayed: boolean,
+): DiscountGateOutcome {
+  const after = afterOf(record);
+  const undo = (record.undoData ?? {}) as Record<string, unknown>;
+  return {
+    status: "executed",
+    actionId,
+    detail,
+    code: typeof undo.code === "string" ? undo.code : typeof after.code === "string" ? after.code : null,
+    discountId: String(undo.couponId ?? "") || null,
+    expiresHours: payload.expiresHours,
+    replayed,
+  };
+}
+
+/**
+ * A previous attempt filed its claim row and then stopped — did its coupon get
+ * minted or not?
+ *
+ * This is the question the claim exists to make ANSWERABLE rather than guessed:
+ * the row names every code that attempt could have used, so the store is asked
+ * which of them exists. Found → the mint landed and only the finalize was lost,
+ * so the row is finalized and the customer keeps the ONE code they were issued.
+ * Not found → the mint never landed, and the same claim row is reused for it.
+ * Neither branch mints a second coupon for one negotiation.
+ */
+async function resolveDiscountClaim(
+  client: StoreClient,
+  claim: ActionRecord,
+  payload: ChatDiscountGatePayload,
+): Promise<SettledGateOutcome> {
+  const codes = ((claim.undoData as Record<string, unknown> | null)?.codes ?? []) as string[];
+  const minted = (await client.listDiscounts()).find((d) => codes.includes(d.code));
+  const claimed = afterOf(claim);
+  const resolvedAmount = typeof claimed.amount === "number" ? claimed.amount : undefined;
+
+  const settled = minted
+    ? await finalizeDiscount(client, claim, minted, payload, resolvedAmount)
+    : await finalizeDiscount(
+        client,
+        claim,
+        await mintReservedCoupon(client, payload, {
+          codes,
+          // Expiry is counted from EXECUTION, and this attempt is the execution.
+          expiresAt: new Date(Date.parse(client.now()) + payload.expiresHours * 3600 * 1000).toISOString(),
+          amount: resolvedAmount,
+        }),
+        payload,
+        resolvedAmount,
+      );
+
+  if (settled.status !== "executed") throw new Error("offer_chat_discount: a finalized claim is always executed");
+  const record = await client.getAction(settled.actionId);
+  return {
+    status: "executed",
+    actionId: settled.actionId,
+    detail: settled.detail,
+    // The row the caller replays from, so the outcome reads identically
+    // whichever attempt produced it. The request's own receipt is NOT re-filed:
+    // the claim row already carries the one this key was filed with.
+    record: record ?? { ...claim, status: "executed", outcome: settled.detail },
+    replayed: true,
   };
 }
 
@@ -1176,15 +1681,20 @@ const CANCEL_DUTY_REF = "sales.inbox_orders" as const;
 export interface CancelOrderGatePayload {
   novaActionId: string;
   /**
-   * The dakio Order id (cuid), resolved from THIS conversation's own state.
-   * Never parsed out of customer free text ("cancel order 1234") — dakio-api
-   * scopes the lookup by tenant alone, so a cancellation scoped to another
-   * thread would destroy a stranger's order on the word of someone who never
-   * placed it.
+   * The order AND the conversation shown to own it, as one value that only
+   * `conversationOrderRef()` can mint — never a bare id.
+   *
+   * This is the type doing the work the header used to claim in prose:
+   * dakio-api scopes the cancel by TENANT alone, so an id parsed out of
+   * customer free text ("cancel order 1234") or emitted by a model would
+   * destroy a stranger's order on the word of someone who never placed it, and
+   * nothing in this repo can detect that after the fact (see the
+   * "Conversation scoping" block above `conversationOrderRef`).
+   *
+   * The two ids are filed on the wire payload as `orderId` and
+   * `conversationId`, exactly as dakio-api's approve executor reads them.
    */
-  orderId: string;
-  /** MUST be `ctx.convId` from the signed ingress. */
-  conversationId: string;
+  order: ConversationOrderRef;
   /** Why they want it cancelled, in their words. The only record of why a sale went away. */
   reason: string;
 }
@@ -1224,11 +1734,20 @@ export function cancelParamsLine(p: CancelOrderGatePayload): string {
  * this must not say "cancelled" and must not imply the parcel is stopped. The
  * inverse of FD-3's order wording, in the same register — normal flow, never an
  * apology, and never an invented cancellation reference.
+ *
+ * TWO CLAIMS WERE REMOVED FROM IT, and both for the same reason:
+ *  - "nothing has shipped on it in the meantime" — the prepared path makes NO
+ *    read of the order (the gate settles before any `getOrder`), so this was a
+ *    statement about the parcel's state written by code that had not looked. A
+ *    parcel that went out an hour ago would have been described as still here.
+ *  - "they will confirm it" — the founder may reject the card, and an
+ *    unanswered Decision expires on its TTL. What is determined is that the
+ *    request reached them; what they do with it is not.
  */
 function cancelPreparedDetail(): string {
   return (
-    "The cancellation request is with the shop and they will confirm it — nothing has shipped on it in the meantime. " +
-    "The order is not cancelled yet."
+    "The cancellation request has gone to the shop for confirmation. " +
+    "The order is not cancelled yet, so it may still move until they answer."
   );
 }
 
@@ -1238,11 +1757,21 @@ export async function performCancelOrder(
 ): Promise<CancelGateOutcome> {
   const client = storeFor(storeId);
   const { payload, receipt } = request;
-  if (!payload.orderId) throw new Error("cancel_order_from_chat: orderId is required");
-  if (!payload.conversationId) throw new Error("cancel_order_from_chat: conversationId is required");
+  // The brand is checked at runtime too: a JS caller, or a TS one that reached
+  // for `as`, must not be able to hand this verb an unscoped id.
+  const order = assertScopedOrder(CANCEL_VERB, payload.order);
   if (!payload.reason || payload.reason.trim().length < 5) {
     throw new Error("cancel_order_from_chat: reason must be at least 5 characters — it is the only record of why a sale went away");
   }
+  // The WIRE payload, built explicitly: `orderId` + `conversationId` are the
+  // keys dakio-api's approve executor reads, and the ref is a lane-side type
+  // that must not travel.
+  const wire: Record<string, unknown> = {
+    novaActionId: payload.novaActionId,
+    orderId: order.orderId,
+    conversationId: order.conversationId,
+    reason: payload.reason,
+  };
 
   const step = await gateOrFile(client, {
     verb: CANCEL_VERB,
@@ -1256,25 +1785,15 @@ export async function performCancelOrder(
     door: "orders",
     title: cancelTitle(payload),
     paramsLine: cancelParamsLine(payload),
-    payload: payload as unknown as Record<string, unknown>,
+    payload: wire,
     receipt,
     preparedDetail: cancelPreparedDetail(),
+    onClaimReplay: (claim) => resolveCancelClaim(client, claim, order, payload.reason),
   });
 
   if (!step.proceed) {
     const o = step.outcome;
-    if (o.status === "executed") {
-      const after = afterOf(o.record);
-      const before = (o.record.receipt?.before ?? {}) as Record<string, unknown>;
-      return {
-        status: "executed",
-        actionId: o.actionId,
-        detail: o.detail,
-        orderId: typeof after.orderId === "string" ? after.orderId : payload.orderId,
-        previousStatus: (typeof before.status === "string" ? before.status : null) as OrderStatus | null,
-        replayed: true,
-      };
-    }
+    if (o.status === "executed") return executedCancelOutcome(o.actionId, o.detail, o.record, order.orderId, true);
     return o;
   }
 
@@ -1284,47 +1803,70 @@ export async function performCancelOrder(
   // the customer-plane `getOrderStatus` returns a humanized `displayStatus`
   // string, not an `OrderStatus`, so feeding it into `previousStatus` would
   // write a value `updateOrder` cannot restore.
-  const before = await client.getOrder(payload.orderId);
+  //
+  // IT IS READ AND PERSISTED BEFORE THE WRITE, which is the whole reason this
+  // path files a claim row. The write destroys the very fact the undo needs: a
+  // first attempt that cancelled the order and then failed before filing its
+  // row left the world at `cancelled`, and the next attempt read THAT as the
+  // state to restore — an undo that restores 'cancelled' is an undo that does
+  // nothing, and the founder's one way back was gone.
+  const before = await client.getOrder(order.orderId);
   const previousStatus: OrderStatus = before?.status ?? "placed";
 
-  await client.updateOrderDelivery(payload.orderId, { status: "cancelled" });
-
-  const outcome =
-    `Cancelled order ${payload.orderId} at the customer's request: "${payload.reason}". ` +
-    "If it was already booked with the courier, cancel the parcel with them too — Dakio has not.";
-
-  const record = await client.addAction({
+  const claim = await fileClaim(client, {
     type: CANCEL_VERB,
     department: CANCEL_DEPARTMENT,
     title: step.title,
-    payload: payload as unknown as Record<string, unknown>,
+    payload: wire,
     justification: justificationOf(receipt),
     receipt: buildReceipt(
       receipt,
       { status: previousStatus },
-      { orderId: payload.orderId, status: "cancelled", reason: payload.reason },
-      [step.gateEvidence],
+      { orderId: order.orderId, status: "cancelled", reason: payload.reason },
+      [...step.rowEvidence, claimEvidence(payload.novaActionId)],
     ),
     riskClass: step.authority.riskClass,
-    status: "executed",
+    // The inverse is already complete at claim time — `previousStatus` is the
+    // only thing it needs and it has just been read. `undoable` flips true at
+    // finalize, because a claim row's write may not have happened yet.
+    undoable: false,
+    undoData: { kind: "uncancel_chat_order", orderId: order.orderId, previousStatus },
+    actor: "nova",
+    targetRef: `order:${order.orderId}`,
+    agentId: null,
+    dutyRef: CANCEL_DUTY_REF,
+    undoDeadline: null,
+    undoneAt: null,
+  });
+
+  await client.updateOrderDelivery(order.orderId, { status: "cancelled" });
+  return finalizeCancel(client, claim, order, payload.reason, previousStatus);
+}
+
+/** Claim row + completed write → the executed receipt and the activity line. */
+async function finalizeCancel(
+  client: StoreClient,
+  claim: ActionRecord,
+  order: ConversationOrderRef,
+  reason: string,
+  previousStatus: OrderStatus,
+): Promise<CancelGateOutcome> {
+  const outcome =
+    `Cancelled order ${order.orderId} at the customer's request: "${reason}". ` +
+    "If it was already booked with the courier, cancel the parcel with them too — Dakio has not.";
+
+  const record = await finalizeClaim(client, claim, {
     outcome,
     undoable: true,
     // `uncancel_chat_order` is the literal string dakio-api's kind-keyed UNDO
     // map dispatches on; a wrong slug reaches a founder as "No inverse is
     // defined for undefined", which has shipped twice. `orderId` is
-    // unconditional — it is the one field that UNDO reads.
-    undoData: { kind: "uncancel_chat_order", orderId: payload.orderId, previousStatus },
-    actor: "nova",
-    targetRef: `order:${payload.orderId}`,
-    agentId: null,
-    dutyRef: CANCEL_DUTY_REF,
-    undoDeadline: null,
-    undoneAt: null,
-    decidedAt: client.now(),
-    executedAt: client.now(),
+    // unconditional — it is the one field that UNDO reads. `previousStatus`
+    // is the claim's, never a re-read: see `performCancelOrder`.
+    undoData: { kind: "uncancel_chat_order", orderId: order.orderId, previousStatus },
   });
 
-  await client.attributeDoorRecord(`order:${payload.orderId}`, record.id).catch(() => {});
+  await client.attributeDoorRecord(`order:${order.orderId}`, record.id).catch(() => {});
   await client
     .addActivity({
       // KNOWN, DELIBERATE ASYMMETRY, left as found: the ledger row's department
@@ -1334,14 +1876,14 @@ export async function performCancelOrder(
       // is recorded rather than silently aligned.
       department: CANCEL_DEPARTMENT,
       kind: "action",
-      title: step.title,
+      title: record.title,
       detail: outcome,
       minutesSaved: 6,
       // A cancellation influences no revenue. Do NOT record the lost order
       // total as negative revenue.
       revenueInfluence: 0,
       actionId: record.id,
-      relatedId: payload.conversationId,
+      relatedId: order.conversationId,
     })
     .catch(() => {});
 
@@ -1349,9 +1891,60 @@ export async function performCancelOrder(
     status: "executed",
     actionId: record.id,
     detail: outcome,
-    orderId: payload.orderId,
+    orderId: order.orderId,
     previousStatus,
     replayed: false,
+  };
+}
+
+/** Read a settled cancel row back into an outcome — `before.status` is the undo anchor. */
+function executedCancelOutcome(
+  actionId: string,
+  detail: string,
+  record: ActionRecord,
+  fallbackOrderId: string,
+  replayed: boolean,
+): CancelGateOutcome {
+  const after = afterOf(record);
+  const before = (record.receipt?.before ?? {}) as Record<string, unknown>;
+  return {
+    status: "executed",
+    actionId,
+    detail,
+    orderId: typeof after.orderId === "string" ? after.orderId : fallbackOrderId,
+    previousStatus: (typeof before.status === "string" ? before.status : null) as OrderStatus | null,
+    replayed,
+  };
+}
+
+/**
+ * A previous cancel attempt filed its claim and stopped.
+ *
+ * The status to restore comes off the CLAIM (`receipt.before.status`), never
+ * from a fresh read — that read is exactly what a re-execution corrupts. The
+ * only thing the world is asked is whether the write landed, and an order that
+ * is already `cancelled` needs no second patch.
+ */
+async function resolveCancelClaim(
+  client: StoreClient,
+  claim: ActionRecord,
+  order: ConversationOrderRef,
+  reason: string,
+): Promise<SettledGateOutcome> {
+  const before = (claim.receipt?.before ?? {}) as Record<string, unknown>;
+  const previousStatus = (typeof before.status === "string" ? before.status : "placed") as OrderStatus;
+  const current = await client.getOrder(order.orderId);
+  if (current && current.status !== "cancelled") {
+    await client.updateOrderDelivery(order.orderId, { status: "cancelled" });
+  }
+  const settled = await finalizeCancel(client, claim, order, reason, previousStatus);
+  const record = await client.getAction(settled.actionId);
+  return {
+    status: "executed",
+    actionId: settled.actionId,
+    detail: settled.detail,
+    record: record ?? { ...claim, status: "executed", outcome: settled.detail },
+    replayed: true,
   };
 }
 
@@ -1388,10 +1981,16 @@ export type ContactField = (typeof CONTACT_FIELDS)[number];
 
 export interface UpdateContactGatePayload {
   novaActionId: string;
-  /** The dakio Order id (cuid) — dakio-api PATCHes `params:{id}`, not an order number. */
-  orderId: string;
-  /** MUST be `ctx.convId` from the signed ingress. */
-  conversationId: string;
+  /**
+   * The order AND the conversation shown to own it — a `ConversationOrderRef`,
+   * never a bare id, for the reason spelled out on `CancelOrderGatePayload`.
+   * Redirecting a COD parcel is the fraud shape this verb's own header names;
+   * "whoever is typing in this thread" is not the same claim as "the person
+   * who placed the order", and an unscoped id makes even the first claim
+   * unverifiable. Filed on the wire as `orderId` (dakio-api PATCHes
+   * `params:{id}`, not an order number) and `conversationId`.
+   */
+  order: ConversationOrderRef;
   /** The full new address as they typed it. */
   address?: string;
   city?: string;
@@ -1442,11 +2041,23 @@ export function contactParamsLine(p: UpdateContactGatePayload): string {
   return parts.join(" · ");
 }
 
-/** Never "I've changed it" for a change that has not happened, and never a total. */
+/**
+ * Never "I've changed it" for a change that has not happened, and never a total.
+ *
+ * TWO CLAIMS WERE REMOVED, for the same reasons as the cancel line:
+ *  - "before the parcel goes out" asserted a pre-dispatch state nothing on this
+ *    path read. This verb's own header says the pre-dispatch fence belongs to
+ *    the SERVER (`patchStoreOrder` answers 409) — which means the agent does
+ *    not know, at the moment it says this, whether the parcel is still here.
+ *  - "They will confirm the change" promised the founder's answer. They may
+ *    reject it; an unanswered Decision expires on its TTL.
+ * What is determined: the correction reached them, and if the area changed the
+ * amount due at the door moves with it.
+ */
 function contactPreparedDetail(): string {
   return (
-    "The corrected delivery details are with the shop to confirm before the parcel goes out. " +
-    "They will confirm the change — and the amount due at the door, if the area changed."
+    "The corrected delivery details have gone to the shop to confirm. " +
+    "Until they answer, the order still carries the old ones — and if the area changed, the amount due at the door changes with it."
   );
 }
 
@@ -1456,12 +2067,23 @@ export async function performUpdateContact(
 ): Promise<ContactGateOutcome> {
   const client = storeFor(storeId);
   const { payload, receipt } = request;
-  if (!payload.orderId) throw new Error("update_order_contact: orderId is required");
-  if (!payload.conversationId) throw new Error("update_order_contact: conversationId is required");
+  // Runtime half of the brand — see `performCancelOrder`.
+  const order = assertScopedOrder(CONTACT_VERB, payload.order);
   const changed = changedContactFields(payload);
   if (changed.length === 0) {
     throw new Error("Give at least one field to change — an update that changes nothing is not an update.");
   }
+  // The WIRE payload, built explicitly: the ref is lane-side and must not
+  // travel; `orderId` + `conversationId` are what dakio-api's executor reads.
+  const wire: Record<string, unknown> = {
+    novaActionId: payload.novaActionId,
+    orderId: order.orderId,
+    conversationId: order.conversationId,
+    ...(payload.address !== undefined ? { address: payload.address } : {}),
+    ...(payload.city !== undefined ? { city: payload.city } : {}),
+    ...(payload.district !== undefined ? { district: payload.district } : {}),
+    ...(payload.phone !== undefined ? { phone: payload.phone } : {}),
+  };
 
   const step = await gateOrFile(client, {
     verb: CONTACT_VERB,
@@ -1475,7 +2097,7 @@ export async function performUpdateContact(
     door: doorFor(CONTACT_DEPARTMENT),
     title: contactTitle(payload),
     paramsLine: contactParamsLine(payload),
-    payload: payload as unknown as Record<string, unknown>,
+    payload: wire,
     receipt,
     preparedDetail: contactPreparedDetail(),
   });
@@ -1499,13 +2121,17 @@ export async function performUpdateContact(
   // Only the changed fields are forwarded; nothing else from the payload
   // reaches the order. `confirm` belongs to `confirm_order_intent` and `status`
   // only to the cancel path, so neither is sent here.
-  await client.updateOrderDelivery(payload.orderId, {
+  await client.updateOrderDelivery(order.orderId, {
     ...(payload.address !== undefined ? { address: payload.address } : {}),
     ...(payload.city !== undefined ? { city: payload.city } : {}),
     ...(payload.district !== undefined ? { district: payload.district } : {}),
     ...(payload.phone !== undefined ? { phone: payload.phone } : {}),
   });
 
+  // "before dispatch" is safe HERE and only here: the write above RETURNED,
+  // and the server's pre-dispatch fence (409 → `InboxSendRefused`) is what let
+  // it. The prepared line may not borrow this sentence — nothing has been
+  // asked of the server on that path.
   const outcome =
     `Updated ${changed.join(", ")} on the order before dispatch.` +
     (payload.district ? " The district changed, so the delivery charge and total were recalculated." : "") +
@@ -1515,11 +2141,11 @@ export async function performUpdateContact(
     type: CONTACT_VERB,
     department: CONTACT_DEPARTMENT,
     title: step.title,
-    payload: payload as unknown as Record<string, unknown>,
+    payload: wire,
     justification: justificationOf(receipt),
     // `before` is null even on the executed tier — parity with nova-ai, which
     // deliberately takes no snapshot for this verb.
-    receipt: buildReceipt(receipt, null, { orderId: payload.orderId, changed }, [step.gateEvidence]),
+    receipt: buildReceipt(receipt, null, { orderId: order.orderId, changed }, step.rowEvidence),
     riskClass: step.authority.riskClass,
     status: "executed",
     outcome,
@@ -1531,7 +2157,7 @@ export async function performUpdateContact(
     undoable: false,
     undoData: null,
     actor: "nova",
-    targetRef: `order:${payload.orderId}`,
+    targetRef: `order:${order.orderId}`,
     agentId: null,
     dutyRef: CONTACT_DUTY_REF,
     undoDeadline: null,
@@ -1540,7 +2166,7 @@ export async function performUpdateContact(
     executedAt: client.now(),
   });
 
-  await client.attributeDoorRecord(`order:${payload.orderId}`, record.id).catch(() => {});
+  await client.attributeDoorRecord(`order:${order.orderId}`, record.id).catch(() => {});
   await client
     .addActivity({
       department: CONTACT_DEPARTMENT,
@@ -1550,7 +2176,7 @@ export async function performUpdateContact(
       minutesSaved: 5,
       revenueInfluence: 0,
       actionId: record.id,
-      relatedId: payload.conversationId,
+      relatedId: order.conversationId,
     })
     .catch(() => {});
 
@@ -1666,9 +2292,15 @@ export function caseParamsLine(p: OpenCaseGatePayload): string {
   return `${kind} · thread only — may duplicate`;
 }
 
-/** No case id, no `joined` state, no timeline — none of the three is known yet. */
+/**
+ * No case id, no `joined` state, no timeline — none of the three is known yet,
+ * and NO CLAIM THAT ANYONE HAS STARTED. "The shop is picking it up from here"
+ * described work in progress when all that exists is a card waiting for a tap;
+ * the executed tier is the only one that may speak about a room having it
+ * (`joined` is server truth, and it exists only after the write returns).
+ */
 function casePreparedDetail(): string {
-  return "The problem is written down and the shop is picking it up from here.";
+  return "The problem is written down and it has gone to the shop.";
 }
 
 export async function performOpenCase(
@@ -1758,7 +2390,7 @@ export async function performOpenCase(
       receipt,
       null,
       { caseId: row.id, kind: row.kind, department: row.department, status: row.status, joined },
-      [step.gateEvidence],
+      step.rowEvidence,
     ),
     riskClass: step.authority.riskClass,
     status: "executed",
@@ -1921,6 +2553,39 @@ export function handoverParamsLine(p: HandoverGatePayload): string {
   return [p.reason.replace(/_/g, " "), `to ${p.department}`, p.summary].join(" · ");
 }
 
+/**
+ * The ask is WAITING, not under way: a prepared row has moved nothing, no
+ * holding line has gone out, and the thread is still Nova's. "The thread is
+ * being handed to the shop" described a transfer in progress that had not
+ * started.
+ */
+function handoverPreparedDetail(): string {
+  return "The request to hand this thread over is waiting on the shop; it has not moved yet.";
+}
+
+/**
+ * Every verb's prepared-tier line, in ONE table.
+ *
+ * They answer to ONE rule — never assert an outcome that is not determined,
+ * never assert state that was not read, never imply queued work is under way —
+ * and a rule that applies to six strings is worth being able to test over six
+ * strings. Each entry is the same function the verb itself calls, so the table
+ * cannot drift from what a customer is actually told; the reasoning for each
+ * line lives on that function.
+ *
+ * The handover's line is reachable only through this table today (NEVER_GATED
+ * means its prepared tier never fires), which is exactly why it is here: an
+ * unreachable string is the one most likely to rot.
+ */
+export const PREPARED_DETAIL_BY_VERB = {
+  create_order_from_chat: preparedDetail,
+  offer_chat_discount: discountPreparedDetail,
+  cancel_order_from_chat: cancelPreparedDetail,
+  update_order_contact: contactPreparedDetail,
+  open_case: casePreparedDetail,
+  escalate_conversation: handoverPreparedDetail,
+} as const satisfies Record<string, () => string>;
+
 export async function performFlagHandover(
   storeId: string,
   request: { payload: HandoverGatePayload; receipt: GateReceiptInput },
@@ -1955,7 +2620,7 @@ export async function performFlagHandover(
     // Unreachable in practice — NEVER_GATED returns `execute`. If a port ever
     // produces a prepared handover that is a bug in the gate, not a tier, and
     // this line is what a reader will see when it happens.
-    preparedDetail: "The thread is being handed to the shop.",
+    preparedDetail: handoverPreparedDetail(),
   });
 
   if (!step.proceed) {
@@ -2026,7 +2691,7 @@ export async function performFlagHandover(
         alreadyEscalated,
         briefUpdated: briefUpdated ?? null,
       },
-      [step.gateEvidence],
+      step.rowEvidence,
     ),
     riskClass: step.authority.riskClass,
     status: "executed",

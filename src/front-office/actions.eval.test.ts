@@ -1,6 +1,11 @@
 /**
- * Order-gate suite (phase D unit 1) — the approval-gated live tier, hermetic
- * against the DEMO backend (deterministic, no network, no model).
+ * Customer-lane write-gate suite (phase D) — the approval-gated live tier,
+ * hermetic against the DEMO backend (deterministic, no network, no model).
+ *
+ * Part 1 (below) is the order gate. Part 2, further down, covers the other five
+ * verbs — offer_chat_discount, cancel_order_from_chat, update_order_contact,
+ * open_case and escalate_conversation — plus the turn wiring and the
+ * shadow-writes-nothing pin for each of them.
  *
  * What it pins, per the design as found in nova-ai (`performAction` +
  * `create_order_from_chat` tool/executor) and dakio-api (`novaExecutors.js`):
@@ -380,6 +385,8 @@ import {
   handoverTitle,
   changedContactFields,
   assertChatDiscountPayload,
+  conversationOrderRef,
+  payloadFingerprint,
   DEPARTMENT_BY_CASE_KIND,
   ESCALATION_REASONS,
   type ChatDiscountGatePayload,
@@ -521,7 +528,16 @@ test("discount auto tier: a single-use NOVA coupon is minted, undoable on the co
   const undo = row.undoData as Record<string, unknown>;
   assert.equal(undo.kind, "deactivate_chat_discount");
   assert.equal(undo.couponId, coupon.id, "couponId, NOT discountId — dakio-api's UNDO destructures that name");
-  assert.equal(row.targetRef, `coupon:${coupon.id}`);
+  assert.equal(undo.code, coupon.code, "the minted code rides on undoData — the claim row's receipt predates it");
+  // `targetRef` is null on a claim-finalized row, and that is the documented
+  // cost of filing the dedupe record BEFORE the mint (see `performOfferDiscount`):
+  // the row is inserted while the coupon does not exist yet, and neither
+  // `updateAction` nor dakio-api's `PATCH /agent-data/actions/:id` can set
+  // `targetRef` afterwards. The links that matter are asserted above —
+  // `undoData.couponId` is what `runUndo` dispatches on, and the door chip is
+  // stamped by `attributeDoorRecord` (a no-op in the demo store), not by this
+  // denormalized copy.
+  assert.equal(row.targetRef, null);
   assert.match(row.outcome ?? "", /one use, expires in 48h/);
   assert.equal(await cardsFor(store, "offer_chat_discount"), 0, "nothing waits on the founder");
 
@@ -617,11 +633,20 @@ test("discount title/params: WHAT then WHY, free delivery carries no number, rea
 // 7. cancel_order_from_chat
 // ---------------------------------------------------------------------------
 
+/**
+ * The order id ALWAYS arrives scoped — `performCancelOrder` takes a
+ * `ConversationOrderRef`, not a string, and only `conversationOrderRef()` mints
+ * one. `scoped()` is what a caller does with the conversation's own order ids;
+ * every test that wants a cancel has to go through it, which is the point.
+ */
+function scoped(orderId: string, convId = CONV) {
+  return conversationOrderRef({ conversationId: convId, orderId, conversationOrderIds: [orderId] });
+}
+
 function cancelPayload(key: string, orderId: string, over: Partial<CancelOrderGatePayload> = {}): CancelOrderGatePayload {
   return {
     novaActionId: key,
-    orderId,
-    conversationId: CONV,
+    order: scoped(orderId),
     reason: "Ordered the wrong size and does not want the parcel to go out.",
     ...over,
   };
@@ -730,8 +755,7 @@ test("cancel PII: a reason carrying a phone number never reaches the card in ful
 function contactPayload(key: string, orderId: string, over: Partial<UpdateContactGatePayload> = {}): UpdateContactGatePayload {
   return {
     novaActionId: key,
-    orderId,
-    conversationId: CONV,
+    order: scoped(orderId),
     address: "House 9, Road 4, Uttara Sector 7",
     ...over,
   };
@@ -812,7 +836,7 @@ test("contact: an update that changes nothing is not an update — it throws bef
   await assert.rejects(
     () =>
       performUpdateContact(AURORA, {
-        payload: { novaActionId: "nm:c:addr-noop", orderId: order.id, conversationId: CONV },
+        payload: { novaActionId: "nm:c:addr-noop", order: scoped(order.id) },
         receipt: GATE_RECEIPT,
       }),
     /at least one field/i,
@@ -1237,4 +1261,637 @@ test("shadow: an address correction writes no update_order_contact row", async (
   assert.equal((await rowsOf(store, "update_order_contact")).length, 0);
   assert.equal(await cardsFor(store, "update_order_contact"), 0);
   resetContext(AURORA, convId);
+});
+
+test("turn wiring, live: an order the gate BLOCKED becomes a guardrail_blocked hand-over, and the customer hears no rule", async () => {
+  const store = demo();
+  const convId = "conv-turn-blocked-order";
+  store.seedInboxConversation({ id: convId });
+  resetContext(AURORA, convId);
+  await seedConfirmableState(convId);
+  // A lock that bites the ORDER's target text ("… order sell cod") but not the
+  // hand-over's, so the refusal can be handed to a person rather than dying.
+  await store.setNoTouch(["COD"]);
+
+  const result = await runCustomerTurn(AURORA, convId, "hae", { mode: "live" });
+  assert.equal(result.action, "ESCALATE");
+  assert.ok(result.handoverActionId);
+  assert.equal(result.reply, "", "the server's holding line is what the customer gets");
+
+  assert.equal((await rowsOf(store, "create_order_from_chat", "blocked")).length, 1);
+  const [handed] = await rowsOf(store, "escalate_conversation", "executed");
+  assert.ok(handed);
+  const p = handed.payload as Record<string, unknown>;
+  assert.equal(p.reason, "guardrail_blocked", "not tool_failure — the FD-4 lesson");
+  assert.equal(p.department, "sales", "routed to whoever should pick it up");
+  // The model may never name a guardrail: the brief says a rule stopped it, the
+  // ledger row names WHICH, and the customer hears neither.
+  assert.doesNotMatch(String(p.summary), /no_touch|guardrail:|COD lock/i);
+  assert.match(String(p.summary), /shop's own rules/i);
+  resetContext(AURORA, convId);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Part 3 — the floors an adversarial review found missing
+//
+// Every test below FAILS on the code as it stood before this change, and each
+// one names the failure it pins. Three floors, one section each:
+//
+//   SAFETY      what may never reach a founder-facing string, and what may
+//               never be written on a caller's unverified word.
+//   IDEMPOTENCY what a redelivered key may and may not do — including the
+//               half a key alone cannot carry (which request it was, and
+//               whether the write either side of the row happened).
+//   HONESTY     one rule over every customer-facing string: never assert an
+//               outcome that is not determined, never assert state that was
+//               not read, never imply queued work is under way.
+//
+// The suite composes with the server-side unique floor being added in parallel
+// in dakio-api (`NovaAction @@unique([tenantId, type, dedupeKey])`) and assumes
+// none of it: the DemoStore has no such index, so every dedupe asserted here is
+// one this repo enforces on its own.
+// ═══════════════════════════════════════════════════════════════════════════
+
+import { orderActionKey, handoverActionKey, buildActionLine } from "./turn.js";
+import { PREPARED_DETAIL_BY_VERB, resolveDiscountAmount } from "./actions.js";
+import { newLiveContext } from "./state.js";
+
+/** A BD mobile and a street line — the two shapes no founder-facing string may carry. */
+const PII_STREET = "House 5, Road 2, Dhanmondi";
+const BD_PHONE_SHAPE = /(?:\+?880|0)1[3-9]\d{8}/;
+
+/** Fail ONE call to `method`, then restore it — a crash between two writes. */
+function failOnce(store: unknown, method: string, message: string): void {
+  const s = store as Record<string, (...a: unknown[]) => unknown>;
+  const original = s[method]!.bind(store);
+  let fired = false;
+  s[method] = (...args: unknown[]) => {
+    if (!fired) {
+      fired = true;
+      return Promise.reject(new Error(message));
+    }
+    return original(...args);
+  };
+}
+
+/** Rows and cards this case filed, ignoring whatever the Aurora seed ships. */
+async function filedBy(store: DemoStore, before: Set<string>, type: string) {
+  const rows = (await store.listActions()).filter((a) => a.type === type && !before.has(a.id));
+  const ids = new Set(rows.map((r) => r.id));
+  const cards = (await store.listDecisions()).filter((d) => ids.has(d.actionId));
+  return { rows, cards };
+}
+
+// ---------------------------------------------------------------------------
+// 12. SAFETY — the PII floor, over every verb
+// ---------------------------------------------------------------------------
+
+/**
+ * ONE table, all six verbs, both founder-facing surfaces.
+ *
+ * The rule was true of five of them and a hope on the sixth: `gateOrFile` ran
+ * `maskPhonesIn` over the title and the params line, and `performCreateOrder`
+ * — which does not pass through it — composed its title straight from
+ * `customerCity`/`customerDistrict`. Those are customer-typed free text, and
+ * the order verb is the ONE whose payload provably carries a phone and a street
+ * line, so the gap was on exactly the verb that could not afford it.
+ *
+ * Each case feeds the verb the worst payload the lane could hand it and reads
+ * back what actually got stored.
+ *
+ * TWO DIFFERENT CLAIMS, and the difference is deliberate. The PHONE claim is
+ * absolute — `maskPhonesIn` is a shape match, so it holds wherever the digits
+ * appear, including inside a customer's own sentence. The STREET claim is
+ * asserted only for the two verbs with a DEDICATED address field
+ * (`create_order_from_chat.customerAddress`, `update_order_contact.address`),
+ * because that is what the code can enforce: a street line a customer types
+ * INSIDE their cancellation reason travels with the reason, which the cancel
+ * verb files unabridged on purpose ("the only record of why a sale went away").
+ * Truncating it to chase a street pattern would lose the founder's one account
+ * of the cancellation; the honest boundary is that no verb COMPOSES a title out
+ * of an address field.
+ */
+const PII_CASES: Array<{ verb: string; lock?: string[]; street?: string; run: () => Promise<unknown> }> = [
+  {
+    verb: "create_order_from_chat",
+    // The verb whose payload has a DEDICATED street field — the one the header
+    // promises never reaches a title.
+    street: PII_STREET,
+    run: () =>
+      performCreateOrder(AURORA, {
+        // A zone as a customer types it, not as a form validates it.
+        payload: payloadFor("nm:pii:order-0", {
+          customerCity: `Savar (ring ${PHONE})`,
+          customerAddress: PII_STREET,
+        }),
+        receipt: RECEIPT,
+      }),
+  },
+  {
+    verb: "offer_chat_discount",
+    run: () =>
+      performOfferDiscount(AURORA, {
+        payload: discountPayload("nm:pii:discount-0", {
+          reason: `Buyer at ${PII_STREET} keeps calling from ${PHONE} about the price.`,
+        }),
+        receipt: GATE_RECEIPT,
+      }),
+  },
+  {
+    verb: "cancel_order_from_chat",
+    run: async () =>
+      performCancelOrder(AURORA, {
+        payload: cancelPayload("nm:pii:cancel-0", (await firstOrderWith(demo(), "placed")).id, {
+          reason: `Call me on ${PHONE}, I am not at ${PII_STREET} any more.`,
+        }),
+        receipt: GATE_RECEIPT,
+      }),
+  },
+  {
+    verb: "update_order_contact",
+    street: PII_STREET,
+    run: async () =>
+      performUpdateContact(AURORA, {
+        payload: contactPayload("nm:pii:addr-0", (await firstOrderWith(demo(), "placed")).id, {
+          address: PII_STREET,
+          phone: PHONE,
+        }),
+        receipt: GATE_RECEIPT,
+      }),
+  },
+  {
+    verb: "open_case",
+    run: () =>
+      performOpenCase(AURORA, {
+        payload: casePayload("nm:pii:case-0", {
+          title: `Parcel stuck at ${PII_STREET}, buyer rang from ${PHONE}`,
+          factsNote: `Customer says nobody came to ${PII_STREET}; reachable on ${PHONE}.`,
+        }),
+        receipt: GATE_RECEIPT,
+      }),
+  },
+  {
+    // A no-touch lock so the hand-over BLOCKS and files its own card — the only
+    // tier on which this verb authors a local Decision at all.
+    verb: "escalate_conversation",
+    lock: ["REFUND"],
+    run: () =>
+      performFlagHandover(AURORA, {
+        payload: handoverPayload("nm:pii:handover", {
+          summary: `Customer at ${PII_STREET} wants a refund and is calling from ${PHONE} about it.`,
+        }),
+        receipt: GATE_RECEIPT,
+      }),
+  },
+];
+
+test("PII floor: no verb's founder-facing title or params line can carry a phone or a street line", async () => {
+  for (const kase of PII_CASES) {
+    resetStores();
+    const store = demo();
+    store.seedInboxConversation({ id: CONV });
+    if (kase.lock) await store.setNoTouch(kase.lock);
+    const before = new Set((await store.listActions()).map((a) => a.id));
+
+    await kase.run();
+    const { rows, cards } = await filedBy(store, before, kase.verb);
+    assert.ok(rows.length >= 1, `${kase.verb}: the case must actually file a row to prove anything`);
+
+    for (const row of rows) {
+      assert.ok(!row.title.includes(PHONE), `${kase.verb}: the title outlives the card — it may not carry a full phone`);
+      assert.doesNotMatch(row.title, BD_PHONE_SHAPE, `${kase.verb}: no BD phone SHAPE in the title, whatever the digits`);
+      if (kase.street) assert.ok(!row.title.includes(kase.street), `${kase.verb}: the address FIELD may not reach the title`);
+    }
+    for (const card of cards) {
+      assert.ok(!card.paramsLine.includes(PHONE), `${kase.verb}: the params line is re-rendered where nobody re-audits it`);
+      assert.doesNotMatch(card.paramsLine, BD_PHONE_SHAPE, `${kase.verb}: no BD phone SHAPE in the params line`);
+      if (kase.street) assert.ok(!card.paramsLine.includes(kase.street), `${kase.verb}: nor the params line`);
+    }
+    // And the raw words survive where the founder reads them in context.
+    assert.ok(rows.every((r) => r.payload && typeof r.payload === "object"), `${kase.verb}: the payload is still filed`);
+  }
+});
+
+test("PII floor: the order verb masks its own title and card — the surface that was uncovered", async () => {
+  const store = demo();
+  const out = await performCreateOrder(AURORA, {
+    payload: payloadFor("nm:pii:order-solo", { customerCity: `Savar (ring ${PHONE})` }),
+    receipt: RECEIPT,
+  });
+  assert.equal(out.status, "prepared");
+  const [row] = await rowsOf(store, "create_order_from_chat", "prepared");
+  assert.ok(row);
+  assert.match(row.title, /···678/, "masked to the last three digits — the card's own convention");
+  assert.equal(orderTitle(payloadFor("k", { customerCity: `Savar (ring ${PHONE})` })).includes(PHONE), true,
+    "the helper still composes the raw string; the MASKER is what the gate applies");
+});
+
+// ---------------------------------------------------------------------------
+// 13. SAFETY — conversation scoping is a type, not a comment
+// ---------------------------------------------------------------------------
+
+test("scoping: an order id this conversation does not own cannot be scoped at all", () => {
+  assert.throws(
+    () => conversationOrderRef({ conversationId: CONV, orderId: "ord-stranger", conversationOrderIds: ["ord-mine"] }),
+    /not one of conversation/,
+    "the mint is where the proof obligation lives — a stranger's parcel never gets a ref",
+  );
+  assert.throws(() => conversationOrderRef({ conversationId: "", orderId: "ord-1", conversationOrderIds: ["ord-1"] }), /conversationId is required/);
+  const ref = conversationOrderRef({ conversationId: CONV, orderId: "ord-1", conversationOrderIds: ["ord-1", "ord-2"] });
+  assert.equal(ref.orderId, "ord-1");
+  assert.equal(ref.conversationId, CONV, "the thread travels WITH the id — a ref minted for one thread cannot be filed under another");
+});
+
+test("scoping: both mutating verbs refuse a hand-built ref, and the order never moves", async () => {
+  const store = demo();
+  await setTier(store, 4, { "inbox.cancelAuto": true, "inbox.addressEditAuto": true });
+  const order = await firstOrderWith(store, "placed");
+  const forged = { orderId: order.id, conversationId: CONV } as never;
+
+  await assert.rejects(
+    () => performCancelOrder(AURORA, { payload: { novaActionId: "nm:scope:cancel", order: forged, reason: "Stop this parcel please." }, receipt: GATE_RECEIPT }),
+    /ConversationOrderRef/,
+  );
+  await assert.rejects(
+    () => performUpdateContact(AURORA, { payload: { novaActionId: "nm:scope:addr", order: forged, address: "Somewhere else" }, receipt: GATE_RECEIPT }),
+    /ConversationOrderRef/,
+  );
+  assert.equal((await store.getOrder(order.id))!.status, "placed", "nothing was written on an unscoped id");
+  assert.equal((await rowsOf(store, "cancel_order_from_chat")).length, 0, "and no row was filed either");
+});
+
+test("scoping: the wire payload still carries orderId + conversationId, exactly as the approve executor reads them", async () => {
+  const store = demo();
+  const order = await firstOrderWith(store, "placed");
+  await performCancelOrder(AURORA, { payload: cancelPayload("nm:scope:wire", order.id), receipt: GATE_RECEIPT });
+  const [row] = await rowsOf(store, "cancel_order_from_chat", "prepared");
+  const p = row!.payload as Record<string, unknown>;
+  assert.equal(p.orderId, order.id);
+  assert.equal(p.conversationId, CONV);
+  assert.equal(p.order, undefined, "the lane-side ref does not travel on the wire");
+});
+
+// ---------------------------------------------------------------------------
+// 14. SAFETY — free delivery: no agent-guessed money on the wire
+// ---------------------------------------------------------------------------
+
+test("free delivery: no tier reaches the wire with an agent-computed amount today", async () => {
+  const store = demo();
+  // The most permissive setting this repo can express.
+  await setTier(store, 4, { ...DISCOUNT_PLATFORM, "inbox.discountAuto": true });
+  const out = await performOfferDiscount(AURORA, {
+    payload: discountPayload("nm:fd:0", { mechanism: "free_delivery", percentOff: undefined, reason: "Delivery is the whole objection on this cart." }),
+    receipt: GATE_RECEIPT,
+  });
+  // `checkGuardrails`' non-percent branch returns needs_approval unconditionally
+  // (a percent ceiling cannot judge a taka amount), so the direct tier is
+  // unreachable for this mechanism and the SERVER prices it at approve time.
+  assert.equal(out.status, "prepared");
+  const [row] = await rowsOf(store, "offer_chat_discount", "prepared");
+  const p = row!.payload as Record<string, unknown>;
+  assert.equal(p.mechanism, "free_delivery");
+  assert.equal(p.amount, undefined, "the mechanism travels; the money figure does not");
+  assert.equal(p.percentOff, undefined);
+  assert.equal((await novaCoupons(store)).length, 0);
+});
+
+test("free delivery: the one agent-side money computation is READ from the store and labelled a server gap", async () => {
+  const store = demo();
+  const settings = await store.getStoreSettings();
+  const expected = Math.max(settings.deliveryInsideDhaka ?? 0, settings.deliveryOutsideDhaka ?? 0);
+
+  const resolved = await resolveDiscountAmount(store, discountPayload("k", { mechanism: "free_delivery", percentOff: undefined }));
+  assert.equal(resolved.amount, expected, "read from the shop's own two charges — never estimated, never a fallback figure");
+  assert.ok(resolved.evidence, "and it says so on the receipt, or a reader concludes the server priced it");
+  assert.equal(resolved.evidence!.source, "tool:get_store_settings");
+  assert.equal(resolved.evidence!.metric, "server_gap");
+  assert.match(resolved.evidence!.note, /no free-delivery mechanism/i, "the route citation is the whole justification");
+
+  // A percent or taka offer computes nothing at all and files no such evidence.
+  assert.equal((await resolveDiscountAmount(store, discountPayload("k"))).evidence, null);
+  const fixed = await resolveDiscountAmount(store, discountPayload("k", { mechanism: "fixed", percentOff: undefined, amount: 200 }));
+  assert.equal(fixed.amount, 200, "the founder's own figure, straight through — no ×100");
+  assert.equal(fixed.evidence, null);
+});
+
+// ---------------------------------------------------------------------------
+// 15. IDEMPOTENCY — the halves a key alone does not carry
+// ---------------------------------------------------------------------------
+
+test("replay: a key reused for a DIFFERENT payload is refused loudly, not answered from the old row", async () => {
+  const store = demo();
+  await setTier(store, 3);
+  const first = await performOpenCase(AURORA, {
+    payload: casePayload("nm:fp:case-0", { title: "Parcel has not moved for three days", factsNote: "Courier scan unchanged since Tuesday." }),
+    receipt: GATE_RECEIPT,
+  });
+  assert.equal(first.status, "executed");
+
+  // Same key, a different problem. Before the fingerprint this returned the
+  // delivery-stuck row's outcome, and the customer who reported a broken bottle
+  // was told a delivery case was open.
+  await assert.rejects(
+    () =>
+      performOpenCase(AURORA, {
+        payload: casePayload("nm:fp:case-0", { kind: "damaged_item", title: "Bottle arrived dented and leaking", factsNote: "Customer sent a photo of a dented lid." }),
+        receipt: GATE_RECEIPT,
+      }),
+    /already filed for a DIFFERENT payload/,
+  );
+  assert.equal((await rowsOf(store, "open_case", "executed")).length, 1, "and nothing new was written");
+
+  // The same payload still replays — the check is on the REQUEST, not the clock.
+  const replay = await performOpenCase(AURORA, {
+    payload: casePayload("nm:fp:case-0", { title: "Parcel has not moved for three days", factsNote: "Courier scan unchanged since Tuesday." }),
+    receipt: GATE_RECEIPT,
+  });
+  assert.equal(replay.actionId, first.actionId);
+  assert.equal(replay.status === "executed" && replay.replayed, true);
+});
+
+test("replay: the fingerprint rides on the row, and key order does not change it", async () => {
+  const store = demo();
+  await performCreateOrder(AURORA, { payload: payloadFor("nm:fp:order-0"), receipt: RECEIPT });
+  const [row] = await rowsOf(store, "create_order_from_chat", "prepared");
+  const stamped = row!.receipt.evidence.find((e) => e.source === "idempotency" && e.metric === "payload_fingerprint");
+  assert.ok(stamped, "every row this file writes names WHICH request its key stood for");
+  assert.equal(stamped.value, payloadFingerprint(payloadFor("nm:fp:order-0") as unknown as Record<string, unknown>));
+  assert.equal(
+    payloadFingerprint({ a: 1, b: { c: 2, d: 3 } }),
+    payloadFingerprint({ b: { d: 3, c: 2 }, a: 1 }),
+    "a re-serialized payload is the same request",
+  );
+  assert.notEqual(payloadFingerprint({ a: 1 }), payloadFingerprint({ a: 2 }));
+});
+
+test("replay: a prepared row whose Decision was lost gets it filed on the next delivery", async () => {
+  const store = demo();
+  const before = new Set((await store.listActions()).map((a) => a.id));
+  failOnce(store, "addDecision", "desk unavailable");
+
+  const payload = casePayload("nm:heal:case-0");
+  const first = await performOpenCase(AURORA, { payload, receipt: GATE_RECEIPT });
+  assert.equal(first.status, "prepared");
+  assert.equal((await filedBy(store, before, "open_case")).cards.length, 0, "the card really was lost");
+
+  const second = await performOpenCase(AURORA, { payload, receipt: GATE_RECEIPT });
+  assert.equal(second.actionId, first.actionId, "still ONE row — healing is not re-filing");
+  const healed = await filedBy(store, before, "open_case");
+  assert.equal(healed.rows.length, 1);
+  assert.equal(healed.cards.length, 1, "the founder can finally see the ask");
+  assert.equal(healed.cards[0]!.kind, "proposal", "a replayed row is never an escalation — blocked rows do not replay");
+
+  // A third delivery must not file a SECOND card on top of the healed one.
+  await performOpenCase(AURORA, { payload, receipt: GATE_RECEIPT });
+  assert.equal((await filedBy(store, before, "open_case")).cards.length, 1);
+});
+
+test("discount: the ledger row exists BEFORE the coupon — a lost claim mints nothing", async () => {
+  const store = demo();
+  await setTier(store, 3, { ...DISCOUNT_PLATFORM, "inbox.discountAuto": true });
+  const couponsBefore = (await novaCoupons(store)).length;
+  failOnce(store, "addAction", "ledger unavailable");
+
+  const payload = discountPayload("nm:claim:discount-0");
+  await assert.rejects(() => performOfferDiscount(AURORA, { payload, receipt: GATE_RECEIPT }), /ledger unavailable/);
+  assert.equal(
+    (await novaCoupons(store)).length - couponsBefore,
+    0,
+    "the claim row is the FIRST write: if it cannot be filed, no coupon is minted",
+  );
+
+  // And the retry issues exactly one.
+  const out = await performOfferDiscount(AURORA, { payload, receipt: GATE_RECEIPT });
+  assert.equal(out.status, "executed");
+  assert.equal((await novaCoupons(store)).length - couponsBefore, 1);
+});
+
+test("discount: a lost FINALIZE leaves one coupon, and the replay answers with that same code", async () => {
+  const store = demo();
+  await setTier(store, 3, { ...DISCOUNT_PLATFORM, "inbox.discountAuto": true });
+  const couponsBefore = (await novaCoupons(store)).length;
+  // The claim files, the coupon mints, and the row never reaches `executed`.
+  failOnce(store, "updateAction", "ledger unavailable");
+
+  const payload = discountPayload("nm:claim:discount-1");
+  await assert.rejects(() => performOfferDiscount(AURORA, { payload, receipt: GATE_RECEIPT }), /ledger unavailable/);
+  const stranded = (await novaCoupons(store)).slice(couponsBefore);
+  assert.equal(stranded.length, 1, "the coupon is out there");
+  const claim = (await rowsOf(store, "offer_chat_discount", "prepared")).at(-1)!;
+  assert.ok(
+    claim.receipt.evidence.some((e) => e.source === "idempotency" && e.metric === "claim"),
+    "and the row that names it is already on the ledger",
+  );
+
+  const replay = await performOfferDiscount(AURORA, { payload, receipt: GATE_RECEIPT });
+  assert.equal(replay.status, "executed");
+  assert.equal(replay.status === "executed" && replay.replayed, true);
+  assert.equal(replay.status === "executed" && replay.code, stranded[0]!.code, "the customer holds ONE code, and it is the one that exists");
+  assert.equal((await novaCoupons(store)).length - couponsBefore, 1, "the replay did not mint a second coupon for one negotiation");
+  assert.equal((await rowsOf(store, "offer_chat_discount", "executed")).length, 1);
+  assert.equal(await cardsFor(store, "offer_chat_discount"), 0, "a claim row is not a founder ask and never grows a card");
+});
+
+test("cancel: the status to restore survives a re-execution", async () => {
+  const store = demo();
+  await setTier(store, 4, { "inbox.cancelAuto": true });
+  const order = await firstOrderWith(store, "placed");
+  // The claim files, the order really cancels, and the finalize is lost.
+  failOnce(store, "updateAction", "ledger unavailable");
+
+  const payload = cancelPayload("nm:claim:cancel-0", order.id);
+  await assert.rejects(() => performCancelOrder(AURORA, { payload, receipt: GATE_RECEIPT }), /ledger unavailable/);
+  assert.equal((await store.getOrder(order.id))!.status, "cancelled", "the world moved on the first attempt");
+
+  const replay = await performCancelOrder(AURORA, { payload, receipt: GATE_RECEIPT });
+  assert.equal(replay.status, "executed");
+  const [row] = await rowsOf(store, "cancel_order_from_chat", "executed");
+  const undo = row!.undoData as Record<string, unknown>;
+  // Read fresh, this would say 'cancelled' — an undo that restores 'cancelled'
+  // is an undo that does nothing, and the founder's one way back is gone.
+  assert.equal(undo.previousStatus, "placed", "the ORIGINAL status, persisted on the claim before the write");
+  assert.equal(replay.status === "executed" && replay.previousStatus, "placed");
+  assert.equal(row!.receipt.before?.status, "placed");
+  assert.equal((await rowsOf(store, "cancel_order_from_chat", "executed")).length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// 16. IDEMPOTENCY — the keys the turn derives
+// ---------------------------------------------------------------------------
+
+test("keys: shadow and live derive the SAME order key from the same state", async () => {
+  const store = demo();
+  const convId = "conv-key-agreement";
+  store.seedInboxConversation({ id: convId });
+  resetContext(AURORA, convId);
+  await seedConfirmableState(convId);
+
+  // One order is already on the founder's desk for this thread.
+  const ctx = loadContext(AURORA, convId, "chat", 0);
+  ctx.pendingOrders = [{ actionId: "act-already-filed", title: "Insulated Steel Bottle 750ml" }];
+  saveContext(ctx);
+  const expected = orderActionKey(loadContext(AURORA, convId, "chat", 0));
+  assert.equal(expected, `nm:${convId}:order-1`, "placed AND pending both count — the live path's rule");
+
+  const shadow = await runCustomerTurn(AURORA, convId, "hae", { mode: "shadow" });
+  assert.equal(shadow.wouldHaveDone!.type, "create_chat_order");
+  assert.equal(
+    shadow.wouldHaveDone!.novaActionId,
+    expected,
+    "the shadow dataset must record the key the live write would mint, or it is a record of a write live never makes",
+  );
+  resetContext(AURORA, convId);
+});
+
+test("keys: the derivation counts placed and pending orders, and rolls with the session", () => {
+  const ctx = newLiveContext("conv-k", AURORA);
+  assert.equal(orderActionKey(ctx), "nm:conv-k:order-0");
+  ctx.orders.push({ no: "1001", title: "Bottle", total: 3599 });
+  assert.equal(orderActionKey(ctx), "nm:conv-k:order-1");
+  ctx.pendingOrders = [{ actionId: "a1", title: "Mug" }];
+  assert.equal(orderActionKey(ctx), "nm:conv-k:order-2", "a second sale while the first waits gets its own key");
+
+  assert.equal(handoverActionKey(ctx), "nm:conv-k:handover");
+  const rolled = newLiveContext("conv-k", AURORA, "chat", 3);
+  assert.equal(handoverActionKey(rolled), "nm:conv-k:e3:handover");
+  assert.equal(orderActionKey(rolled), "nm:conv-k:e3:order-0");
+  assert.equal(
+    handoverActionKey(newLiveContext("conv-k", AURORA, "chat", 0)),
+    "nm:conv-k:handover",
+    "epoch 0 keeps the legacy key shape, so rows already in ledgers keep matching",
+  );
+});
+
+test("handover: a thread the founder handed back can be escalated again", async () => {
+  const store = demo();
+  const convId = "conv-reescalate";
+  store.seedInboxConversation({ id: convId });
+  resetContext(AURORA, convId);
+
+  const first = await runCustomerTurn(AURORA, convId, "human", { mode: "live", epoch: 0 });
+  assert.equal(first.action, "ESCALATE");
+  assert.equal((await rowsOf(store, "escalate_conversation", "executed")).length, 1);
+
+  // Redelivery of the SAME turn inside the session still dedupes — the key is
+  // constant within a session, which is what at-most-once means here.
+  resetContext(AURORA, convId);
+  await runCustomerTurn(AURORA, convId, "human", { mode: "live", epoch: 0 });
+  assert.equal((await rowsOf(store, "escalate_conversation", "executed")).length, 1, "one escalation per session, however many deliveries");
+
+  // The founder answers and hands it back; dakio-api rolls the session.
+  const second = await runCustomerTurn(AURORA, convId, "human", { mode: "live", epoch: 1 });
+  assert.equal(second.action, "ESCALATE");
+  const rows = await rowsOf(store, "escalate_conversation", "executed");
+  assert.equal(rows.length, 2, "escalation was once-per-conversation-FOREVER — a re-escalated thread could never reach a person again");
+  assert.equal((rows[1]!.payload as Record<string, unknown>).novaActionId, `nm:${convId}:e1:handover`);
+  resetContext(AURORA, convId);
+});
+
+// ---------------------------------------------------------------------------
+// 17. HONESTY — one rule, every customer-facing string
+// ---------------------------------------------------------------------------
+
+/**
+ * The three ways a line can lie, as patterns.
+ *
+ * Every one of these fired on the code before this change:
+ *   "will be placed as approved"        (order)     — the founder may reject it
+ *   "they will confirm it"              (cancel)    — likewise
+ *   "nothing has shipped on it"         (cancel)    — nothing read the order
+ *   "before the parcel goes out"        (contact)   — likewise
+ *   "They will confirm the change"      (contact)   — the founder may reject it
+ *   "the shop is picking it up"         (case)      — only a card is queued
+ *   "The thread is being handed"        (handover)  — a prepared row moved nothing
+ *   "will confirm shortly"              (turn line) — nothing bounds the wait
+ *   "will take over shortly"            (turn line) — likewise, and on a BLOCKED
+ *                                                     hand-over nothing was handed
+ */
+const DISHONEST_WORDING: Array<{ pattern: RegExp; why: string }> = [
+  { pattern: /\bwill (?:confirm|approve|be placed|be issued|take over|reply|call|get back)\b/i, why: "asserts an outcome the founder has not given" },
+  { pattern: /\b(?:shortly|soon|right away|straight away|in a moment)\b/i, why: "promises a timeframe nothing bounds" },
+  { pattern: /\bnothing has shipped\b/i, why: "asserts parcel state nothing on this path read" },
+  { pattern: /before the parcel goes out/i, why: "asserts pre-dispatch state the server alone knows" },
+  { pattern: /\bpicking it up\b|\bis being handed\b|\bis working on\b|\bhas started\b/i, why: "implies queued work is under way" },
+  { pattern: /\balready (?:cancelled|changed|done|issued)\b/i, why: "asserts a completed write on a tier that wrote nothing" },
+];
+
+/** Every string this lane can put in front of a customer, in one list. */
+async function customerFacingLines(): Promise<Array<{ where: string; text: string }>> {
+  const ctx = newLiveContext("conv-wording", AURORA);
+  const lines: Array<{ where: string; text: string }> = [];
+  for (const [verb, detail] of Object.entries(PREPARED_DETAIL_BY_VERB)) {
+    lines.push({ where: `${verb} preparedDetail`, text: detail() });
+  }
+  lines.push({ where: "turn ORDER_PENDING_APPROVAL", text: buildActionLine(ctx, "ORDER_PENDING_APPROVAL", "") });
+  lines.push({ where: "turn ESCALATE (shadow / not run)", text: buildActionLine(ctx, "ESCALATE", "") });
+  lines.push({ where: "turn ESCALATE (blocked)", text: buildActionLine(ctx, "ESCALATE", "", { handoverOutcome: "blocked" }) });
+  lines.push({ where: "turn ANSWER_ORDER_STATUS", text: buildActionLine(ctx, "ANSWER_ORDER_STATUS", "") });
+  lines.push({ where: "turn DECLINE_DISCOUNT_ONCE", text: buildActionLine(ctx, "DECLINE_DISCOUNT_ONCE", "") });
+  return lines;
+}
+
+test("honesty: no verb's customer-facing wording asserts an undetermined outcome, unread state, or completed queued work", async () => {
+  const lines = await customerFacingLines();
+  assert.equal(lines.length, 11, "all six verbs plus the turn's own instruction lines");
+  for (const line of lines) {
+    for (const rule of DISHONEST_WORDING) {
+      assert.doesNotMatch(line.text, rule.pattern, `${line.where}: ${rule.why} — "${line.text}"`);
+    }
+  }
+});
+
+test("honesty: each prepared line still says the ONE thing that is determined — it reached the shop", async () => {
+  const lines = Object.entries(PREPARED_DETAIL_BY_VERB).map(([verb, detail]) => [verb, detail()] as const);
+  for (const [verb, text] of lines) {
+    assert.match(text, /shop|owner/i, `${verb}: the customer is owed the fact that a person now has it`);
+  }
+  // And the delicate ones still carry their own load-bearing clause.
+  assert.match(PREPARED_DETAIL_BY_VERB.cancel_order_from_chat(), /not cancelled yet/i);
+  assert.match(PREPARED_DETAIL_BY_VERB.create_order_from_chat(), /shop confirms/i, "FD-3: the normal flow, never an apology");
+  assert.doesNotMatch(PREPARED_DETAIL_BY_VERB.offer_chat_discount(), /NOVA[A-Z0-9]/, "no code exists yet, so none may be named");
+  assert.doesNotMatch(PREPARED_DETAIL_BY_VERB.open_case(), /\bcase\b/i, "no case exists yet, so none may be announced");
+});
+
+test("honesty: a BLOCKED hand-over does not tell the customer a person is taking over", async () => {
+  const store = demo();
+  const convId = "conv-blocked-handover-reply";
+  store.seedInboxConversation({ id: convId });
+  resetContext(AURORA, convId);
+  // A lock that bites the hand-over's own summary, so the gate REFUSES it.
+  await store.setNoTouch(["REFUND"]);
+
+  const out = await performFlagHandover(AURORA, {
+    payload: handoverPayload("nm:blocked:handover", {
+      summary: "Customer wants a refund on a delivered parcel and will not accept an exchange.",
+    }),
+    receipt: GATE_RECEIPT,
+  });
+  assert.equal(out.status, "blocked", "the action-level state the old suite already pinned");
+
+  // THE PART THAT WAS NEVER TESTED: what the customer is told afterwards.
+  // Nova is still on the thread, no card reached anyone, and no holding line
+  // was sent — so the reply may not promise a person on any clause.
+  const ctx = newLiveContext(convId, AURORA);
+  const blocked = buildActionLine(ctx, "ESCALATE", "", { handoverOutcome: "blocked" });
+  assert.match(blocked, /promise NO person/i);
+  assert.doesNotMatch(blocked, /\bwill take over\b/i);
+  assert.doesNotMatch(blocked, /\bshortly\b/i);
+  assert.match(blocked, /never mention the shop's internal rules/i, "the founder's lock is the shop's own business");
+  // The executed path is the ONLY one that may speak of a person, and even it
+  // does not promise when.
+  const executed = buildActionLine(ctx, "ESCALATE", "");
+  assert.match(executed, /taking this over/i);
+  assert.doesNotMatch(executed, /\bshortly\b/i);
+  assert.notEqual(blocked, executed, "the two states must not share a sentence");
+  resetContext(AURORA, convId);
+});
+
+test("honesty: the pending-order line carries FD-3 without promising when or inventing a number", async () => {
+  const ctx = newLiveContext("conv-pending-line", AURORA);
+  const line = buildActionLine(ctx, "ORDER_PENDING_APPROVAL", "");
+  assert.match(line, /double-checks every chat order/i, "the normal flow, stated as normal");
+  assert.match(line, /no apology/i);
+  assert.match(line, /give NO timeframe/i);
+  assert.match(line, /do NOT invent an order number/i);
+  assert.doesNotMatch(line, /\bshortly\b/i, "nothing bounds a founder's response time");
 });
