@@ -21,12 +21,19 @@ import {
   computeStage,
   fact,
   isFresh,
+  maskPhonesIn,
   pushMessage,
   type NovaLiveContext,
 } from "./state.js";
 import { feeForZone, focusProduct, hydratePolicies, resolveProduct, variantIdFor, variantStock } from "./hydrate.js";
 import { listProducts, type DakioProduct } from "./dakio.js";
-import { performCreateOrder, type ChatOrderGatePayload } from "./actions.js";
+import {
+  performCreateOrder,
+  performFlagHandover,
+  type ChatOrderGatePayload,
+  type EscalationReason,
+  type HandoverDepartment,
+} from "./actions.js";
 import { getStoreProfile } from "../lib/store.js";
 import { resolverAgent, resolverSchema, writerAgent, writerSystem } from "./agents.js";
 import { withGatewayRetry } from "../lib/gateway-retry.js";
@@ -72,6 +79,8 @@ export interface TurnResult {
   order?: { orderNumber: string; total: number };
   /** Live, approval tier: the prepared `create_order_from_chat` action on the founder's desk. */
   pendingActionId?: string;
+  /** Live: the executed (or blocked) `escalate_conversation` row for this thread. */
+  handoverActionId?: string;
   timings: Record<string, number>;
   cacheHits: number;
   version: number;
@@ -254,8 +263,12 @@ async function executeTurn(
   // action/Decision and the reply carries FD-3 honestly.
   let order: TurnResult["order"];
   let pendingActionId: string | undefined;
+  let handoverActionId: string | undefined;
   let facts = "";
   let draftSuppressed = false;
+  /** True when this turn's ESCALATE came from the order gate refusing, not from
+   *  the customer asking — it decides the escalation reason below. */
+  let orderGateBlocked = false;
   if (action === "CREATE_ORDER") {
     if (mode === "shadow") {
       wouldHaveDone = {
@@ -289,7 +302,81 @@ async function executeTurn(
       } else {
         action = gate.fallback;
         facts = gate.reason;
+        // `hardValidateAndCreate` returns fallback ESCALATE only for a gate
+        // BLOCK (a founder lock or a rule Nova may not cross). Every other
+        // fallback is an ordinary ladder step.
+        if (gate.fallback === "ESCALATE") orderGateBlocked = true;
       }
+    }
+  }
+
+  // ---- Hand-over gate: ESCALATE ---------------------------------------------
+  // The second write this pipeline can reach, and the only other call site of a
+  // dakio-api mutation in this file. `escalate_conversation` is NEVER_GATED, so
+  // in live mode it executes at every tier — asking for a human has to work at
+  // the lowest autonomy setting. SHADOW never enters the gate: a handover locks
+  // a real thread and queues a real customer message, so the decided hand-off
+  // is recorded as `wouldHaveDone` and nothing is called.
+  if (action === "ESCALATE") {
+    const route = handoverRoute(classified.intent, orderGateBlocked);
+    const key = `nm:${ctx.convId}:handover`;
+    if (mode === "shadow") {
+      wouldHaveDone = {
+        type: "escalate_conversation",
+        novaActionId: key,
+        conversationId: ctx.convId,
+        reason: route.reason,
+        department: route.department,
+      };
+    } else {
+      const brief = escalationBrief(ctx, route.reason);
+      const hand = await performFlagHandover(ctx.storeId, {
+        payload: {
+          novaActionId: key,
+          // Taken from the turn envelope, never from model output: this lane has
+          // no `scopedConversationId` seam and must not pretend to one.
+          conversationId: ctx.convId,
+          reason: route.reason,
+          department: route.department,
+          summary: brief.summary,
+          summaryBn: brief.summaryBn,
+          // `factsChecked` comes from real reads only — the tool ledger this
+          // turn actually wrote. Nothing is synthesized.
+          factsChecked: factsCheckedFrom(ctx),
+        },
+        receipt: {
+          reason: brief.summary,
+          expectedImpact: "A person from the shop takes this thread over.",
+          confidence: classified.confidence,
+          evidence: [
+            {
+              source: "conversation",
+              note: `intent ${classified.intent} at stage ${ctx.conversation.stage}`,
+              metric: "reason",
+              value: route.reason,
+            },
+          ],
+        },
+      });
+      handoverActionId = hand.actionId;
+      ctx.toolLedger.push({
+        tool: "escalate_conversation",
+        args: { reason: route.reason, department: route.department, gate: hand.status },
+        raw: hand.detail,
+        calledAt: Date.now(),
+        ok: hand.status === "executed",
+      });
+      if (hand.status === "executed") {
+        // The SERVER owns the holding line (a deterministic template chosen by
+        // reason — and deliberately NO line at all for `fraud_risk`, where a
+        // holding bubble would be both untrue and a tip-off). A writer draft on
+        // top of it is a second bubble at best; suppress it, exactly as the
+        // post-handover lock path above already returns an empty reply.
+        draftSuppressed = true;
+      }
+      // A BLOCKED handover is the other case: Nova is still on the thread and
+      // still owes an answer, so the draft stands. The founder's rule stays on
+      // the ledger row — the customer never hears it.
     }
   }
 
@@ -356,6 +443,7 @@ async function executeTurn(
     stateCard: renderStateCard(ctx),
     order,
     ...(pendingActionId ? { pendingActionId } : {}),
+    ...(handoverActionId ? { handoverActionId } : {}),
     timings,
     cacheHits,
     version: ctx.version,
@@ -527,6 +615,110 @@ async function hardValidateAndCreate(ctx: NovaLiveContext): Promise<GateResult> 
     reason: "",
     fallback: "PRESENT_SUMMARY",
   };
+}
+
+// ---------------------------------------------------------------------------
+// Hand-over composition — deterministic, from state, never from model output
+// ---------------------------------------------------------------------------
+
+/**
+ * Which slug and which room, decided by the app.
+ *
+ * `tool_failure` is NOT a catch-all and is deliberately unreachable from here:
+ * it maps to the "Nova is not sure" holding template and its founder label
+ * reads "Nova could not check", so using it for anything but a tool that
+ * actually errored is the wrong sentence twice over. A blocked order gate is
+ * `guardrail_blocked`; a complaint Nova cannot settle is `anger`; anything else
+ * that reaches ESCALATE is honestly `lost`.
+ *
+ * `anger` for the `complaint` intent is a JUDGEMENT worth naming: the L0
+ * classifier fires on vanga/nosto/kharap/refund/problem/wrong, i.e. a
+ * dissatisfied customer, and `anger` is the taxonomy's bucket for that. A finer
+ * classifier that could tell "the box arrived broken" from "you charged me
+ * twice" would route the first to `open_case(damaged_item)` and the second to
+ * `payment_dispute`; neither distinction exists in `classify.ts` today, and
+ * inventing one here would be the app guessing rather than deciding.
+ */
+function handoverRoute(
+  intent: Intent,
+  orderGateBlocked: boolean,
+): { reason: EscalationReason; department: HandoverDepartment } {
+  if (orderGateBlocked) return { reason: "guardrail_blocked", department: "sales" };
+  if (intent === "human_ask") return { reason: "human_ask", department: "support" };
+  if (intent === "complaint") return { reason: "anger", department: "support" };
+  return { reason: "lost", department: "support" };
+}
+
+/**
+ * The founder's brief, in both halves.
+ *
+ * Composed from STATE, not from the customer's message text: in nova-ai this
+ * summary is model-authored inside a tool whose payload cannot hold a phone,
+ * and the equivalent discipline here is to build it from facts the app already
+ * owns. `summaryBn` is a real Bangla sentence — not the English text, not a
+ * transliteration, and not a placeholder to satisfy the length check.
+ *
+ * The guardrail case never names the rule. That stays on the ledger row.
+ */
+function escalationBrief(ctx: NovaLiveContext, reason: EscalationReason): { summary: string; summaryBn: string } {
+  const focus = ctx.hydrated.product?.value?.name;
+  const focusEn = focus ? `Product in focus: ${focus}.` : "No product in focus.";
+  const focusBn = focus ? `আলোচিত পণ্য: ${focus}।` : "কোনো পণ্য নির্দিষ্ট হয়নি।";
+  const orders = ctx.orders.map((o) => `#${o.no}`).join(", ");
+  const ordersEn = orders ? ` Orders in this thread: ${orders}.` : "";
+  const ordersBn = orders ? ` এই থ্রেডের অর্ডার: ${orders}।` : "";
+  const stageEn = ` Stage: ${ctx.conversation.stage}.`;
+
+  const lead: Record<EscalationReason, [string, string]> = {
+    human_ask: [
+      "Customer asked to speak to a person.",
+      "ক্রেতা একজন মানুষের সাথে কথা বলতে চেয়েছেন।",
+    ],
+    anger: [
+      "Customer raised a complaint Nova cannot settle from the thread.",
+      "ক্রেতা এমন একটি অভিযোগ করেছেন যা নোভা থ্রেড থেকে মীমাংসা করতে পারে না।",
+    ],
+    guardrail_blocked: [
+      "A chat order could not be placed under this shop's own rules, so the thread needs you.",
+      "দোকানের নিজের নিয়মের কারণে চ্যাট অর্ডারটি বসানো যায়নি, তাই থ্রেডটি আপনাকে দেখতে হবে।",
+    ],
+    lost: [
+      "Nova could not carry this conversation further on its own.",
+      "নোভা নিজে থেকে এই কথোপকথনটি আর এগিয়ে নিতে পারছে না।",
+    ],
+    // Reachable only if `handoverRoute` grows a branch for them; the pairs are
+    // here so a new branch cannot ship with an English-only brief.
+    payment_dispute: ["Customer disputes a payment on this thread.", "ক্রেতা এই থ্রেডে একটি পেমেন্ট নিয়ে আপত্তি তুলেছেন।"],
+    legal: ["This thread raises a legal matter.", "এই থ্রেডে একটি আইনি বিষয় উঠে এসেছে।"],
+    negotiation: ["Customer is negotiating beyond what Nova may offer.", "ক্রেতা এমন দর-কষাকষি করছেন যা নোভার সীমার বাইরে।"],
+    vip: ["A priority customer is on this thread.", "এই থ্রেডে একজন গুরুত্বপূর্ণ ক্রেতা আছেন।"],
+    tool_failure: ["A tool Nova needed did not answer.", "নোভার প্রয়োজনীয় একটি টুল সাড়া দেয়নি।"],
+    fraud_risk: ["This thread looks like a fraud risk.", "এই থ্রেডটি প্রতারণার ঝুঁকির মতো দেখাচ্ছে।"],
+    policy_gap: ["The shop has no written rule covering what was asked.", "যা জানতে চাওয়া হয়েছে তার কোনো লিখিত নিয়ম দোকানের নেই।"],
+    catalog_gap: ["The shop does not carry what was asked for.", "যা চাওয়া হয়েছে দোকানে তা নেই।"],
+  };
+
+  const [en, bnText] = lead[reason];
+  return {
+    summary: `${en} ${focusEn}${ordersEn}${stageEn}`,
+    summaryBn: `${bnText} ${focusBn}${ordersBn}`,
+  };
+}
+
+/** Real reads only — the tool ledger this turn actually wrote, phones masked. */
+function factsCheckedFrom(ctx: NovaLiveContext): Array<{ source: string; note: string }> {
+  return ctx.toolLedger.slice(-6).map((entry) => {
+    let args = "";
+    try {
+      args = JSON.stringify(entry.args) ?? "";
+    } catch {
+      args = "(unserializable args)";
+    }
+    return {
+      source: entry.tool,
+      note: maskPhonesIn(`${entry.ok ? "checked ok" : "did not succeed"}: ${args}`).slice(0, 200),
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
