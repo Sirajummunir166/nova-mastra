@@ -1,4 +1,8 @@
-import "dotenv/config";
+// FIRST, and it must stay first: loads .env and routes fetch through the
+// environment's proxy before any module that could make an outbound call is
+// evaluated. See src/boot.ts for why this is an import and not a call.
+import "./boot.js";
+
 import express, { type Request, type Response } from "express";
 import { MastraServer } from "@mastra/express";
 import { mastra } from "./mastra/index.js";

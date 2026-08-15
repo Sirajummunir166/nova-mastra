@@ -37,7 +37,19 @@ hourly, and the lanes that act on what it finds.
    *"NOTHING is on order… There is no date to give"* — **0 model calls**,
    because the honesty fork is arithmetic and a model invited to word a
    supply position it cannot check is how "next week" gets invented.
-6. **A sixth sense, honestly.** Courier data collected for months is now read
+6. **The model layer is measured, not assumed.** `openai/gpt-5.6-luna` through
+   the Vercel AI Gateway, four turns, all four succeeded:
+
+   | | eve (measured) | Nova on Mastra |
+   |---|---|---|
+   | founder's opener | p50 **26,666** in-tokens | **425** in-tokens |
+   | latency | p50 **29.4 s** | **3.6 s** |
+
+   The opener attaches zero tools because the snapshot already answers it —
+   that is the whole 63× difference. Asked what the pending orders are worth,
+   the model answered *"not available in the current snapshot"* rather than
+   inventing a figure. The pulse judge returned valid structured output.
+7. **A sixth sense, honestly.** Courier data collected for months is now read
    and watched — with rates refused below an evidence floor, no claim from a
    truncated window, and `onTimeRate` null forever because the schema has no
    promised-delivery date to compute one from.
@@ -69,10 +81,25 @@ would have shipped:
    the live stack** — no order in the dev database has a stale scan. Its
    producer flag stays OFF until one drill on a seeded stuck parcel.
    `NOVA_RESTOCK_CHECK_PRODUCER` is ON and proven; the courier one is not.
-2. **The pulse's judge has never met a real model.** Every count above is the
-   deterministic path; the judgement step is exercised only by fakes.
-   *This is the gateway-key gap, and it is the largest unverified surface in
-   the whole migration.*
+2. ~~**The pulse's judge has never met a real model.**~~ **CLOSED.** The
+   gateway is reachable and the judge has now been run for real. What it did
+   is worth knowing before you read the cost numbers as good news: given a
+   margin collapse from **44.4% → 9.1%**, it answered `worthWaking: false` —
+   twice, on two independent runs. It is not wrong on its own terms (BDT 25
+   gross profit per unit is still positive), but it is the exact judgement the
+   founder would want to overrule.
+
+   The code holds up under it. A dismissed department is recorded as
+   **dismissed, not announced** (`pulse.ts:963-975`), so the finding returns as
+   news after `DISMISSAL_QUIET_MS` (24h) and sooner if it worsens — the
+   permanent burial that adversarial review found is genuinely fixed, and this
+   run is the first time that fix has been exercised against real model
+   judgement rather than a fake. The title stayed derived, never the model's
+   prose. **But the tuning question is now open and it is a product question,
+   not a bug:** a margin falling four-fifths overnight probably should wake a
+   founder, and today only stock-out conditions are `critical` (the one
+   severity the judge cannot suppress). Widening that set is a decision about
+   how loud Nova is allowed to be, and it is yours.
 3. **RTO reduction has data but no verb.** `shipping.rto_reduction` sits
    unclaimed with a reason this work made stale ("nothing reads RTO" — the
    pulse does now). Wiring it needs a roster-governed verb first; nothing in
@@ -88,6 +115,42 @@ would have shipped:
    (dakio-api shipped a point lookup the agent does not use yet); one
    structural fix (the list-derived all-blind guard) that no test can fail
    against with exactly six senses.
+
+## What the real model run changed in the code
+
+Running a model found one defect no test had: **the tool router was
+English-only**. The founder asked *"ei mash e amar business kemon cholche?"* —
+a plain check-in — and it fell through to `default`, buying five tool schemas
+to answer a question the snapshot answers by itself. The English twin, "how is
+my business doing?", is an opener and costs nothing. Same question, same store,
+different price, for no reason but the alphabet.
+
+`select.ts` now carries Bangla and Banglish for every topic, and the Bangla
+patterns are kept in a **separate field with no `\b`** — because `\b` in
+JavaScript is ASCII-only with or without the `u` flag, which is precisely the
+bug that produced the dead Bangla arm in the front-office classifier in Phase
+C. One test asserts on the patterns themselves, so re-adding `\b` fails
+immediately instead of degrading quietly. That turn now routes as `opener`,
+zero tools, and still answers correctly in Bangla script.
+
+## The proxy trap, written down so it costs nobody another hour
+
+Adding `ai-gateway.vercel.sh` to the environment allowlist was **necessary and
+not sufficient**. Node 22's global `fetch` ignores `HTTPS_PROXY`, so it went
+around the proxy that enforces the allowlist and got:
+
+```
+403  Host not in allowlist: ai-gateway.vercel.sh.
+     Add this host to your network egress settings to allow access.
+```
+
+— while `curl` to the same host in the same second returned `200`. The message
+sends you back to the allowlist, which was already correct.
+
+`src/lib/egress.ts` installs undici's `EnvHttpProxyAgent` (what
+`NODE_USE_ENV_PROXY=1` does) and `src/boot.ts` makes it a side-effect import so
+the ordering is a fact of the module graph rather than a comment. It is a
+**no-op when no proxy is set**, so Railway is untouched.
 
 ## Not done in Phase E
 

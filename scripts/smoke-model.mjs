@@ -4,18 +4,33 @@
  * Everything it needs is baked in: a real store profile and a real CEO
  * snapshot, both copied from the seeded demo store.
  *
- * It exists because the cloud sandbox this migration was built in cannot
- * reach ai-gateway.vercel.sh (the egress policy answers 403 to CONNECT), so
- * every model-dependent claim is unverified until someone runs this where the
- * gateway is reachable.
- *
  *   cd nova-mastra
  *   npm install                       # if you have not already
  *   node --env-file=.env --import tsx scripts/smoke-model.mjs
  *
  * Needs AI_GATEWAY_API_KEY and NOVA_MODEL in .env. Prints token counts and
  * latency per turn; paste the whole output back.
+ *
+ * ── IF EVERY CALL FAILS WITH "Host not in allowlist" ───────────────────────
+ *
+ * Two DIFFERENT things have to be true to reach the gateway from a sandboxed
+ * environment, and the error message only names the first one:
+ *
+ *  1. `ai-gateway.vercel.sh` must be on the environment's egress allowlist.
+ *     In Claude Code cloud sessions that is claude.ai/code → the cloud icon
+ *     above the message box → the environment's gear → Network access:
+ *     **Custom** → Allowed domains. Tick "also include default list of common
+ *     package managers", or npm stops working.
+ *  2. Node's `fetch` must actually USE the proxy that enforces that
+ *     allowlist — and by default it does not. `./src/boot.js` below fixes
+ *     this; the long version is in `src/lib/egress.ts`.
+ *
+ * Get (1) right and skip (2) and you see the same 403 as before, which reads
+ * like the allowlist did not save. It did.
  */
+
+// FIRST — see src/boot.ts. Routes fetch through the environment's proxy.
+import "../src/boot.js";
 
 import { Agent } from "@mastra/core/agent";
 import { gateway } from "@ai-sdk/gateway";
