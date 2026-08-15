@@ -6,6 +6,7 @@ import { getStoreProfile } from "./lib/store.js";
 import { novaInstructions } from "./lib/context.js";
 import { toolsForTurn } from "./tools/index.js";
 import { eveRouter } from "./eve-compat/router.js";
+import { inboxRouter } from "./inbox/ingress.js";
 import { withGatewayRetry } from "./lib/gateway-retry.js";
 import { createStudioRouter, hasValidStudioCookie } from "./studio.js";
 
@@ -75,6 +76,14 @@ app.use((req, res, next) => {
 // JSON body parser: it serves static files and needs no parsed body.
 const studioRouter = createStudioRouter(STUDIO_TOKEN);
 if (studioRouter) app.use("/studio", studioRouter);
+
+// Customer-message ingress (SHADOW) — POST /customer/message, the same root
+// path nova-ai exposes, so dakio-api's NOVA_AGENT_URL can point here with no
+// other change. Mounted BEFORE express.json(): the HMAC covers the raw bytes
+// (the router uses express.raw). Its auth is the x-nova-signature MAC, not
+// NOVA_STUDIO_TOKEN — the studio guard above only covers /api/* and /chat,
+// so this route rides its own fail-closed secret check.
+app.use(inboxRouter);
 
 app.use(express.json());
 

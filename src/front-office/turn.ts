@@ -12,7 +12,7 @@
 import { classifyL0, detectLang, type Classified, type Intent } from "./classify.js";
 import { nextBestAction, type NextAction } from "./nba.js";
 import { renderStateCard, renderRecent } from "./card.js";
-import { loadContext, saveContext, withTurnLock } from "./context-store.js";
+import { loadContext, primeContext, saveContext, withTurnLock } from "./context-store.js";
 import { observe, TTL } from "./cache.js";
 import {
   addMemo,
@@ -30,6 +30,29 @@ import { getStoreProfile } from "../lib/store.js";
 import { resolverAgent, resolverSchema, writerAgent, writerSystem } from "./agents.js";
 import { withGatewayRetry } from "../lib/gateway-retry.js";
 
+/**
+ * SHADOW vs LIVE — the phase-C gate.
+ *
+ * `shadow` (the DEFAULT — no caller can reach a customer-visible write by
+ * accident): the full delta loop runs and state persists, but the turn only
+ * DRAFTS. The one mutation in this pipeline — `createChatOrder` — is never
+ * called; a decided CREATE_ORDER is recorded as `wouldHaveDone` and the turn
+ * stops there (no invented order number, no confirmation draft). Model
+ * failures degrade to a recorded `modelFailure` instead of throwing, so the
+ * shadow-diff dataset still gets the deterministic half of the turn (intent,
+ * rung, action, state delta) when no gateway credential is present.
+ *
+ * `live`: today's behavior, byte-for-byte — the order gate executes and model
+ * failures throw. Call sites must opt in explicitly (workflow.ts does).
+ */
+export type TurnMode = "shadow" | "live";
+
+export interface TurnOptions {
+  mode?: TurnMode;
+  /** dakio-api's session roll — partitions persisted state (context-store key). */
+  epoch?: number;
+}
+
 export interface TurnResult {
   reply: string;
   intent: Intent;
@@ -42,18 +65,43 @@ export interface TurnResult {
   timings: Record<string, number>;
   cacheHits: number;
   version: number;
+  mode: TurnMode;
+  epoch: number;
+  /** Model generations ATTEMPTED this turn (resolver and/or writer). */
+  modelCalls: number;
+  /** Shadow only: the write the turn decided on but did not perform. */
+  wouldHaveDone?: Record<string, unknown>;
+  /** Shadow only: model call(s) that failed; the turn still returned its deterministic half. */
+  modelFailure?: string;
 }
 
-export function runCustomerTurn(storeId: string, convId: string, message: string): Promise<TurnResult> {
-  return withTurnLock(storeId, convId, () => executeTurn(storeId, convId, message));
+export function runCustomerTurn(
+  storeId: string,
+  convId: string,
+  message: string,
+  opts: TurnOptions = {},
+): Promise<TurnResult> {
+  const mode: TurnMode = opts.mode ?? "shadow";
+  const epoch = Number.isFinite(opts.epoch) && (opts.epoch as number) > 0 ? Math.floor(opts.epoch as number) : 0;
+  return withTurnLock(storeId, convId, () => executeTurn(storeId, convId, message, mode, epoch));
 }
 
 
-async function executeTurn(storeId: string, convId: string, message: string): Promise<TurnResult> {
+async function executeTurn(
+  storeId: string,
+  convId: string,
+  message: string,
+  mode: TurnMode,
+  epoch: number,
+): Promise<TurnResult> {
   const t0 = Date.now();
   const timings: Record<string, number> = { receivedAt: t0 };
+  let modelCalls = 0;
+  let modelFailure: string | undefined;
+  let wouldHaveDone: Record<string, unknown> | undefined;
 
-  const ctx = loadContext(storeId, convId);
+  await primeContext(storeId, convId, epoch);
+  const ctx = loadContext(storeId, convId, "chat", epoch);
   timings.stateLoadedMs = Date.now() - t0;
 
   const store = await getStoreProfile(storeId);
@@ -95,6 +143,9 @@ async function executeTurn(storeId: string, convId: string, message: string): Pr
       timings: { receivedAt: t0, sentMs: Date.now() - t0 },
       cacheHits: ctx.toolLedger.length,
       version: ctx.version,
+      mode,
+      epoch,
+      modelCalls,
     };
   }
 
@@ -102,16 +153,26 @@ async function executeTurn(storeId: string, convId: string, message: string): Pr
   const awaiting = ctx.purchase.confirmSent ? "confirm" : ctx.conversation.nextAction === "ASK_QTY" ? "qty" : null;
   let classified: Classified | null = classifyL0(message, { awaiting });
   if (!classified) {
-    const res = await withGatewayRetry(() =>
-      resolverAgent.generate(
-        [{ role: "user", content: `STATE:\n${renderStateCard(ctx)}\n\nCUSTOMER MESSAGE: ${message}` }],
-        { structuredOutput: { schema: resolverSchema } },
-      ),
-    );
-    const obj = res.object;
-    classified = obj
-      ? { intent: obj.intent, entities: obj.entities ?? {}, rung: 1, confidence: obj.confidence }
-      : { intent: "other", entities: {}, rung: 1, confidence: 0.3 };
+    modelCalls += 1;
+    try {
+      const res = await withGatewayRetry(() =>
+        resolverAgent.generate(
+          [{ role: "user", content: `STATE:\n${renderStateCard(ctx)}\n\nCUSTOMER MESSAGE: ${message}` }],
+          { structuredOutput: { schema: resolverSchema } },
+        ),
+      );
+      const obj = res.object;
+      classified = obj
+        ? { intent: obj.intent, entities: obj.entities ?? {}, rung: 1, confidence: obj.confidence }
+        : { intent: "other", entities: {}, rung: 1, confidence: 0.3 };
+    } catch (err) {
+      // Live keeps today's contract (the caller sees the failure). Shadow is
+      // observe-only: record the failure and continue with the honest floor,
+      // so the shadow row still carries a rung/intent instead of vanishing.
+      if (mode === "live") throw err;
+      modelFailure = `resolver: ${err instanceof Error ? err.message : String(err)}`;
+      classified = { intent: "other", entities: {}, rung: 1, confidence: 0 };
+    }
   }
   timings.resolvedMs = Date.now() - t0;
 
@@ -173,18 +234,39 @@ async function executeTurn(storeId: string, convId: string, message: string): Pr
   }
   timings.validatedMs = Date.now() - t0;
 
-  // ---- Mutation gate: CREATE_ORDER — hard revalidation, always live ---------
+  // ---- Mutation gate: CREATE_ORDER ------------------------------------------
+  // `createChatOrder` is the ONE write in this pipeline that goes beyond
+  // drafting, and this branch is its only call site (via
+  // `hardValidateAndCreate`). SHADOW never enters the gate: the decided
+  // placement is recorded as `wouldHaveDone` and the turn stops there — no
+  // dakio-api write, no invented order number, no confirmation draft.
   let order: TurnResult["order"];
   let facts = "";
+  let draftSuppressed = false;
   if (action === "CREATE_ORDER") {
-    const gate = await hardValidateAndCreate(ctx);
-    if (gate.ok) {
-      order = { orderNumber: gate.orderNumber!, total: gate.total! };
-      action = "ORDER_CONFIRMED" as never;
-      facts = `Order #${gate.orderNumber} created — total ৳${gate.total} COD (product ৳${gate.subtotal} + delivery ৳${gate.shipping}).`;
+    if (mode === "shadow") {
+      wouldHaveDone = {
+        type: "create_chat_order",
+        novaActionId: `nm:${ctx.convId}:order-${ctx.orders.length}`,
+        productId: ctx.products.focusId ?? null,
+        productName: ctx.hydrated.product?.value?.name ?? null,
+        variant: ctx.purchase.variant ?? null,
+        qty: ctx.purchase.qty ?? null,
+        zone: ctx.purchase.zone ?? null,
+        phone: ctx.customer.phone?.value ?? null,
+        address: ctx.customer.addr?.value ?? null,
+      };
+      draftSuppressed = true; // a confirmation for an order that does not exist is a lie
     } else {
-      action = gate.fallback;
-      facts = gate.reason;
+      const gate = await hardValidateAndCreate(ctx);
+      if (gate.ok) {
+        order = { orderNumber: gate.orderNumber!, total: gate.total! };
+        action = "ORDER_CONFIRMED" as never;
+        facts = `Order #${gate.orderNumber} created — total ৳${gate.total} COD (product ৳${gate.subtotal} + delivery ৳${gate.shipping}).`;
+      } else {
+        action = gate.fallback;
+        facts = gate.reason;
+      }
     }
   }
 
@@ -217,15 +299,25 @@ async function executeTurn(storeId: string, convId: string, message: string): Pr
   const genStart = Date.now();
   timings.genStartMs = genStart - t0;
 
-  const writeRes = await withGatewayRetry(() =>
-    writerAgent.generate(
-      [{ role: "user", content: `${card}\n\nLAST MESSAGES:\n${renderRecent(ctx)}\n\nACTION: ${actionLine}\nWrite the reply.` }],
-      { instructions: writerSystem({ name: store.name, currency: store.currency }) },
-    ),
-  );
-  const reply = writeRes.text.trim();
+  let reply = "";
+  if (!draftSuppressed) {
+    modelCalls += 1;
+    try {
+      const writeRes = await withGatewayRetry(() =>
+        writerAgent.generate(
+          [{ role: "user", content: `${card}\n\nLAST MESSAGES:\n${renderRecent(ctx)}\n\nACTION: ${actionLine}\nWrite the reply.` }],
+          { instructions: writerSystem({ name: store.name, currency: store.currency }) },
+        ),
+      );
+      reply = writeRes.text.trim();
+    } catch (err) {
+      // Same asymmetry as the resolver above: live throws, shadow records.
+      if (mode === "live") throw err;
+      modelFailure = `${modelFailure ? `${modelFailure}; ` : ""}writer: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
 
-  pushMessage(ctx, { role: "nova", text: reply, at: Date.now() });
+  if (reply) pushMessage(ctx, { role: "nova", text: reply, at: Date.now() });
   bump(ctx);
   saveContext(ctx);
   timings.sentMs = Date.now() - t0;
@@ -243,6 +335,11 @@ async function executeTurn(storeId: string, convId: string, message: string): Pr
     timings,
     cacheHits,
     version: ctx.version,
+    mode,
+    epoch,
+    modelCalls,
+    ...(wouldHaveDone ? { wouldHaveDone } : {}),
+    ...(modelFailure ? { modelFailure } : {}),
   };
 }
 

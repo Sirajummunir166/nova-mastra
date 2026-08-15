@@ -40,7 +40,10 @@ const customerTurnStep = createStep({
     const storeId = inputData.storeId || process.env.NOVA_DEV_STORE_ID;
     if (!storeId) throw new Error("storeId required (or set NOVA_DEV_STORE_ID)");
     if (inputData.reset) resetContext(storeId, inputData.convId);
-    return runCustomerTurn(storeId, inputData.convId, inputData.message);
+    // Explicit LIVE: this workflow predates the shadow gate and is the Studio
+    // lane whose guard (index.ts) already warns it can create real orders.
+    // `runCustomerTurn` itself now defaults to shadow, so live is opt-in here.
+    return runCustomerTurn(storeId, inputData.convId, inputData.message, { mode: "live" });
   },
 });
 

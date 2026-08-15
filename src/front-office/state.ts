@@ -111,6 +111,15 @@ export interface ToolLedgerEntry {
 export interface NovaLiveContext {
   convId: string;
   storeId: string;
+  /**
+   * dakio-api's session roll (`InboxConversation.novaSessionEpoch`, read via
+   * `GET /conversations/:id/session-epoch`). Part of the STORAGE KEY — the
+   * same discipline as nova-ai's `inbox:<conv>:<model>:e<epoch>` continuation
+   * token: a rolled epoch starts a fresh context and never touches the old
+   * one. `0` is the pre-roll default, so legacy state (files without the
+   * field) keeps loading under the exact key it already had.
+   */
+  epoch: number;
   version: number;
   updatedAt: number;
 
@@ -168,10 +177,11 @@ export interface NovaLiveContext {
   recent: ChatTurnMessage[];
 }
 
-export function newLiveContext(convId: string, storeId: string, channel = "chat"): NovaLiveContext {
+export function newLiveContext(convId: string, storeId: string, channel = "chat", epoch = 0): NovaLiveContext {
   return {
     convId,
     storeId,
+    epoch,
     version: 0,
     updatedAt: Date.now(),
     customer: { lang: { pref: "bn", detected: "banglish", conf: 0.5 }, sentiment: "neutral", channel },
