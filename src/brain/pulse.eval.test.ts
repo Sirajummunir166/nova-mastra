@@ -30,16 +30,23 @@ import { test, before, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  boundJudgeText,
+  boundJudgement,
+  changeCard,
+  pulseTitle,
   runPulse,
   productionRemedy,
   scopeJudgement,
   settleFinding,
+  HEADLINE_MAX_CHARS,
+  PULSE_RECEIPT_CONFIDENCE,
   type DecideFn,
   type PulseJudgement,
 } from "./pulse.js";
 import { loadPulseState, resetPulseState } from "./pulse-state.js";
-import { comparePulse, PULSE_THRESHOLDS } from "./pulse-compare.js";
-import { senseStore, SENSE_GAPS } from "../lib/snapshot.js";
+import { blindSpotNews, comparePulse, PULSE_THRESHOLDS, type PulseFinding } from "./pulse-compare.js";
+import { LIST_PAGE_CAP, senseStore, SENSE_GAPS } from "../lib/snapshot.js";
+import type { AbandonedCart, Order, Product, Supplier } from "../store/types.js";
 import { storeFor, resetStores } from "../store/resolve.js";
 import { laneFor } from "./registry.js";
 import { gateOrFile, originOf } from "../front-office/actions.js";
@@ -51,7 +58,22 @@ process.env.NOVA_STORE_BACKEND = "demo";
 // The file backend, deliberately: this suite must not need a Postgres.
 delete process.env.NOVA_PG_URL;
 
-const A = "store-aurora";
+/**
+ * THIS SUITE'S OWN TENANT, and the id is load-bearing.
+ *
+ * It was `store-aurora` — the same id `dispatcher.eval.test.ts` enqueues pulse
+ * jobs against. `node --test` runs the two FILES CONCURRENTLY, in separate
+ * processes, over one shared `.data/pulse-state/store-aurora.json`, so the
+ * dispatcher's pulse could overwrite this suite's snapshot between its two
+ * passes: "a condition that is already open is not news again" failed roughly
+ * one whole-suite run in five, from a race in the fixture rather than anything
+ * about the pulse. A flaky test quietly discounts every claim the suite makes.
+ *
+ * `resolve.ts` seeds any unknown store id with the same Aurora dataset
+ * (`SEEDERS[storeId] ?? createSeed`), so the store is identical and the state
+ * file is this suite's alone.
+ */
+const A = "store-pulse-eval";
 
 /** The demo backend's own data, the seam a test needs to move the world. */
 function demo(storeId: string) {
@@ -143,6 +165,13 @@ test("a pulse where nothing changed costs ZERO model calls — and still writes 
   assert.equal(stored!.at, quiet.at);
   assert.ok(Object.keys(stored!.products ?? {}).length > 0, "with the per-product state COMPARE needs");
   assert.ok(Object.keys(stored!.openFindings ?? {}).length > 0, "and the open conditions, so they do not re-fire");
+
+  // WHY they do not re-fire, stated: every one of them REACHED the founder, in
+  // the first pass's report. "Open" is a claim about what was told, not about
+  // what was worked out — see the D12/D13 cases below.
+  for (const [key, state] of Object.entries(stored!.openFindings!)) {
+    assert.equal(state.announced, true, `${key} was in the report the first pass filed`);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -747,4 +776,614 @@ test("a judge that is DOWN does not silence the watchdog", async () => {
   assert.equal(result.quiet, false, "the numbers were measured by code and stand on their own");
   assert.equal(result.modelCalls, 1, "the attempt is still counted — it was made and it cost the call");
   assert.match(result.findings[0]!.note, /Judgement unavailable/);
+});
+
+// ===========================================================================
+// THE HONESTY DEFECTS
+//
+// Everything below was found by an adversarial review that PROBED this lane,
+// and every one of them passed the suite above. That is the part worth keeping
+// in mind while reading these cases: the claims were "tested" by asserting
+// properties the demo seed makes true by construction — the sales domain never
+// fired because the seeded revenue is up, the nullable-velocity fix had no test
+// at all because every demo product ships eight real weeks, and no test ever
+// looked at a report title or stubbed `addReport` to throw.
+//
+// So these cases bring their OWN world: a judge that lies, a backend that 500s,
+// a read that succeeds and returns nothing useful, a page that fills up.
+// ===========================================================================
+
+/** The report this pulse filed — by id, never by "the newest one". */
+async function reportOf(result: { reportId?: string }, storeId = A) {
+  assert.ok(result.reportId, "precondition: this pulse filed a report");
+  const report = (await storeFor(storeId).listReports({ kind: "pulse" })).find((r) => r.id === result.reportId);
+  assert.ok(report, "and it is on the store");
+  return report!;
+}
+
+/** Swap a client method and hand back the restore — for cases that need BOTH halves. */
+function swap(storeId: string, method: string, impl: (...args: never[]) => unknown): () => void {
+  const client = storeFor(storeId) as unknown as Record<string, unknown>;
+  const original = client[method];
+  client[method] = impl;
+  return () => {
+    client[method] = original;
+  };
+}
+
+const DAY_MS = 86_400_000;
+
+/** A demo-shaped order, for the sales domain the seed never exercises. */
+function order(patch: Partial<Order> & { id: string }): Order {
+  const template = demo(A).data.orders[0]!;
+  return { ...template, items: [], ...patch };
+}
+
+// ---------------------------------------------------------------------------
+// D1 — the judge's free text was the founder's headline
+// ---------------------------------------------------------------------------
+
+/**
+ * THE PROBE THAT FOUND THIS produced, live:
+ *
+ *   ⚠ Sales are down because your courier is losing parcels and ad spend is wasted
+ *
+ * as the TITLE of a report whose own footer says Nova makes no claim about
+ * courier or ads. `settled[0].headline` — an unvalidated model string — was the
+ * title, and the change card never told the judge which domains are unknowable.
+ */
+test("the report title is DERIVED from the findings — a judge cannot title the report", async () => {
+  await baseline();
+  demo(A).data.products.find((p) => p.id === "prod-candle-amber")!.stock = 2;
+
+  const liar = countingJudge({
+    headline: "Sales are down because your courier is losing parcels and ad spend is wasted",
+    note: "Pause the ad campaigns and switch courier today.",
+  });
+  const result = await runPulse(A, { decide: liar.decide });
+  const report = await reportOf(result);
+
+  assert.doesNotMatch(report.title, /courier|ad spend|campaign/i, "the fabricated cause is nowhere near the title");
+  assert.match(report.title, /Amber & Oak Soy Candle will stock out before a reorder can arrive/);
+  assert.match(report.title, /^⚠ /, "the badge is arithmetic over the findings that carry it");
+  assert.doesNotMatch(report.body, /losing parcels/, "and the body will not carry it either");
+  assert.doesNotMatch(report.body, /Pause the ad campaigns/);
+  assert.match(report.body, /wording for inventory was set aside/, "the founder is told the wording was refused");
+
+  // The measurement itself survives untouched — a refused sentence must not
+  // cost the founder the finding.
+  assert.match(report.body, /2 units left/);
+  assert.match(result.findings[0]!.note, /the measurement stands/);
+});
+
+test("the title leads with the finding the ⚠ belongs to — one department's headline, another's severity", () => {
+  // D14 as a unit, because the production condition set happens to order
+  // inventory first and hides it. `settled[0].headline` + a severity counted
+  // across ALL departments is a badge that can belong to a different finding
+  // than the sentence beside it.
+  const settled = (severity: PulseFinding["severity"], title: string) => ({
+    finding: { severity, title } as PulseFinding,
+    headline: `the model's line about ${title}`,
+    note: "n",
+    outcome: { kind: "reported" as const },
+  });
+  const title = pulseTitle([
+    settled("info", "Ceramic Vase Set looks like dead stock"),
+    settled("critical", "Portable Blender Pro will stock out before a reorder can arrive"),
+  ]);
+
+  assert.match(title, /^⚠ Portable Blender Pro will stock out/, "the ⚠ and the sentence are the same finding");
+  assert.match(title, /\(\+1 more finding\)/);
+  assert.doesNotMatch(title, /the model's line/, "no model prose reaches the title at all");
+  assert.ok(title.length <= 120);
+
+  // A pass with no findings still has one honest thing to say.
+  assert.match(pulseTitle([], [{ key: "sense:products", detail: "x" }]), /could not see part of your store/);
+});
+
+test("nothing the judge writes reaches a founder unchecked", () => {
+  const card =
+    "DEPARTMENT: sales\n- [warning] Revenue is down 22.4% week over week\n" +
+    "  ৳12,000 over the last 7 days against ৳16,000 the week before";
+  const fallback = "Revenue is down 22.4% week over week";
+  const bound = (raw: string) => boundJudgeText(raw, { card, fallback, maxLen: HEADLINE_MAX_CHARS });
+
+  const honest = bound("Revenue is down 22.4%: ৳12,000 against ৳16,000 the week before");
+  assert.equal(honest.rejected, null, "a line written from the card survives verbatim");
+
+  const invented = bound("Revenue is down 43% week over week");
+  assert.match(invented.rejected!, /cites 43/, "a number nobody measured");
+  assert.equal(invented.text, fallback);
+
+  for (const [line, domain] of [
+    ["Sales are down because ad spend is wasted", "ads"],
+    ["Your courier is losing parcels", "courier"],
+    ["Support tickets are piling up", "support"],
+  ] as const) {
+    const rejected = bound(line);
+    assert.match(rejected.rejected!, new RegExp(domain), `${domain} has no data source — it may not be named`);
+    assert.equal(rejected.text, fallback, "and the measurement replaces it");
+  }
+
+  assert.match(bound("x".repeat(HEADLINE_MAX_CHARS + 1)).rejected!, /over 120 characters/);
+  assert.match(bound("   ").rejected!, /empty/);
+});
+
+test("the change card tells the judge which domains are UNKNOWABLE, not only this pass's failures", async () => {
+  const judge = countingJudge();
+  await runPulse(A, { decide: judge.decide });
+  const card = judge.cards[0]!;
+
+  assert.match(card, /NOVA CANNOT SEE/);
+  for (const gap of SENSE_GAPS) assert.match(card, new RegExp(gap.domain));
+  assert.match(card, /do not explain anything with them/);
+  assert.ok(card.length < 1400, "and it is still a card, not a register");
+
+  // The same instruction, on the function, so it cannot be an accident of this
+  // store's data.
+  const bare = changeCard({ department: "sales", findings: [], eventsSeen: 0, senseDark: [] });
+  assert.match(bare, /NOVA CANNOT SEE \(no data source[^)]*\): ads, courier, support/);
+});
+
+/**
+ * D1's second path, and D8. The judge's `note` becomes `receipt.expectedImpact`
+ * on a Decision card — the line a founder reads as Nova's reason for a write.
+ * Driven as `night_ops` because that is the only lane that may reach the gate
+ * (see the rehearsal fixture above).
+ */
+test("a judge line naming an unmeasured domain never reaches a Decision card — and the receipt's confidence is honest", async () => {
+  const client = storeFor(A);
+  const { sense, finding } = await coverFinding();
+  const card = changeCard({ department: "inventory", findings: [finding], eventsSeen: 0, senseDark: [] });
+
+  const bounded = boundJudgement(
+    {
+      worthWaking: true,
+      headline: "Stock is fine, the courier is the problem",
+      note: "Sales are down because your courier is losing parcels — switch courier before reordering.",
+    },
+    { department: "inventory", findings: [finding], card },
+  );
+  assert.deepEqual(
+    bounded.rejections.map((r) => r.split(" ")[0]),
+    ["headline", "note"],
+    "both lines reached for a domain nobody measured",
+  );
+
+  const outcome = await settleFinding(client, finding, sense, reorderRemedy, scopeJudgement(bounded, "inventory", 1), "night_ops");
+  const row = (await client.listActions()).find((a) => a.id === (outcome as { actionId: string }).actionId)!;
+
+  assert.doesNotMatch(row.receipt.expectedImpact, /courier/i, "the card carries no cause Nova cannot see");
+  assert.match(row.receipt.expectedImpact, /the measurement stands/);
+  assert.match(row.receipt.reason, /days of cover/, "the reason is still the observation");
+
+  // D8: 0.9 for critical and 0.7 otherwise was a severity flag wearing a
+  // probability's clothes. One constant, and a row that says what it is.
+  assert.equal(row.receipt.confidence, PULSE_RECEIPT_CONFIDENCE);
+  const stated = row.receipt.evidence.find((e) => e.source === "pulse:confidence");
+  assert.ok(stated, "the constant is labelled as one on the card itself");
+  assert.match(stated!.note, /Not a probability/);
+});
+
+// ---------------------------------------------------------------------------
+// D12 + D13 — findings buried forever
+// ---------------------------------------------------------------------------
+
+/**
+ * Probed: "Shenzhen HomeGoods is 4 days late" dropped by one Haiku call and
+ * never mentioned again. Only `inventory:cover:` findings are ever critical, so
+ * every revenue drop, supplier delay, margin and cart finding was suppressible
+ * once — and forever, because an open condition only returns if it worsens 25%.
+ */
+test("a dismissed finding is DEFERRED, not retired — and the snapshot says which of the two happened", async () => {
+  await baseline();
+  const key = "supplier:sup-vista";
+  demo(A).data.suppliers.find((s) => s.id === "sup-vista")!.currentDelayDays = 6;
+
+  const dismissive = countingJudge({ worthWaking: false });
+  const dropped = await runPulse(A, { decide: dismissive.decide });
+  assert.equal(dismissive.calls(), 1, "the judgement was bought");
+  assert.equal(dropped.quiet, true, "and it said no — a legitimate answer, for a while");
+  assert.equal(dropped.reportId, undefined);
+
+  const stored = await loadPulseState(A)!;
+  assert.equal(
+    stored!.openFindings![key]!.announced,
+    false,
+    "DERIVED IS NOT TOLD: the snapshot records that nobody heard about this",
+  );
+  assert.ok(stored!.openFindings![key]!.dismissedAt, "and that a judgement, not an accident, is why");
+
+  // Within the window: the same card would buy the same answer, so it is not
+  // re-asked. This is the half that keeps the hourly cost claim intact.
+  const soon = countingJudge();
+  const held = await runPulse(A, { decide: soon.decide });
+  assert.equal(soon.calls(), 0, "a dismissal holds for a day, not for an hour");
+  assert.equal(held.quiet, true);
+
+  // A dismissal is not a burial: once the window passes, an unreported
+  // condition is news again. Asserted at COMPARE level, because the window is a
+  // day and this suite runs in milliseconds.
+  const sense = await senseStore(A);
+  const yesterday = new Date(Date.parse(sense.at) - 25 * 3600 * 1000).toISOString();
+  const stale = comparePulse(sense, {
+    ...(await loadPulseState(A))!,
+    openFindings: { [key]: { since: yesterday, metric: 6, measuredAt: yesterday, announced: false, dismissedAt: yesterday } },
+  });
+  const back = stale.findings.find((f) => f.key === key);
+  assert.ok(back, "the delay never stopped being true and the founder was never told");
+  assert.equal(back!.trigger, "unreported");
+
+  // And a WORSENING cuts through the window immediately — a dismissal covers
+  // the fact that was judged, not every future version of it.
+  demo(A).data.suppliers.find((s) => s.id === "sup-vista")!.currentDelayDays = 8;
+  const worse = countingJudge();
+  const raised = await runPulse(A, { decide: worse.decide });
+  assert.ok(worse.calls() >= 1, "the worsening is judged");
+  assert.ok(raised.departments.includes("operations"));
+  assert.equal(raised.findings.find((f) => f.finding.key === key)?.finding.trigger, "worsened");
+  assert.ok(raised.reportId);
+  assert.equal((await loadPulseState(A))!.openFindings![key]!.announced, true, "and NOW it has reached them");
+  assert.equal((await loadPulseState(A))!.openFindings![key]!.dismissedAt, null, "an announcement clears the deferral");
+
+  // The zero-model-call property, intact: an announced condition that has not
+  // moved does not buy another judgement.
+  const after = countingJudge();
+  const quiet = await runPulse(A, { decide: after.decide });
+  assert.equal(after.calls(), 0);
+  assert.equal(quiet.quiet, true);
+});
+
+/**
+ * Probed: one 500 on `POST /reports` erased six findings including two critical
+ * stock-outs. The failure was caught, logged, and the snapshot written anyway —
+ * with every condition marked open, meaning "told".
+ */
+test("a report that could not be filed loses nothing — the next pulse says it all again", async () => {
+  await baseline();
+  demo(A).data.products.find((p) => p.id === "prod-candle-amber")!.stock = 2;
+  const key = "inventory:cover:prod-candle-amber";
+
+  const restore = swap(A, "addReport", async () => {
+    throw new Error("dakio-api 500 on /reports");
+  });
+  const lost = await runPulse(A, { decide: countingJudge().decide });
+  restore();
+
+  assert.equal(lost.reportId, undefined);
+  assert.match(lost.reportFailed!, /500 on \/reports/, "the failure rides on the result, not only in a log line");
+  assert.equal(lost.findings[0]!.finding.severity, "critical");
+  assert.equal(lost.snapshotWritten, true, "the snapshot still lands — the memory of the NUMBERS is not the problem");
+  assert.equal(
+    (await loadPulseState(A))!.openFindings![key]!.announced,
+    false,
+    "but nothing is marked as told, because nothing was",
+  );
+
+  const retry = await runPulse(A, { decide: countingJudge().decide });
+  assert.equal(retry.findings.length, 1);
+  assert.equal(retry.findings[0]!.finding.key, key);
+  assert.ok(retry.reportId, "the second attempt reaches the founder");
+  assert.equal((await loadPulseState(A))!.openFindings![key]!.announced, true);
+});
+
+// ---------------------------------------------------------------------------
+// D15 + D10 — blindness reported as quiet
+// ---------------------------------------------------------------------------
+
+test("four of five senses dark is NOT a quiet pulse — a blind store must not look like a healthy one", async () => {
+  await baseline();
+  const blind = async () => {
+    throw new Error("dakio-api 503");
+  };
+  for (const method of ["listProducts", "listOrders", "listAbandonedCarts", "listInboxEvents"]) stub(A, method, blind);
+
+  const judge = countingJudge();
+  const result = await runPulse(A, { decide: judge.decide });
+
+  assert.equal(judge.calls(), 0, "nothing moved — there was nothing left that could move");
+  assert.equal(result.modelCalls, 0);
+  assert.equal(result.quiet, false, "THE DEFECT: this answered `quiet: true` and completed the job row");
+  assert.equal(result.senseFailures.length, 4);
+  assert.ok(result.reportId, "the founder is told, because a week of this is otherwise invisible");
+  for (const key of ["sense:products", "sense:sales", "sense:carts", "sense:inbox"]) {
+    assert.ok(result.blindSpotsReported.includes(key), `${key} was reported`);
+  }
+
+  const report = await reportOf(result);
+  assert.match(report.title, /could not see 4 parts of your store/);
+  assert.match(report.body, /Nova could not see this/);
+  assert.match(report.body, /not good news/, "the report says what the silence does NOT mean");
+
+  // An hour later, still dark, nothing new: silence, not an hourly alarm.
+  const again = await runPulse(A, { decide: countingJudge().decide });
+  assert.equal(again.quiet, true);
+  assert.equal(again.reportId, undefined);
+  assert.equal(again.blindSpots.length, 4, "still blind, and the result still says so to whoever is watching");
+});
+
+test("blindness is news when it appears, again after a day, and silent in between", () => {
+  const spot = [{ key: "sense:products", detail: "products could not be read" }];
+  const t0 = "2026-08-15T09:00:00.000Z";
+  const at = (hours: number) => new Date(Date.parse(t0) + hours * 3_600_000).toISOString();
+  const prior = (announcedAt: string | null) =>
+    ({
+      at: t0,
+      products: null,
+      supplierDelayDays: null,
+      revenue7d: null,
+      revenuePrior7d: null,
+      carts: null,
+      inboxCursor: null,
+      openFindings: null,
+      blindSpots: { "sense:products": { since: t0, announcedAt } },
+    });
+
+  assert.equal(blindSpotNews(spot, null, t0).length, 1, "newly dark is news");
+  assert.equal(blindSpotNews(spot, prior(t0), at(1)).length, 0, "an hour later it is not news again");
+  assert.equal(blindSpotNews(spot, prior(t0), at(25)).length, 1, "a day later it is — a week of dark is not one line");
+  assert.equal(blindSpotNews(spot, prior(null), at(1)).length, 1, "derived but never told is always still news");
+});
+
+/**
+ * D10 — the same failure one level down, and the one that looked healthiest: a
+ * product read that SUCCEEDS and comes back with no velocity. Nothing re-derives
+ * the cover conditions, so they leave the open set as though the stock-out had
+ * been solved — and when the field returns, the evidence announces a condition
+ * that was continuously true as "(first sighting)".
+ */
+test("a field that goes dark does not close an open condition — and it does not return as a 'first sighting'", async () => {
+  demo(A).data.products.find((p) => p.id === "prod-candle-amber")!.stock = 2;
+  await baseline();
+  const key = "inventory:cover:prod-candle-amber";
+  assert.equal((await loadPulseState(A))!.openFindings![key]!.announced, true, "precondition: open, and told");
+
+  const client = storeFor(A) as unknown as { listProducts: (f?: unknown) => Promise<Product[]> };
+  const real = client.listProducts.bind(client);
+  const restore = swap(A, "listProducts", async (filter?: never) =>
+    (await real(filter)).map((p) => ({ ...p, weeklyVelocity: [] })),
+  );
+
+  const dark = await runPulse(A, { decide: countingJudge().decide });
+  assert.equal(dark.senseFailures.length, 0, "THE READ SUCCEEDED — this is the case that looks perfectly healthy");
+  assert.ok(dark.blindSpots.some((b) => b.key === "field:velocity"));
+  assert.equal(dark.quiet, false, "a load-bearing field going dark is not a quiet hour");
+  assert.ok(
+    (await loadPulseState(A))!.openFindings![key],
+    "and the open CRITICAL condition survived a dark field, as it survives a dark read",
+  );
+
+  restore();
+  const back = countingJudge();
+  const after = await runPulse(A, { decide: back.decide });
+  assert.equal(back.calls(), 0, "the condition never stopped being true, so its return is not news");
+  assert.deepEqual(after.findings, []);
+  assert.equal(after.quiet, true);
+});
+
+// ---------------------------------------------------------------------------
+// D3/D4 — margin, the velocity bug one field over
+// ---------------------------------------------------------------------------
+
+test("a product Nova cannot cost produces NO margin claim — not a 100% margin, and not NaN%", async () => {
+  await baseline();
+  const client = storeFor(A) as unknown as { listProducts: (f?: unknown) => Promise<Product[]> };
+  const real = client.listProducts.bind(client);
+  // dakio-api's two shapes: `num(null) = 0`, and a cost that is not a number.
+  swap(A, "listProducts", async (filter?: never) =>
+    (await real(filter)).map((p) =>
+      p.id === "prod-candle-amber" ? { ...p, cost: NaN } : p.id === "prod-mug-set" ? { ...p, cost: 0 } : p,
+    ),
+  );
+
+  const result = await runPulse(A, { decide: countingJudge().decide });
+
+  for (const f of result.findings) {
+    assert.doesNotMatch(f.finding.observation.evidence, /NaN/, "a confident `NaN% margin at ৳3,959 on ৳NaN cost`");
+  }
+  assert.equal(
+    result.findings.some((f) => f.finding.key === "margin:prod-candle-amber"),
+    false,
+    "an unreadable cost is not a margin",
+  );
+  assert.equal(result.findings.some((f) => f.finding.key === "margin:prod-mug-set"), false);
+
+  // And the founder is TOLD the cost is missing, rather than told nothing —
+  // "Nova checked my margins and found nothing" about a catalogue it cannot
+  // cost is the belief this creates.
+  const cost = result.blindSpots.find((b) => b.key === "field:cost");
+  assert.ok(cost, "the gap is reported");
+  assert.match(cost!.detail, /is NOT a 100% margin/);
+  assert.match((await reportOf(result)).body, /no unit cost for 2 of/);
+});
+
+// ---------------------------------------------------------------------------
+// D5/D6/D7 — truncated pages presented as measurements
+// ---------------------------------------------------------------------------
+
+/**
+ * THE SALES DOMAIN, FIRING. It never had: the demo seed's revenue is up, so the
+ * revenue-drop condition, its threshold, its denominator and its wording had
+ * never once run under an assertion.
+ */
+test("a real week-over-week drop is measured, named, and worded so the founder can check it", async () => {
+  await baseline();
+  const now = Date.now();
+  stub(A, "listOrders", async () => [
+    order({ id: "o-new-1", total: 8000, placedAt: new Date(now - 1 * DAY_MS).toISOString() }),
+    order({ id: "o-new-2", total: 4000, placedAt: new Date(now - 3 * DAY_MS).toISOString() }),
+    order({ id: "o-old-1", total: 30000, placedAt: new Date(now - 9 * DAY_MS).toISOString() }),
+    order({ id: "o-old-2", total: 10000, placedAt: new Date(now - 11 * DAY_MS).toISOString() }),
+    // A cancelled order counts toward neither week.
+    order({ id: "o-void", total: 99999, status: "cancelled", placedAt: new Date(now - 2 * DAY_MS).toISOString() }),
+  ]);
+
+  const judge = countingJudge();
+  const result = await runPulse(A, { decide: judge.decide });
+  const sales = result.findings.find((f) => f.finding.domain === "sales");
+
+  assert.ok(sales, "৳12,000 against ৳40,000 is a 70% drop, and the threshold is 15%");
+  assert.equal(sales!.finding.key, "sales:revenue_drop");
+  assert.equal(sales!.finding.department, "sales");
+  assert.equal(sales!.finding.severity, "warning");
+  assert.equal(sales!.finding.observation.value, -70);
+  assert.match(sales!.finding.title, /Revenue is down 70% week over week/);
+  assert.match(sales!.finding.observation.evidence, /৳12,000 over the last 7 days against ৳40,000 the week before/);
+  assert.match(
+    sales!.finding.observation.evidence,
+    /cancelled, refunded and returned orders excluded from both weeks/,
+    "the maturity bias is named, because the founder's own dashboard will not match otherwise",
+  );
+  assert.equal(sales!.outcome.kind, "reported", "no verb in ActionType fixes a revenue decline — the report IS the response");
+});
+
+test("a truncated order page produces NO week-over-week claim — the denominator is what falls off", async () => {
+  await baseline();
+  const now = Date.now();
+  // 200 rows: the newest week is dense and cheap, last week's rows are the ones
+  // a real cap would drop. The arithmetic here would read as a 96% collapse.
+  stub(A, "listOrders", async () =>
+    Array.from({ length: LIST_PAGE_CAP }, (_, i) =>
+      order({
+        id: `o${i}`,
+        total: i < 150 ? 10 : 1000,
+        placedAt: new Date(now - (i < 150 ? 1 : 9) * DAY_MS).toISOString(),
+      }),
+    ),
+  );
+
+  const result = await runPulse(A, { decide: countingJudge().decide });
+  assert.equal(
+    result.findings.some((f) => f.finding.domain === "sales"),
+    false,
+    "a percentage the founder can check and find wrong is worse than no percentage",
+  );
+  assert.ok(result.blindSpots.some((b) => b.key === "page:orders"));
+  assert.match((await reportOf(result)).body, /week-over-week revenue cannot be measured/);
+});
+
+test("a full page of leads is reported as a FLOOR — never as the number of abandoned carts", async () => {
+  // No baseline: the cart condition is a first sighting here, so the case is
+  // about the WORDING of the total rather than about a delta.
+  stub(A, "listAbandonedCarts", async () =>
+    Array.from({ length: LIST_PAGE_CAP }, (_, i) => ({
+      id: `lead-${i}`,
+      customerId: "",
+      items: [],
+      // Three leads with no cart value: dakio-api's `num(null) = 0`.
+      value: i < 3 ? 0 : 500,
+      abandonedAt: new Date().toISOString(),
+      recoveryState: "none",
+      recoveryMessage: null,
+    })) as AbandonedCart[],
+  );
+
+  const result = await runPulse(A, { decide: countingJudge().decide });
+  const carts = result.findings.find((f) => f.finding.domain === "carts");
+  assert.ok(carts, "the cart total moved");
+  assert.match(carts!.finding.title, /^at least 200 abandoned carts/, "200 is where the page stopped, not where the carts stop");
+  assert.match(carts!.finding.observation.evidence, /floor, not a total/);
+  assert.match(carts!.finding.observation.evidence, /3 of them with no cart value recorded/);
+  assert.equal(carts!.finding.observation.value, 98_500, "the ৳0 leads are counted, not priced at ৳0");
+  assert.ok(result.blindSpots.some((b) => b.key === "page:carts"));
+});
+
+test("a catalogue that fills the page says so — and a condition about a product that fell off it is not 'solved'", async () => {
+  demo(A).data.products.find((p) => p.id === "prod-candle-amber")!.stock = 2;
+  await baseline();
+  const key = "inventory:cover:prod-candle-amber";
+  assert.ok((await loadPulseState(A))!.openFindings![key], "precondition: the candle has an open stock-out condition");
+
+  const template = demo(A).data.products[0]!;
+  stub(A, "listProducts", async () =>
+    Array.from({ length: LIST_PAGE_CAP }, (_, i) => ({
+      ...template,
+      id: `filler-${i}`,
+      name: `Filler ${i}`,
+      // Nothing derivable, so this case is only about the page, not the rows.
+      weeklyVelocity: [],
+      cost: 0,
+      reorderPoint: 0,
+      supplierId: "",
+    })) as Product[],
+  );
+
+  const result = await runPulse(A, { decide: countingJudge().decide });
+  const page = result.blindSpots.find((b) => b.key === "page:products");
+  assert.ok(page, "a store with 800 SKUs had 600 never watched and nothing said so");
+  assert.match(page!.detail, /stopped there/);
+  assert.ok(
+    (await loadPulseState(A))!.openFindings![key],
+    "and the 601st SKU does not stop having a problem because the page stopped at 200",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// D9, D11, D17 — the smaller ones, each with the sentence it changes
+// ---------------------------------------------------------------------------
+
+test("a velocity averaged over ONE week says one week — not four", async () => {
+  await baseline();
+  const client = storeFor(A) as unknown as { listProducts: (f?: unknown) => Promise<Product[]> };
+  const real = client.listProducts.bind(client);
+  swap(A, "listProducts", async (filter?: never) =>
+    (await real(filter)).map((p) => (p.id === "prod-candle-amber" ? { ...p, weeklyVelocity: [30], stock: 2 } : p)),
+  );
+
+  const result = await runPulse(A, { decide: countingJudge().decide });
+  const cover = result.findings.find((f) => f.finding.key === "inventory:cover:prod-candle-amber");
+  assert.ok(cover);
+  assert.match(
+    cover!.finding.observation.evidence,
+    /\(1 week of sales\)/,
+    "'selling ~4.29/day' reads as settled demand; over one bucket it is one week divided by seven",
+  );
+});
+
+test("a supplier that reports nothing is never stored as on time", async () => {
+  stub(A, "listSuppliers", async (): Promise<Supplier[]> => [
+    { ...demo(A).data.suppliers[0]!, id: "sup-quiet", currentDelayDays: undefined as unknown as number },
+  ]);
+
+  const result = await runPulse(A, { decide: countingJudge().decide });
+  assert.equal(
+    result.findings.some((f) => f.finding.domain === "supplier"),
+    false,
+    "unknown produces no finding — and no on-time observation either",
+  );
+  const stored = await loadPulseState(A);
+  assert.equal(
+    stored!.supplierDelayDays!["sup-quiet"],
+    null,
+    "`currentDelayDays ?? 0` stored a MEASURED zero for a supplier nobody has heard from",
+  );
+  assert.ok(result.blindSpots.some((b) => b.key === "field:supplierDelay"));
+});
+
+test("'was X' names WHEN X was measured — never a pulse that did not observe it", async () => {
+  demo(A).data.products.find((p) => p.id === "prod-candle-amber")!.stock = 2;
+  const sense = await senseStore(A);
+  const key = "inventory:cover:prod-candle-amber";
+
+  // A value measured two weeks ago, carried forward through pulses whose
+  // product read was dark. The old wording called it "the last pulse".
+  const measuredAt = "2026-08-01T09:00:00.000Z";
+  const comparison = comparePulse(sense, {
+    at: "2026-08-14T09:00:00.000Z",
+    products: null,
+    supplierDelayDays: null,
+    revenue7d: null,
+    revenuePrior7d: null,
+    carts: null,
+    inboxCursor: null,
+    openFindings: { [key]: { since: measuredAt, metric: 30, measuredAt, announced: true, dismissedAt: null } },
+    blindSpots: null,
+  });
+
+  const finding = comparison.findings.find((f) => f.key === key);
+  assert.ok(finding, "30 days of cover down to under one is a material worsening");
+  assert.equal(finding!.trigger, "worsened");
+  assert.equal(finding!.observation.priorMeasuredAt, measuredAt);
+  assert.match(finding!.observation.evidence, /was 30 days, measured 2026-08-01/);
+  assert.doesNotMatch(finding!.observation.evidence, /at the last pulse/);
 });

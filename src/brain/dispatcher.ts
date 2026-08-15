@@ -175,6 +175,13 @@ export interface JobReport {
    * one is "no message was owed", this one is "the business is fine".
    */
   quiet?: boolean;
+  /**
+   * What the lane could not see this run, by key (`sense:products`,
+   * `field:velocity`, `page:orders`, …). Present on every founder-plane job,
+   * empty when the lane saw everything — an empty array and an absent field are
+   * different claims, and only one of them means "nothing was dark".
+   */
+  blindSpots?: string[];
   settled:
     | "completed"
     /** The work happened; the server said our lease had already been recovered. NOT a success. */
@@ -275,6 +282,16 @@ interface FounderPlaneRun {
   modelCalls: number;
   /** Nothing worth telling the founder. The pulse's designed success. */
   quiet: boolean;
+  /**
+   * WHAT THE LANE COULD NOT SEE, by stable key.
+   *
+   * This used to be dropped here: the pulse computed `senseFailures` and the
+   * dispatcher forwarded `{modelCalls, quiet}` only, so a tenant whose reads
+   * had been failing for a week produced tick reports identical to a healthy
+   * one's. "Quiet" and "blind" are opposite claims and the row that carries one
+   * must carry the other.
+   */
+  blindSpots: string[];
 }
 
 /**
@@ -306,7 +323,11 @@ const FOUNDER_PLANE_RUNNERS: Record<string, (storeId: string, job: NovaJob) => P
       dedupeKey: job.dedupeKey,
       jobId: job.id,
     });
-    return { modelCalls: result.modelCalls, quiet: result.quiet };
+    return {
+      modelCalls: result.modelCalls,
+      quiet: result.quiet,
+      blindSpots: result.blindSpots.map((b) => b.key),
+    };
   },
 };
 
@@ -400,6 +421,7 @@ async function performJob(
           kind: job.kind,
           lane: "founder_plane",
           modelCalls: founder.modelCalls,
+          blindSpots: founder.blindSpots,
           ...(founder.quiet ? { quiet: true } : {}),
         },
       };

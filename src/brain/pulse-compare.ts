@@ -15,7 +15,7 @@
  * owner") was the only thing standing between the founder and a daily drip of
  * the same alert.
  *
- * Here a condition is news exactly twice:
+ * Here a condition is news exactly three times:
  *   1. when it CROSSES — it was not true at the last pulse and it is now
  *      (a store with no stored snapshot at all is a first sighting: every true
  *      condition crosses, once, and then goes quiet);
@@ -23,11 +23,39 @@
  *      moved by at least {@link MATERIAL_CHANGE_PCT} in the bad direction.
  *      "12 days of cover became 3" is a different fact from "12 days of cover
  *      is still 11".
+ *   3. when it is still true and was NEVER REPORTED (`unreported`). See below —
+ *      this is the third case, and it exists because the first two silently
+ *      assumed that deriving a condition and telling the founder about it were
+ *      the same event.
  *
  * A condition that CLOSES is deliberately NOT a finding. Silence is the
  * designed success of this lane, and "the thing I warned you about is fine now"
  * is the most tempting kind of spam there is. It leaves the open set, and the
  * next time it crosses it is news again.
+ *
+ * ── OPEN MEANS "THE FOUNDER KNOWS", NOT "WE WORKED IT OUT" ─────────────────
+ *
+ * Every derived condition used to be written into `open` before any judging or
+ * filing happened, which quietly made two very different things equal. Probed:
+ * a single `worthWaking: false` dropped a department's findings and marked them
+ * open forever (they can only return by worsening 25%, and only stock-out
+ * conditions are ever critical — so every revenue drop, supplier delay, margin
+ * and cart finding was suppressible once and for good); and one 500 on
+ * `POST /reports` erased six findings including two critical stock-outs while
+ * the snapshot recorded all of them as told.
+ *
+ * `OpenCondition.announced` is the fix, and `pulse.ts` sets it from what
+ * reached the founder — a filed report, or a Decision card on their desk. The
+ * zero-model-call property survives intact: a condition that DID reach them
+ * stays quiet until it worsens, exactly as before. Only the ones nobody was
+ * told about come back.
+ *
+ * The two ways of not being told are not the same event, and
+ * {@link DISMISSAL_QUIET_MS} is where they part company: a LOST REPORT decided
+ * nothing, so the next pulse says it again immediately; a DISMISSAL is Nova
+ * having answered the question it was asked ("worth waking them RIGHT NOW?"),
+ * so it holds for a day and then the condition is news again. Neither is
+ * forever, which is the only property the old code got wrong.
  *
  * ── A DOMAIN THAT DID NOT ANSWER PRODUCES NOTHING, AND FORGETS NOTHING ─────
  *
@@ -37,11 +65,19 @@
  * would read as "all conditions cleared"; without the second, the pulse after
  * a blip would see every condition as a first sighting and alert on all of
  * them at once.
+ *
+ * THE SAME RULE NOW HOLDS ONE LEVEL DOWN. A read that SUCCEEDS but comes back
+ * without the field a condition is built on is just as unable to re-derive it:
+ * a product page with no velocity closed every open critical stock-out
+ * condition, and the re-crossing announced itself as *"(first sighting)"* about
+ * something that had been true the whole time. {@link undeterminableKeys} names
+ * those conditions and they are carried forward with the dark domains.
  */
 
 import type { NovaDepartment } from "../store/types.js";
-import type { ProductSignal, StoreSense } from "../lib/snapshot.js";
-import type { PulseSnapshot, ProductState } from "./pulse-state.js";
+import { LIST_PAGE_CAP } from "../lib/snapshot.js";
+import type { BlindSpot, ProductSignal, StoreSense } from "../lib/snapshot.js";
+import type { BlindSpotState, OpenCondition, PulseSnapshot, ProductState } from "./pulse-state.js";
 
 /** The five domains the sense layer actually reads. Nothing else may appear. */
 export type PulseDomain = "inventory" | "sales" | "carts" | "margin" | "supplier";
@@ -69,6 +105,33 @@ export const PULSE_THRESHOLDS = {
   materialChangePct: 25,
 } as const;
 
+/**
+ * How long a blind spot may stay dark before Nova says so AGAIN.
+ *
+ * Blindness is edge-triggered like everything else, or a week-long outage
+ * becomes an hourly alarm. But pure edge-triggering is how "four of five senses
+ * are dark" turned into a healthy-looking `quiet: true` after the first pass,
+ * so a blind spot that is still dark a day later is news again.
+ */
+export const BLIND_REANNOUNCE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * How long a judge's "not worth waking them for this" holds.
+ *
+ * The two unreported outcomes are not the same event. A LOST REPORT decided
+ * nothing, so the next pulse says it all again. A DISMISSAL is Nova having
+ * looked at the finding and answered the question it was asked — "is this worth
+ * the founder's attention RIGHT NOW" — and the honest re-ask is tomorrow, not
+ * in an hour with the identical card and a predictable identical answer.
+ *
+ * The bound that matters is that it EXPIRES. What this replaces marked the
+ * condition open forever: since only stock-out conditions are ever critical,
+ * one dismissive call retired a supplier delay, a revenue drop, a thin margin
+ * or a cart pile-up for the life of the subject, recoverable only by a 25%
+ * worsening. A worsening still cuts through this window immediately.
+ */
+export const DISMISSAL_QUIET_MS = 24 * 60 * 60 * 1000;
+
 export const MATERIAL_CHANGE_PCT = PULSE_THRESHOLDS.materialChangePct;
 
 /**
@@ -92,23 +155,44 @@ export interface PulseFinding {
   observation: {
     metric: string;
     value: number | null;
-    /** The same metric at the last pulse. `null` = first sighting. */
+    /** The same metric, last time it was MEASURED. `null` = first sighting. */
     priorValue: number | null;
+    /**
+     * When that prior value was measured. Not necessarily the last pulse: a
+     * value survives passes whose domain went dark, and "was 12 at the last
+     * pulse" about a pulse that never read the number is a small, confident
+     * lie. `null` alongside a `null` priorValue.
+     */
+    priorMeasuredAt: string | null;
     /** One line a founder can check against their own dashboard. */
     evidence: string;
   };
-  /** `crossed` = newly true. `worsened` = open, and materially worse. */
-  trigger: "crossed" | "worsened";
+  /**
+   * `crossed` = newly true. `worsened` = open, and materially worse.
+   * `unreported` = open, unchanged, and the founder was never actually told
+   * (a dropped judgement or a lost report — see the file header).
+   */
+  trigger: "crossed" | "worsened" | "unreported";
 }
 
 /** What COMPARE decided. `quiet` is the success case, and it is the common one. */
 export interface PulseComparison {
   findings: PulseFinding[];
-  /** Conditions currently true, for the next snapshot's `openFindings`. */
-  open: Record<string, { since: string; metric: number | null }>;
+  /**
+   * Conditions currently true, for the next snapshot's `openFindings` — with
+   * `announced` carried from the prior snapshot, NOT set from the fact that
+   * this pass derived them. `pulse.ts` marks the ones that reached the founder.
+   */
+  open: Record<string, OpenCondition>;
   /** Departments with at least one finding — the only ones DECIDE may wake. */
   departments: NovaDepartment[];
   quiet: boolean;
+}
+
+/** A prior measurement, and when it was actually taken. */
+export interface PriorObservation {
+  value: number | null;
+  at: string;
 }
 
 /** Internal shape: a condition that is TRUE right now. */
@@ -123,11 +207,25 @@ interface Condition {
   value: number | null;
   /** Which way is worse — decides whether a move is news or relief. */
   worseWhen: "lower" | "higher";
-  evidence: (priorValue: number | null) => string;
+  evidence: (prior: PriorObservation | null) => string;
 }
 
 const round = (n: number, dp = 2): number => Math.round(n * 10 ** dp) / 10 ** dp;
 const money = (n: number): string => `৳${Math.round(n).toLocaleString("en-IN")}`;
+
+/**
+ * How a finding refers to the number it is being compared against.
+ *
+ * "(was 12 days at the last pulse)" was written whatever the prior value's age,
+ * and prior values are deliberately carried across dark passes — so the line
+ * could name a pulse that never observed it. The measurement's own date is
+ * named instead: always true, and it tells the founder when the comparison
+ * actually starts from.
+ */
+function sinceLine(prior: PriorObservation | null, render: (value: number) => string): string {
+  if (prior === null || prior.value === null) return " (first sighting)";
+  return ` (was ${render(prior.value)}, measured ${prior.at.slice(0, 10)})`;
+}
 
 /**
  * Did an open condition's metric move enough, in the bad direction, to be news?
@@ -177,9 +275,10 @@ function inventoryConditions(products: ProductSignal[]): Condition[] {
         value: round(p.daysOfCover),
         worseWhen: "lower",
         evidence: (prior) =>
-          `${p.stock} units left selling ~${round(p.velocity ?? 0)}/day = ${Math.floor(p.daysOfCover!)} days of cover, ` +
+          `${p.stock} units left selling ~${round(p.velocity ?? 0)}/day (${weekWindow(p)}) = ` +
+          `${Math.floor(p.daysOfCover!)} days of cover, ` +
           `against a ${p.leadTimeDays}-day wait from ${p.supplierName ?? p.supplierId}` +
-          (prior === null ? " (first sighting)" : ` (was ${round(prior)} days at the last pulse)`),
+          sinceLine(prior, (v) => `${round(v)} days`),
       });
     }
     // DEAD STOCK NEEDS BOTH INPUTS TO BE REAL. A live dakio tenant answers
@@ -187,12 +286,18 @@ function inventoryConditions(products: ProductSignal[]): Condition[] {
     // novaStore.js), and reading those as "sells nothing" and "reorder at zero"
     // would declare the ENTIRE catalogue dead stock, confidently, every hour.
     // Unknown is not a measurement.
+    // The CASH figure needs a cost, and a cost of `null` is unknown — see
+    // `costOf` in snapshot.ts. Reading dakio-api's `num(null) = 0` as a
+    // measurement would price every uncosted overhang at ৳0 tied up, which is
+    // both wrong and reassuring.
     if (
       p.velocity !== null &&
+      p.cost !== null &&
       p.reorderPoint > 0 &&
       p.stock > PULSE_THRESHOLDS.deadStockOverhangMultiple * p.reorderPoint &&
       p.velocity < PULSE_THRESHOLDS.deadStockVelocity
     ) {
+      const tiedUp = p.stock * p.cost;
       out.push({
         key: `inventory:dead:${p.id}`,
         domain: "inventory",
@@ -203,16 +308,27 @@ function inventoryConditions(products: ProductSignal[]): Condition[] {
         // The metric is the CASH, not the unit count: 80 units of a ৳7,799
         // vase and 80 units of a ৳120 candle are not the same problem.
         metric: "tiedUpCash",
-        value: round(p.stock * p.cost),
+        value: round(tiedUp),
         worseWhen: "higher",
         evidence: (prior) =>
-          `${p.stock} units on hand (reorder point ${p.reorderPoint}) selling ~${round(p.velocity ?? 0)}/day — ` +
-          `${money(p.stock * p.cost)} tied up` +
-          (prior === null ? " (first sighting)" : ` (was ${money(prior)})`),
+          `${p.stock} units on hand (reorder point ${p.reorderPoint}) selling ~${round(p.velocity ?? 0)}/day ` +
+          `(${weekWindow(p)}) — ${money(tiedUp)} tied up` +
+          sinceLine(prior, (v) => money(v)),
       });
     }
   }
   return out;
+}
+
+/**
+ * What the velocity figure was averaged over, said out loud.
+ *
+ * "selling ~0.14/day" reads as a settled fact about a product's demand. With
+ * one weekly bucket it is one week's sales divided by seven, and the founder
+ * cannot tell the two apart from the sentence.
+ */
+function weekWindow(p: ProductSignal): string {
+  return p.velocityWeeks === 1 ? "1 week of sales" : `mean of ${p.velocityWeeks} weeks`;
 }
 
 /**
@@ -234,21 +350,47 @@ function marginConditions(products: ProductSignal[]): Condition[] {
       metric: "marginPct",
       value: round(p.marginPct),
       worseWhen: "lower",
+      // `p.cost` is non-null whenever `marginPct` is — `marginPctOf` returns
+      // null without a cost, which is the entire point of D3/D4: no cost, no
+      // margin claim, rather than a confident 100% on a product Nova cannot
+      // cost or a `NaN% margin at ৳3,959 on ৳NaN cost`.
       evidence: (prior) =>
-        `${round(p.marginPct!)}% margin at ${money(p.price)} on ${money(p.cost)} cost` +
-        (prior === null ? " (first sighting)" : ` (was ${round(prior)}%)`),
+        `${round(p.marginPct!)}% margin at ${money(p.price)} on ${money(p.cost!)} cost` +
+        sinceLine(prior, (v) => `${round(v)}%`),
     });
   }
   return out;
 }
 
-/** Sales — revenue over the last 7 days against the 7 before it. */
-function salesConditions(sales: { revenue7d: number; revenuePrior7d: number }): Condition[] {
+/**
+ * Sales — revenue over the last 7 days against the 7 before it.
+ *
+ * REFUSED OUTRIGHT ON A TRUNCATED PAGE. The window is one 200-row page ordered
+ * newest-first, so on a busy store the rows that fall off are the prior week's
+ * — the denominator. Every such comparison is biased the same way (toward "up",
+ * so the alarm goes quiet) and the percentage is one the founder can check
+ * against their own dashboard and find wrong. A missing claim is recoverable;
+ * a confident wrong percentage in a report costs Nova the founder's trust in
+ * every other number on the page.
+ */
+function salesConditions(sales: {
+  revenue7d: number;
+  revenuePrior7d: number;
+  partial: boolean;
+  unpricedOrders: number;
+}): Condition[] {
+  if (sales.partial) return [];
   // No prior week to compare against ⇒ no claim. A first-week store is not a
   // store whose revenue collapsed.
   if (sales.revenuePrior7d <= 0) return [];
   const changePct = ((sales.revenue7d - sales.revenuePrior7d) / sales.revenuePrior7d) * 100;
   if (changePct > PULSE_THRESHOLDS.revenueDropPct) return [];
+  // The maturity bias, named in the line the founder reads: both weeks exclude
+  // cancelled/refunded/RTO orders, and the older week has had a week longer to
+  // reach one of those statuses.
+  const basis =
+    ` (cancelled, refunded and returned orders excluded from both weeks — the earlier week has had longer to ` +
+    `accumulate them${sales.unpricedOrders > 0 ? `; ${sales.unpricedOrders} order(s) carry no total and are left out` : ""})`;
   return [
     {
       key: "sales:revenue_drop",
@@ -262,14 +404,31 @@ function salesConditions(sales: { revenue7d: number; revenuePrior7d: number }): 
       worseWhen: "lower",
       evidence: (prior) =>
         `${money(sales.revenue7d)} over the last 7 days against ${money(sales.revenuePrior7d)} the week before` +
-        (prior === null ? " (first sighting)" : ` (the gap was ${round(prior, 1)}%)`),
+        basis +
+        sinceLine(prior, (v) => `a ${round(v, 1)}% gap`),
     },
   ];
 }
 
-/** Carts — what is sitting unrecovered, measured in money. */
-function cartConditions(carts: { count: number; value: number }): Condition[] {
+/**
+ * Carts — what is sitting unrecovered, measured in money.
+ *
+ * The count is the unrecovered subset of ONE page of leads (dakio-api hands
+ * back the 200 newest, of any status, of all time). When that page is full the
+ * subset is a floor and says so — "24 carts" that can never exceed 200 however
+ * bad it gets is not a total, and a founder reading it as one is the failure.
+ */
+function cartConditions(carts: { count: number; value: number; partial: boolean; unpriced: number }): Condition[] {
   if (carts.count <= 0) return [];
+  const at = carts.partial ? "at least " : "";
+  const plural = carts.count === 1 ? "" : "s";
+  const unpriced =
+    carts.unpriced > 0
+      ? `, ${carts.unpriced} of them with no cart value recorded (counted, not priced at ৳0)`
+      : "";
+  const scope = carts.partial
+    ? ` — counted from the newest ${LIST_PAGE_CAP} leads only, so this is a floor, not a total`
+    : "";
   return [
     {
       key: "carts:unrecovered",
@@ -277,35 +436,47 @@ function cartConditions(carts: { count: number; value: number }): Condition[] {
       department: "sales",
       severity: "info",
       subject: "carts",
-      title: `${carts.count} abandoned cart${carts.count === 1 ? "" : "s"} awaiting recovery`,
+      title: `${at}${carts.count} abandoned cart${plural} awaiting recovery`,
       metric: "unrecoveredValue",
       value: round(carts.value),
       worseWhen: "higher",
       evidence: (prior) =>
-        `${carts.count} cart${carts.count === 1 ? "" : "s"} worth ${money(carts.value)} with no recovery message sent` +
-        (prior === null ? " (first sighting)" : ` (was ${money(prior)})`),
+        `${at}${carts.count} cart${plural} worth ${at}${money(carts.value)} with no recovery message sent` +
+        unpriced +
+        scope +
+        sinceLine(prior, (v) => money(v)),
     },
   ];
 }
 
-/** Supplier — days late on open POs, as the supplier itself reports them. */
-function supplierConditions(suppliers: { id: string; name: string; currentDelayDays: number }[]): Condition[] {
-  return suppliers
-    .filter((s) => s.currentDelayDays > 0)
-    .map((s) => ({
+/**
+ * Supplier — days late on open POs, as the supplier itself reports them.
+ *
+ * `null` days is UNKNOWN and produces no condition. It used to arrive as
+ * `currentDelayDays ?? 0`, which turned "this supplier told us nothing" into a
+ * measured, on-time observation — and then stored it as one.
+ */
+function supplierConditions(suppliers: { id: string; name: string; currentDelayDays: number | null }[]): Condition[] {
+  const out: Condition[] = [];
+  for (const s of suppliers) {
+    const delay = s.currentDelayDays;
+    if (delay === null || delay <= 0) continue;
+    out.push({
       key: `supplier:${s.id}`,
-      domain: "supplier" as const,
-      department: "operations" as const,
-      severity: "warning" as const,
+      domain: "supplier",
+      department: "operations",
+      severity: "warning",
       subject: s.id,
-      title: `${s.name} is running ${s.currentDelayDays} day${s.currentDelayDays === 1 ? "" : "s"} late`,
+      title: `${s.name} is running ${delay} day${delay === 1 ? "" : "s"} late`,
       metric: "currentDelayDays",
-      value: s.currentDelayDays,
-      worseWhen: "higher" as const,
-      evidence: (prior: number | null) =>
-        `${s.name} reports ${s.currentDelayDays} day${s.currentDelayDays === 1 ? "" : "s"} of delay on open POs` +
-        (prior === null ? " (first sighting)" : ` (was ${prior})`),
-    }));
+      value: delay,
+      worseWhen: "higher",
+      evidence: (prior) =>
+        `${s.name} reports ${delay} day${delay === 1 ? "" : "s"} of delay on open POs` +
+        sinceLine(prior, (v) => `${v}`),
+    });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -333,15 +504,41 @@ export function comparePulse(sense: StoreSense, prior: PulseSnapshot | null): Pu
 
   const priorOpen = prior?.openFindings ?? null;
   const findings: PulseFinding[] = [];
-  const open: Record<string, { since: string; metric: number | null }> = {};
+  const open: Record<string, OpenCondition> = {};
 
   for (const condition of conditions) {
     const was = priorOpen?.[condition.key] ?? null;
-    const priorValue = was?.metric ?? null;
-    const trigger: PulseFinding["trigger"] | null =
-      was === null ? "crossed" : materiallyWorse(condition, priorValue) ? "worsened" : null;
+    const priorObservation: PriorObservation | null =
+      was === null ? null : { value: was.metric, at: was.measuredAt };
 
-    open[condition.key] = { since: was?.since ?? sense.at, metric: condition.value };
+    // THE THREE WAYS A CONDITION IS NEWS. The third is the one that was
+    // missing: still true, unchanged, and nobody ever told the founder.
+    //
+    // A worsening is checked LAST but suppresses nothing — a condition inside
+    // its dismissal window that materially worsens is a different fact and is
+    // raised immediately.
+    const trigger: PulseFinding["trigger"] | null =
+      was === null
+        ? "crossed"
+        : !was.announced && !withinDismissalWindow(was, sense.at)
+          ? "unreported"
+          : materiallyWorse(condition, was.metric)
+            ? "worsened"
+            : null;
+
+    // A condition whose value could not be measured this pass keeps the last
+    // real measurement and its date, rather than overwriting a known number
+    // with `null` and dating it now.
+    const measured = condition.value !== null;
+    open[condition.key] = {
+      since: was?.since ?? sense.at,
+      metric: measured ? condition.value : (was?.metric ?? null),
+      measuredAt: measured ? sense.at : (was?.measuredAt ?? sense.at),
+      // Carried, never set from "we derived it" — `pulse.ts` sets both of these
+      // from what happened to the finding downstream.
+      announced: was?.announced ?? false,
+      dismissedAt: was?.dismissedAt ?? null,
+    };
     if (trigger === null) continue;
 
     findings.push({
@@ -354,27 +551,105 @@ export function comparePulse(sense: StoreSense, prior: PulseSnapshot | null): Pu
       observation: {
         metric: condition.metric,
         value: condition.value,
-        priorValue,
-        evidence: condition.evidence(priorValue),
+        priorValue: priorObservation?.value ?? null,
+        priorMeasuredAt: priorObservation?.value === undefined || priorObservation?.value === null
+          ? null
+          : priorObservation.at,
+        evidence: condition.evidence(priorObservation),
       },
       trigger,
     });
   }
 
-  // ── Carry forward the open set of any domain that went dark ───────────────
+  // ── Carry forward what could NOT be re-derived this pass ──────────────────
   //
-  // Its conditions were not re-derived this pass, so dropping them would (a)
-  // report every one of them as newly crossed on the next healthy pulse and (b)
-  // lose the `since` stamps. A blind domain remembers; it does not forget.
+  // Two ways a condition goes un-re-derived, and both must remember:
+  //   · its whole DOMAIN went dark (a failed read);
+  //   · its domain answered but the FIELD the condition is built on came back
+  //     unknown — a product page with no velocity, a supplier with no delay
+  //     figure, a truncated catalogue that no longer contains the product.
+  // Dropping either would report every one of them as newly crossed on the next
+  // healthy pulse — announced as a "(first sighting)" of something that has
+  // been continuously true — and lose the `since` stamps.
   if (priorOpen) {
+    const undeterminable = undeterminableKeys(sense, Object.keys(priorOpen));
     for (const [key, state] of Object.entries(priorOpen)) {
       if (key in open) continue;
-      if (!domainAnswered(sense, domainOfKey(key))) open[key] = state;
+      if (!domainAnswered(sense, domainOfKey(key)) || undeterminable.has(key)) open[key] = state;
     }
   }
 
   const departments = [...new Set(findings.map((f) => f.department))];
   return { findings, open, departments, quiet: findings.length === 0 };
+}
+
+/**
+ * Condition keys this pass COULD NOT DECIDE — the read answered, the input did
+ * not.
+ *
+ * This is the field-granularity half of the degradation contract. Without it, a
+ * `200 OK` product page missing `weeklyVelocity` silently closes every open
+ * stock-out condition on the store: nothing re-derives them, so they leave the
+ * open set as though the problem had been solved.
+ *
+ * A key in here is neither open nor closed — it is UNKNOWN, and unknown keeps
+ * whatever the last pulse knew.
+ */
+export function undeterminableKeys(sense: StoreSense, priorKeys: readonly string[] = []): Set<string> {
+  const out = new Set<string>();
+
+  if (sense.products.ok) {
+    const onPage = new Set<string>();
+    for (const p of sense.products.value) {
+      onPage.add(p.id);
+      // Cover needs a velocity above the floor AND a lead time.
+      if (p.daysOfCover === null || p.leadTimeDays === null) out.add(`inventory:cover:${p.id}`);
+      // Dead stock needs a velocity, a cost for the cash figure, and a reorder
+      // point to measure overhang from (`0` is dakio-api's "no source").
+      if (p.velocity === null || p.cost === null || p.reorderPoint <= 0) out.add(`inventory:dead:${p.id}`);
+      if (p.marginPct === null) out.add(`margin:${p.id}`);
+    }
+    // A TRUNCATED catalogue did not look at every product, so a previously open
+    // condition about a product that is not on this page was not examined. It
+    // is unknown, not solved — the 601st SKU does not stop having a problem
+    // because the page stopped at 200.
+    if (sense.partial.products) {
+      for (const key of priorKeys) {
+        const id = productIdOfKey(key);
+        if (id !== null && !onPage.has(id)) out.add(key);
+      }
+    }
+  }
+
+  if (sense.suppliers.ok) {
+    for (const s of sense.suppliers.value) {
+      if (s.currentDelayDays === null) out.add(`supplier:${s.id}`);
+    }
+  }
+
+  // A revenue comparison that cannot be computed (truncated page, or no prior
+  // week) leaves the condition where it was rather than closing it.
+  if (sense.sales.ok && (sense.sales.value.partial || sense.sales.value.revenuePrior7d <= 0)) {
+    out.add("sales:revenue_drop");
+  }
+
+  return out;
+}
+
+/** The product id inside a per-product condition key, or `null`. */
+function productIdOfKey(key: string): string | null {
+  for (const prefix of ["inventory:cover:", "inventory:dead:", "margin:"]) {
+    if (key.startsWith(prefix)) return key.slice(prefix.length);
+  }
+  return null;
+}
+
+/** Is this condition still inside the window a judge's dismissal bought? */
+function withinDismissalWindow(state: OpenCondition, at: string): boolean {
+  if (state.dismissedAt === null) return false;
+  const dismissedMs = Date.parse(state.dismissedAt);
+  if (!Number.isFinite(dismissedMs)) return false;
+  return Date.parse(at) - dismissedMs < DISMISSAL_QUIET_MS;
 }
 
 /** The domain a condition key belongs to — the prefix before the first colon. */
@@ -418,7 +693,24 @@ export function nextSnapshot(
   comparison: PulseComparison,
   /** Max `receivedAt` of the events this pulse took into account. */
   inboxCursor: string | null,
+  /**
+   * WHAT HAPPENED TO THE FINDINGS after they were derived — the half the
+   * snapshot used to assume.
+   *
+   * `announced`: keys that made it into a filed report or onto a Decision card.
+   * `dismissed`: keys whose department the judge said was not worth waking the
+   * founder for. Everything mentioned in neither stays unreported and is news
+   * again next pulse, which is the safe default for a caller that forgets.
+   */
+  outcome: {
+    announced?: ReadonlySet<string>;
+    dismissed?: ReadonlySet<string>;
+    blindSpots?: Record<string, BlindSpotState>;
+  } = {},
 ): PulseSnapshot {
+  const announced = outcome.announced ?? new Set<string>();
+  const dismissed = outcome.dismissed ?? new Set<string>();
+  const blind = outcome.blindSpots ?? {};
   const products: Record<string, ProductState> | null = sense.products.ok
     ? Object.fromEntries(
         sense.products.value.map((p) => [
@@ -427,6 +719,17 @@ export function nextSnapshot(
         ]),
       )
     : (prior?.products ?? null);
+
+  const openFindings = Object.fromEntries(
+    Object.entries(comparison.open).map(([key, state]) => [
+      key,
+      announced.has(key)
+        ? { ...state, announced: true, dismissedAt: null }
+        : dismissed.has(key)
+          ? { ...state, dismissedAt: sense.at }
+          : state,
+    ]),
+  );
 
   return {
     at: sense.at,
@@ -440,6 +743,57 @@ export function nextSnapshot(
     // The cursor only ever moves forward: a failed inbox read leaves it where
     // it was, so the events it could not see are still unseen next time.
     inboxCursor: inboxCursor ?? prior?.inboxCursor ?? null,
-    openFindings: comparison.open,
+    openFindings,
+    blindSpots: blind,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Blindness, compared the same way findings are
+// ---------------------------------------------------------------------------
+
+/**
+ * Which blind spots are NEWS this pass.
+ *
+ * Newly dark ⇒ news. Still dark and last announced more than
+ * {@link BLIND_REANNOUNCE_MS} ago ⇒ news again. Still dark and told recently ⇒
+ * silence, so a broken read does not become an hourly alarm.
+ *
+ * The middle case is the one that matters: pure edge-triggering is exactly how
+ * four-of-five senses dark became an indefinite `quiet: true` after the first
+ * pass, and a store that has been blind for a week must not look like a store
+ * with nothing to report.
+ */
+export function blindSpotNews(current: BlindSpot[], prior: PulseSnapshot | null, at: string): BlindSpot[] {
+  const known = prior?.blindSpots ?? {};
+  const nowMs = Date.parse(at);
+  return current.filter((spot) => {
+    const was = known[spot.key];
+    if (!was || was.announcedAt === null) return true;
+    const toldMs = Date.parse(was.announcedAt);
+    return !Number.isFinite(toldMs) || nowMs - toldMs >= BLIND_REANNOUNCE_MS;
+  });
+}
+
+/**
+ * The blind-spot memory to store: `since` carried from the first sighting,
+ * `announcedAt` advanced only for the ones the founder was actually told about
+ * this pass. A spot that cleared is dropped — its next appearance is news.
+ */
+export function nextBlindSpots(
+  current: BlindSpot[],
+  prior: PulseSnapshot | null,
+  at: string,
+  announced: ReadonlySet<string>,
+): Record<string, BlindSpotState> {
+  const known = prior?.blindSpots ?? {};
+  const out: Record<string, BlindSpotState> = {};
+  for (const spot of current) {
+    const was = known[spot.key];
+    out[spot.key] = {
+      since: was?.since ?? at,
+      announcedAt: announced.has(spot.key) ? at : (was?.announcedAt ?? null),
+    };
+  }
+  return out;
 }

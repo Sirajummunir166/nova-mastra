@@ -375,6 +375,39 @@ test("a BUILT founder-plane lane runs and completes — and reports what it cost
   // first pulse has real findings, so this one is not zero — the ZERO case is
   // pinned in pulse.eval.test.ts, which owns the pulse's own contract.
   assert.equal(typeof job?.modelCalls, "number");
+  assert.deepEqual(job?.blindSpots, [], "the seeded store can be seen in full, and the row says so explicitly");
+});
+
+/**
+ * A LANE THAT COULD NOT SEE MUST NOT SETTLE LIKE ONE THAT COULD.
+ *
+ * `senseFailures` was computed by the pulse and dropped here — the dispatcher
+ * forwarded `{modelCalls, quiet}` only. A tenant whose catalogue read had been
+ * failing for a week produced tick reports identical to a healthy tenant's, and
+ * the job row said the pulse ran.
+ */
+test("a founder-plane lane that ran blind says so on its job row", async () => {
+  await resetPulseState(A);
+  const judge = pulseJudgeAgent as unknown as { generate: (...a: unknown[]) => unknown };
+  const savedJudge = judge.generate;
+  judge.generate = async () => ({
+    object: { worthWaking: true, headline: "Stock cover slipped", note: "Reorder the two that will run out." },
+  });
+  stub(A, "listProducts", async () => {
+    throw new Error("dakio-api 503 on /products");
+  });
+  const id = enqueue(A, "pulse");
+  let report;
+  try {
+    report = await runDispatchTick({ tenantIds: [A] });
+  } finally {
+    judge.generate = savedJudge;
+  }
+
+  const job = report.jobs.find((j) => j.jobId === id);
+  assert.equal(job?.settled, "completed", "the work that COULD be done was done");
+  assert.ok(job?.blindSpots?.includes("sense:products"), "and the part that could not is on the row");
+  assert.equal(row(A, id).status, "done");
 });
 
 test("a guard-rail violation releases with the fault on the row", async () => {

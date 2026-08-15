@@ -46,6 +46,33 @@
  * appear, and `pulse-compare.ts` refuses to build a finding on an unknown. The
  * demo backend carries real velocity series, which is what keeps those rules
  * exercised and tested until dakio-api grows the reads.
+ *
+ * TWO MORE FIELDS JOINED THAT LIST, for the same reason and after the same
+ * defect was found one field over:
+ *
+ *   cost:             `num(p.purchasePrice)` with `num(null) = 0`, so a product
+ *                     with no purchase price arrives as `cost: 0` — which reads
+ *                     as a 100% margin and SILENTLY DROPS the thin-margin
+ *                     finding for exactly the catalogue Nova cannot cost.
+ *                     {@link costOf} carries `null` instead (see it for why 0
+ *                     is treated as absent rather than as free goods).
+ *   currentDelayDays: `0, // gap` — hard-coded by dakio-api's supplier mapper.
+ *                     An unreported delay must not become a MEASURED on-time
+ *                     observation, so a non-numeric value is carried as `null`.
+ *                     The value `0` itself is genuinely ambiguous on the wire
+ *                     and is named as a blind spot by {@link blindSpots}
+ *                     whenever the supplier record carries no offers either —
+ *                     the shape dakio-api's stub always has.
+ *
+ * ── AND THE PAGES ARE PAGES, NOT TOTALS ────────────────────────────────────
+ *
+ * Every list route in dakio-api's Nova surface is `take: LIST_CAP` (200),
+ * `orderBy: createdAt desc`, with no pagination to page around. A 200-row page
+ * presented as "your catalogue" or "your carts" is a measurement the founder
+ * can check and find wrong, so {@link StoreSense.partial} says which reads hit
+ * the cap and everything downstream words itself as a PARTIAL VIEW — or, where
+ * the truncation destroys the arithmetic outright (week-over-week revenue),
+ * refuses to make the claim at all.
  */
 
 import { storeFor } from "../store/resolve.js";
@@ -216,7 +243,13 @@ export interface ProductSignal {
   stock: number;
   reorderPoint: number;
   price: number;
-  cost: number;
+  /**
+   * Unit cost. NULL MEANS UNKNOWN — see {@link costOf}. A `0` on the wire is
+   * dakio-api's `num(null)`, and reading it as a measurement is what produced a
+   * confident "100% margin" for every product whose purchase price Nova cannot
+   * see, and a `NaN% margin at ৳3,959 on ৳NaN cost` for a non-numeric one.
+   */
+  cost: number | null;
   /**
    * Units/day, the mean of the last 4 weekly buckets ÷ 7 (nova-ai's window).
    *
@@ -227,6 +260,15 @@ export interface ProductSignal {
    * confident, false findings built on a field with no source.
    */
   velocity: number | null;
+  /**
+   * HOW MANY WEEKLY BUCKETS THAT MEAN IS OVER — 0 when velocity is unknown.
+   *
+   * The window is "the last 4 weeks", and the average was taken over however
+   * many buckets happened to exist: one week of history read as a settled
+   * "~0.14/day" with nothing saying it was one week. The count travels so the
+   * evidence line can say what was actually averaged.
+   */
+  velocityWeeks: number;
   /**
    * `stock / velocity`. NULL when velocity is unknown, or at or below
    * {@link NEAR_ZERO_VELOCITY} — a product nobody is buying has no meaningful
@@ -246,25 +288,72 @@ export interface ProductSignal {
   supplierName: string | null;
 }
 
-/** Revenue over the last 7 days and the 7 before it — the WoW comparison. */
+/**
+ * Revenue over the last 7 days and the 7 before it — the WoW comparison.
+ *
+ * TWO BIASES TRAVEL WITH THIS WINDOW and neither can be fixed from this side,
+ * so both are stated rather than smoothed over:
+ *
+ *  · TRUNCATION. The window is one `sinceDays: 14` page, capped at 200 rows
+ *    NEWEST FIRST. On a store busy enough to fill it, the rows that fall off
+ *    are the OLDEST — the prior week — so the ratio is biased toward "revenue
+ *    is up" and the drop alarm silently stops firing. {@link SalesWindow.partial}
+ *    marks it and `pulse-compare.ts` REFUSES to compute a week-over-week claim
+ *    from a truncated page: a percentage the founder can check against their own
+ *    dashboard and find wrong is worse than no percentage.
+ *  · MATURITY. `revenueEligible` strips cancelled/refunded/RTO, and the older
+ *    week has had a week longer to reach those statuses. That inflates the
+ *    ratio too, by a smaller amount, and it is named in the finding's evidence
+ *    so a founder comparing against their dashboard knows what was counted.
+ */
 export interface SalesWindow {
   revenue7d: number;
   revenuePrior7d: number;
   orders7d: number;
   ordersPrior7d: number;
+  /** The order page hit the row cap — this is a slice, not the fortnight. */
+  partial: boolean;
+  /** Eligible orders with no usable total; excluded from the sums, not zeroed. */
+  unpricedOrders: number;
 }
 
-/** Carts nobody has recovered yet: `none` + `message_prepared`. */
+/**
+ * Carts nobody has recovered yet: `none` + `message_prepared`.
+ *
+ * NOT A TOTAL WHEN {@link CartTotals.partial} IS SET. dakio-api's `/carts` is
+ * the 200 newest storefront leads OF ANY STATUS, of all time; the unrecovered
+ * ones are a subset of that page, so on a store with more leads the count can
+ * never exceed 200 no matter how bad it gets. Leads with no cart value are
+ * COUNTED but not priced (dakio-api's `num(null) = 0` would otherwise fold
+ * them into the money figure at ৳0).
+ */
 export interface CartTotals {
   count: number;
   value: number;
+  /** The lead page hit the row cap — "at least this many", never a total. */
+  partial: boolean;
+  /** Unrecovered carts with no usable value; excluded from `value`. */
+  unpriced: number;
 }
 
 export interface SupplierSignal {
   id: string;
   name: string;
-  /** Days of delay on currently open POs, 0 if none. */
-  currentDelayDays: number;
+  /**
+   * Days of delay on currently open POs, 0 if none. NULL = the supplier did
+   * not report a number. An unreported delay is not an on-time delivery, and
+   * storing it as one is how "measured, on time" gets written about a supplier
+   * nobody has heard from.
+   */
+  currentDelayDays: number | null;
+  /**
+   * Does this record carry supplier offers at all? dakio-api's supplier mapper
+   * ships `offers: []` and `currentDelayDays: 0, // gap` together, so a record
+   * with no offers is a STUB and its `0` is indistinguishable from a measured
+   * on-time supplier. {@link blindSpots} says so rather than the pulse quietly
+   * believing every live supplier is running perfectly to schedule.
+   */
+  hasOffers: boolean;
 }
 
 /** One unprocessed store event — awareness, never a finding of its own. */
@@ -291,7 +380,22 @@ export interface StoreSense {
   carts: DomainRead<CartTotals>;
   suppliers: DomainRead<SupplierSignal[]>;
   inbox: DomainRead<InboxEventSignal[]>;
+  /**
+   * Which reads came back on a page that hit dakio-api's row cap. A capped page
+   * is a SLICE — the newest 200 rows — and nothing downstream may present one
+   * as a total.
+   */
+  partial: { products: boolean; orders: boolean; carts: boolean };
 }
+
+/**
+ * The senses, by name. ONE list, so "did every sense go dark?" is a question
+ * about this array rather than a hard-coded `=== 5` that a sixth sense would
+ * silently walk past.
+ */
+export const SENSE_DOMAINS = ["products", "sales", "carts", "suppliers", "inbox"] as const;
+
+export type SenseDomain = (typeof SENSE_DOMAINS)[number];
 
 /**
  * THE DOMAINS THIS LAYER DELIBERATELY DOES NOT SENSE, and why.
@@ -331,6 +435,19 @@ export const SENSE_GAPS: readonly { domain: "ads" | "courier" | "support"; reaso
 /** Treat average daily sales at or below this as "not selling" (nova-ai). */
 export const NEAR_ZERO_VELOCITY = 0.01;
 
+/**
+ * dakio-api's row cap on every Nova list route (`LIST_CAP = 200` in
+ * `novaStore.js`), mirrored here because there is no pagination to page around
+ * it and no header that says a page was truncated. A read that comes back with
+ * this many rows is ASSUMED to be a slice — conservative in the honest
+ * direction: a store with exactly 200 products is described as "at least 200",
+ * which is true, rather than as a complete sweep, which might not be.
+ */
+export const LIST_PAGE_CAP = 200;
+
+/** The velocity window: the last 4 weekly buckets (nova-ai's). */
+export const VELOCITY_WEEKS = 4;
+
 const DAY_MS = 86_400_000;
 
 function sum(values: number[]): number {
@@ -345,22 +462,69 @@ function revenueEligible(orders: StoreOrder[]): StoreOrder[] {
 }
 
 /**
+ * The weekly buckets this velocity is actually averaged over: the last
+ * {@link VELOCITY_WEEKS}, with anything that is not a finite number dropped.
+ *
+ * A single `null` inside the series used to poison the mean into `NaN`, which
+ * then propagated into `daysOfCover` and compared as a number against every
+ * threshold below.
+ */
+function weeklyBuckets(product: Pick<StoreProduct, "weeklyVelocity">): number[] {
+  return (product.weeklyVelocity ?? []).filter((n) => Number.isFinite(n)).slice(-VELOCITY_WEEKS);
+}
+
+/**
  * Units/day from the last 4 weekly buckets — nova-ai's window, kept.
  *
  * `null` when there are no buckets at all. nova-ai returned 0 here, which was
  * safe against its demo seed (every product carries eight real weeks) and is
  * not safe against dakio-api, which returns `weeklyVelocity: []` for every
  * product. See {@link ProductSignal.velocity}.
+ *
+ * THE MEAN IS OVER WHATEVER BUCKETS EXIST, which is the right arithmetic and
+ * the wrong sentence: one week of history is a legitimate estimate of a daily
+ * rate and an illegitimate "we watched this for a month". {@link velocityWeeksOf}
+ * carries the count so the founder-facing line can say which it was.
  */
 export function velocityOf(product: Pick<StoreProduct, "weeklyVelocity">): number | null {
-  const weeks = (product.weeklyVelocity ?? []).slice(-4);
+  const weeks = weeklyBuckets(product);
   if (weeks.length === 0) return null;
   return sum(weeks) / weeks.length / 7;
 }
 
-function marginPctOf(product: Pick<StoreProduct, "price" | "cost">): number | null {
+/** How many weekly buckets {@link velocityOf} averaged. 0 = no velocity source. */
+export function velocityWeeksOf(product: Pick<StoreProduct, "weeklyVelocity">): number {
+  return weeklyBuckets(product).length;
+}
+
+/**
+ * Unit cost, or `null` when Nova cannot see one.
+ *
+ * ZERO IS TREATED AS UNKNOWN, and that is a judgement call worth stating.
+ * dakio-api maps a missing `purchasePrice` through `num(null) = 0`, so on the
+ * wire "I have no cost for this" and "this cost me nothing" are the same
+ * number. One of those two readings produces a confident 100% margin on a
+ * catalogue Nova cannot cost, and silently drops every thin-margin finding
+ * there is; the other loses a finding about goods that genuinely cost nothing,
+ * which no store sells. Unknown wins.
+ */
+export function costOf(product: Pick<StoreProduct, "cost">): number | null {
+  return Number.isFinite(product.cost) && product.cost > 0 ? product.cost : null;
+}
+
+/**
+ * `(price - cost) / price * 100`, or `null` when either side is unknown.
+ *
+ * The price guard was here from the start; the cost guard was not, and that is
+ * the whole of D3/D4: `((3959 - 0) / 3959) * 100 = 100%` for an uncosted
+ * product (finding dropped, founder told nothing), and `NaN` for a non-numeric
+ * one (finding rendered as `NaN% margin at ৳3,959 on ৳NaN cost`).
+ */
+export function marginPctOf(product: Pick<StoreProduct, "price" | "cost">): number | null {
+  const cost = costOf(product);
+  if (cost === null) return null;
   if (!Number.isFinite(product.price) || product.price <= 0) return null;
-  return ((product.price - product.cost) / product.price) * 100;
+  return ((product.price - cost) / product.price) * 100;
 }
 
 /**
@@ -390,12 +554,16 @@ export async function senseStore(storeId: string, client: StoreClient = storeFor
   const at = client.now();
   const nowMs = Date.parse(at);
 
-  const [products, suppliers, orders14, cartsNone, cartsPrepared, events] = await Promise.all([
+  const [products, suppliers, orders14, cartPage, events] = await Promise.all([
     sense(storeId, "products", () => client.listProducts({ status: "active" })),
     sense(storeId, "suppliers", () => client.listSuppliers()),
     sense(storeId, "orders", () => client.listOrders({ sinceDays: 14 })),
-    sense(storeId, "carts:none", () => client.listAbandonedCarts("none")),
-    sense(storeId, "carts:prepared", () => client.listAbandonedCarts("message_prepared")),
+    // ONE cart read, filtered here. It used to be two calls for `none` and
+    // `message_prepared` — two identical GETs of the same 200-row page, each
+    // filtered server-side — which cost double and, worse, hid the page size:
+    // "were there more leads than fit?" is unanswerable from a filtered slice,
+    // and that is exactly the question a cart TOTAL depends on.
+    sense(storeId, "carts", () => client.listAbandonedCarts()),
     sense(storeId, "inbox_events", () => client.listInboxEvents({ processed: false })),
   ]);
 
@@ -421,8 +589,9 @@ export async function senseStore(storeId: string, client: StoreClient = storeFor
             stock: p.stock,
             reorderPoint: p.reorderPoint,
             price: p.price,
-            cost: p.cost,
+            cost: costOf(p),
             velocity,
+            velocityWeeks: velocityWeeksOf(p),
             daysOfCover: velocity !== null && velocity > NEAR_ZERO_VELOCITY ? p.stock / velocity : null,
             // Lead time is the CATALOGUE wait plus the supplier's CURRENT
             // delay: reordering against a lead time that ignores a supplier
@@ -438,38 +607,54 @@ export async function senseStore(storeId: string, client: StoreClient = storeFor
     : products;
 
   // ── sales: last 7 days vs the 7 before ────────────────────────────────────
+  //
+  // `o.total || 0` used to fold an order with no usable total into the sum as a
+  // free order. It is counted and excluded instead — an order Nova cannot price
+  // is not an order worth ৳0, and the count rides out so the report can say the
+  // revenue figure is a floor.
   const salesWindow: DomainRead<SalesWindow> = orders14.ok
     ? (() => {
         const eligible = revenueEligible(orders14.value);
-        const last7 = eligible.filter((o) => Date.parse(o.placedAt) >= nowMs - 7 * DAY_MS);
-        const prior7 = eligible.filter((o) => Date.parse(o.placedAt) < nowMs - 7 * DAY_MS);
+        const priced = eligible.filter((o) => Number.isFinite(o.total));
+        const last7 = priced.filter((o) => Date.parse(o.placedAt) >= nowMs - 7 * DAY_MS);
+        const prior7 = priced.filter((o) => Date.parse(o.placedAt) < nowMs - 7 * DAY_MS);
         return {
           ok: true as const,
           value: {
-            revenue7d: sum(last7.map((o) => o.total || 0)),
-            revenuePrior7d: sum(prior7.map((o) => o.total || 0)),
+            revenue7d: sum(last7.map((o) => o.total)),
+            revenuePrior7d: sum(prior7.map((o) => o.total)),
             orders7d: last7.length,
             ordersPrior7d: prior7.length,
+            partial: orders14.value.length >= LIST_PAGE_CAP,
+            unpricedOrders: eligible.length - priced.length,
           },
         };
       })()
     : orders14;
 
-  // ── carts: BOTH reads or neither ──────────────────────────────────────────
+  // ── carts: one page, filtered here ────────────────────────────────────────
   //
-  // A partial cart total is worse than none: half the unrecovered carts reads
-  // as carts having been recovered since the last pulse, which is a "good news"
-  // delta nobody would question.
-  const carts: DomainRead<CartTotals> =
-    cartsNone.ok && cartsPrepared.ok
-      ? {
-          ok: true,
+  // Unrecovered = `none` + `message_prepared`. The page is what dakio-api will
+  // give (200 newest leads, ANY status, all time), so `partial` says when the
+  // subset below cannot be a total, and leads with no cart value are counted
+  // without being priced at ৳0.
+  const carts: DomainRead<CartTotals> = cartPage.ok
+    ? (() => {
+        const unrecovered = cartPage.value.filter(
+          (c) => c.recoveryState === "none" || c.recoveryState === "message_prepared",
+        );
+        const priced = unrecovered.filter((c) => Number.isFinite(c.value) && c.value > 0);
+        return {
+          ok: true as const,
           value: {
-            count: cartsNone.value.length + cartsPrepared.value.length,
-            value: sum([...cartsNone.value, ...cartsPrepared.value].map((c) => c.value || 0)),
+            count: unrecovered.length,
+            value: sum(priced.map((c) => c.value)),
+            partial: cartPage.value.length >= LIST_PAGE_CAP,
+            unpriced: unrecovered.length - priced.length,
           },
-        }
-      : { ok: false, reason: cartsNone.ok ? (cartsPrepared as { reason: string }).reason : (cartsNone as { reason: string }).reason };
+        };
+      })()
+    : cartPage;
 
   return {
     storeId,
@@ -477,13 +662,19 @@ export async function senseStore(storeId: string, client: StoreClient = storeFor
     products: productSignals,
     sales: salesWindow,
     carts,
+    partial: {
+      products: products.ok && products.value.length >= LIST_PAGE_CAP,
+      orders: orders14.ok && orders14.value.length >= LIST_PAGE_CAP,
+      carts: cartPage.ok && cartPage.value.length >= LIST_PAGE_CAP,
+    },
     suppliers: suppliers.ok
       ? {
           ok: true,
           value: suppliers.value.map((s) => ({
             id: s.id,
             name: s.name,
-            currentDelayDays: s.currentDelayDays ?? 0,
+            currentDelayDays: Number.isFinite(s.currentDelayDays) ? s.currentDelayDays : null,
+            hasOffers: (s.offers ?? []).length > 0,
           })),
         }
       : suppliers,
@@ -500,17 +691,167 @@ export async function senseStore(storeId: string, client: StoreClient = storeFor
   };
 }
 
+/** The read behind one sense, by name. */
+function readOf(sense: StoreSense, domain: SenseDomain): DomainRead<unknown> {
+  return sense[domain];
+}
+
 /** Which senses went dark this pass, as report-ready lines. Empty = all read. */
 export function senseFailures(sense: StoreSense): string[] {
   const out: string[] = [];
-  for (const [domain, read] of Object.entries({
-    products: sense.products,
-    sales: sense.sales,
-    carts: sense.carts,
-    suppliers: sense.suppliers,
-    inbox: sense.inbox,
-  }) as [string, DomainRead<unknown>][]) {
+  for (const domain of SENSE_DOMAINS) {
+    const read = readOf(sense, domain);
     if (!read.ok) out.push(`${domain} (${read.reason})`);
   }
+  return out;
+}
+
+/**
+ * Did EVERY sense go dark? Asked of {@link SENSE_DOMAINS} rather than of a
+ * hard-coded count, so a sixth sense cannot silently switch the all-blind guard
+ * off by making `dark.length === 5` unreachable.
+ */
+export function allSensesDark(sense: StoreSense): boolean {
+  return SENSE_DOMAINS.every((domain) => !readOf(sense, domain).ok);
+}
+
+/**
+ * ONE BLIND SPOT — something Nova could not see this pass, at whatever
+ * granularity it went dark.
+ *
+ * ── WHY A DARK SENSE WAS NOT ENOUGH ────────────────────────────────────────
+ *
+ * `senseFailures` only ever named a whole read that THREW. A read that succeeds
+ * and comes back missing the field the finding is built on is just as blind and
+ * looks perfectly healthy: probed, a product read that answered 200 OK with no
+ * velocity closed every open critical stock-out condition (nothing re-derived
+ * them, so they "cleared"), and when the field came back the evidence line said
+ * *"(first sighting)"* about a condition that had been continuously true.
+ *
+ * So blindness is a first-class observation with a STABLE KEY — the key is what
+ * lets `pulse.ts` treat it edge-triggered like everything else: announced when
+ * it appears, re-announced daily while it lasts, and never allowed to sit under
+ * a `quiet: true`.
+ */
+export interface BlindSpot {
+  /** Stable across passes — the reason text changes, this does not. */
+  key: string;
+  /** One line the founder reads, naming what cannot be judged because of it. */
+  detail: string;
+}
+
+/**
+ * Everything Nova could not see this pass: dark senses, load-bearing fields
+ * missing inside a healthy read, and pages that came back truncated.
+ */
+export function blindSpots(sense: StoreSense): BlindSpot[] {
+  const out: BlindSpot[] = [];
+
+  for (const domain of SENSE_DOMAINS) {
+    const read = readOf(sense, domain);
+    if (!read.ok) out.push({ key: `sense:${domain}`, detail: `${domain} could not be read — ${read.reason}` });
+  }
+
+  if (sense.products.ok) {
+    const products = sense.products.value;
+    const total = products.length;
+    const noVelocity = products.filter((p) => p.velocity === null).length;
+    const noLeadTime = products.filter((p) => p.leadTimeDays === null).length;
+    const noCost = products.filter((p) => p.cost === null).length;
+    if (noVelocity > 0) {
+      out.push({
+        key: "field:velocity",
+        detail:
+          `no sales-velocity source for ${noVelocity} of ${total} product(s) — days of cover and dead stock ` +
+          `cannot be judged for them, so silence about those products is not "all clear"`,
+      });
+    }
+    if (noLeadTime > 0) {
+      out.push({
+        key: "field:leadTime",
+        detail:
+          `no supplier lead time for ${noLeadTime} of ${total} product(s) — Nova cannot tell whether a reorder ` +
+          `would land before the shelf empties`,
+      });
+    }
+    if (noCost > 0) {
+      out.push({
+        key: "field:cost",
+        detail:
+          `no unit cost for ${noCost} of ${total} product(s) — margin cannot be computed for them, and a ` +
+          `missing cost is NOT a 100% margin`,
+      });
+    }
+    if (sense.partial.products) {
+      out.push({
+        key: "page:products",
+        detail:
+          `the catalogue sweep covered the ${total} most recently created products and stopped there — anything ` +
+          `older was not looked at this pass`,
+      });
+    }
+  }
+
+  if (sense.sales.ok) {
+    if (sense.sales.value.partial) {
+      out.push({
+        key: "page:orders",
+        detail:
+          `the 14-day order read came back at the ${LIST_PAGE_CAP}-row cap, so the earlier week is truncated — ` +
+          `week-over-week revenue cannot be measured and Nova makes no claim about it`,
+      });
+    }
+    if (sense.sales.value.unpricedOrders > 0) {
+      out.push({
+        key: "field:orderTotal",
+        detail:
+          `${sense.sales.value.unpricedOrders} order(s) in the window carry no usable total — they are excluded ` +
+          `from revenue rather than counted at ৳0, so the revenue figures are a floor`,
+      });
+    }
+  }
+
+  if (sense.carts.ok) {
+    if (sense.carts.value.partial) {
+      out.push({
+        key: "page:carts",
+        detail:
+          `the abandoned-cart read came back at the ${LIST_PAGE_CAP}-row cap (newest leads of any status), so ` +
+          `the cart figures are a floor, not a total`,
+      });
+    }
+    if (sense.carts.value.unpriced > 0) {
+      out.push({
+        key: "field:cartValue",
+        detail:
+          `${sense.carts.value.unpriced} abandoned cart(s) carry no value — counted, but left out of the money ` +
+          `figure instead of being added at ৳0`,
+      });
+    }
+  }
+
+  if (sense.suppliers.ok) {
+    const suppliers = sense.suppliers.value;
+    const unknown = suppliers.filter((s) => s.currentDelayDays === null).length;
+    // A stub record: dakio-api ships `offers: []` and `currentDelayDays: 0,
+    // // gap` from the same mapper, so that 0 is a placeholder, not a delivery
+    // record. Believing it means reporting every live supplier as on time.
+    const stubs = suppliers.filter((s) => s.currentDelayDays !== null && !s.hasOffers).length;
+    if (unknown > 0) {
+      out.push({
+        key: "field:supplierDelay",
+        detail: `${unknown} of ${suppliers.length} supplier(s) report no delay figure — unknown, not on time`,
+      });
+    }
+    if (stubs > 0) {
+      out.push({
+        key: "field:supplierRecord",
+        detail:
+          `${stubs} of ${suppliers.length} supplier(s) came back with no offers and no lead times, so their ` +
+          `"0 days late" is a placeholder from the source, not a measured on-time record`,
+      });
+    }
+  }
+
   return out;
 }

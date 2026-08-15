@@ -32,7 +32,29 @@
  *   ACT      through the SAME authority gate the customer lane uses
  *            (`gateOrFile` → `evaluateAuthority`). No second gate exists in
  *            this repo and this file does not add one.
- *   RECORD   one consolidated `pulse` report, only when something survived.
+ *   RECORD   one consolidated `pulse` report, only when something survived —
+ *            or when something Nova CANNOT SEE is news.
+ *
+ * ── THREE RULES ABOUT WHAT THE FOUNDER IS TOLD ─────────────────────────────
+ *
+ * All three were defects an adversarial review found by probing this lane, and
+ * all three passed the suite that was supposed to guard them.
+ *
+ *  1. THE TITLE IS DERIVED, NEVER WRITTEN BY THE MODEL. {@link pulseTitle}
+ *     builds it from the findings' own code-generated titles. The judge's
+ *     prose is still used — bounded and checked against the card it was judging
+ *     ({@link boundJudgeText}) — but it cannot become the line the founder
+ *     reads first, because that line once read "⚠ Sales are down because your
+ *     courier is losing parcels and ad spend is wasted" on a report that
+ *     disclaims courier and ads in its own footer.
+ *  2. A CONDITION IS "OPEN" ONLY IF IT REACHED THE FOUNDER. The snapshot's
+ *     `announced` flag is set from a filed report or a Decision card on the
+ *     desk — not from "we derived it". One `worthWaking: false`, or one 500 on
+ *     `POST /reports`, used to retire a finding permanently.
+ *  3. `quiet: true` IS UNREACHABLE WHILE SOMETHING IS DARK AND UNREPORTED —
+ *     including a load-bearing FIELD inside a read that succeeded. Blindness is
+ *     compared like a finding (news when it appears, again after a day) so it
+ *     is neither spam nor invisible.
  *
  * ── WHAT THE PULSE MAY DO, AND THE HONEST ANSWER TODAY ─────────────────────
  *
@@ -86,17 +108,45 @@ import {
   type GateReceiptInput,
   type GateSpec,
 } from "../front-office/actions.js";
-import { senseStore, senseFailures, SENSE_GAPS, type StoreSense } from "../lib/snapshot.js";
+import {
+  allSensesDark,
+  blindSpots,
+  senseStore,
+  senseFailures,
+  SENSE_GAPS,
+  type BlindSpot,
+  type StoreSense,
+} from "../lib/snapshot.js";
 import { storeFor } from "../store/resolve.js";
 import { UNGOVERNED_VERBS } from "../store/duties.js";
 import type { StoreClient } from "../store/client.js";
 import type { ActionType, JobKind, NovaDepartment } from "../store/types.js";
 import { laneFor } from "./registry.js";
-import { comparePulse, nextSnapshot, type PulseFinding } from "./pulse-compare.js";
+import {
+  blindSpotNews,
+  comparePulse,
+  nextBlindSpots,
+  nextSnapshot,
+  type PulseFinding,
+} from "./pulse-compare.js";
 import { loadPulseState, savePulseState } from "./pulse-state.js";
 
 /** This lane's kind — every registry lookup below is keyed on it. */
 const KIND = "pulse" as const;
+
+/**
+ * The `confidence` every pulse receipt carries — A CONSTANT, AND SAID TO BE ONE.
+ *
+ * The gate's receipt schema wants a number in this field. The pulse has no
+ * honest one: it does not estimate probabilities, it reports that a measured
+ * value crossed a fixed threshold. The old code wrote `0.9` for critical
+ * findings and `0.7` otherwise, which is a severity flag wearing a probability's
+ * clothes on a founder's Decision card. Nothing in `evaluateAuthority` reads
+ * this field, so no gate outcome moves; what changes is that the card no longer
+ * implies an estimate nobody made. A `pulse:confidence` evidence row states it
+ * in words beside the number.
+ */
+export const PULSE_RECEIPT_CONFIDENCE = 1;
 
 // ---------------------------------------------------------------------------
 // DECIDE — the only model in the lane
@@ -105,16 +155,25 @@ const KIND = "pulse" as const;
 const JUDGE_MODEL =
   process.env.NOVA_MODEL_PULSE ?? process.env.NOVA_MODEL_RESOLVER ?? "anthropic/claude-haiku-4-5-20251001";
 
+/** Hard bounds on anything the judge writes that a founder will read. */
+export const HEADLINE_MAX_CHARS = 120;
+export const NOTE_MAX_CHARS = 240;
+
 export const pulseJudgeSchema = z.object({
   /**
    * Is this worth interrupting the founder's day for, right now? `false` is a
    * real answer and the lane's preferred one.
    */
   worthWaking: z.boolean(),
-  /** One line the founder reads first. ≤ 120 chars, no invented numbers. */
-  headline: z.string(),
-  /** What you would do about it, in one sentence. */
-  note: z.string(),
+  /**
+   * One line about this department's change. BOUNDED AND CHECKED — see
+   * {@link boundJudgeText}. It is NOT the report's title (the title is derived
+   * from the findings themselves) and it may not carry a number the card does
+   * not, or a word about a domain Nova cannot see.
+   */
+  headline: z.string().max(HEADLINE_MAX_CHARS),
+  /** What you would do about it, in one sentence. Same bounds. */
+  note: z.string().max(NOTE_MAX_CHARS),
 });
 
 export type PulseJudgement = z.infer<typeof pulseJudgeSchema>;
@@ -136,10 +195,16 @@ export const pulseJudgeAgent = new Agent({
     "",
     "RULES:",
     "- Never invent a number, a cause or a name. Use only what the card says.",
+    "- NEVER EXPLAIN A CHANGE WITH SOMETHING THE CARD DOES NOT MEASURE. The card lists what Nova cannot see;",
+    "  those subjects do not exist for you. 'Sales are down because the courier is losing parcels' is a lie",
+    "  when nobody measured the courier — and it is the single worst thing you can write here.",
     "- worthWaking = false is the RIGHT answer for anything the owner would not act on today.",
     "  Silence is success; a report about a quiet hour is spam.",
-    "- headline: one line, plain, leading with the fact. No greetings, no filler.",
-    "- note: the single most useful next move, or why it can wait.",
+    `- headline: one line, at most ${HEADLINE_MAX_CHARS} characters, plain, leading with the fact. No greetings,`,
+    "  no filler, no cause you were not given.",
+    `- note: the single most useful next move, or why it can wait. At most ${NOTE_MAX_CHARS} characters.`,
+    "- Both lines are checked against the card before a founder sees them, and a line that fails the check is",
+    "  replaced by the measurement itself. Writing within the card is the only way your wording survives.",
   ].join("\n"),
   model: gateway(JUDGE_MODEL),
 });
@@ -166,6 +231,11 @@ export function changeCard(input: {
   department: NovaDepartment;
   findings: PulseFinding[];
   eventsSeen: number;
+  /**
+   * What Nova could not see THIS PASS, in words — dark reads AND dark fields.
+   * It used to be failed reads only, so a judge asked about inventory on a
+   * store with no velocity source was not told that was why the card was thin.
+   */
   senseDark: string[];
 }): string {
   const lines = [`DEPARTMENT: ${input.department}`, "WHAT CHANGED SINCE THE LAST CHECK:"];
@@ -182,12 +252,103 @@ export function changeCard(input: {
       `CONTEXT: ${input.eventsSeen} new store event(s) since the last check (orders/carts). Awareness only — not a task list.`,
     );
   }
+  // ── WHAT NOVA CANNOT SEE AT ALL ──────────────────────────────────────────
+  //
+  // This was the hole under D1. The card named only THIS PASS's failed reads,
+  // never the three domains that have no source at all — so the judge, asked
+  // why sales moved, reached for the most plausible commerce story it knew and
+  // wrote "your courier is losing parcels and ad spend is wasted" into a report
+  // whose own footer disclaims courier and ads. A model cannot decline to
+  // discuss a subject nobody told it was off the table.
+  lines.push(
+    `NOVA CANNOT SEE (no data source — these subjects do not exist for you, do not name them and do not ` +
+      `explain anything with them): ${SENSE_GAPS.map((g) => g.domain).join(", ")}.`,
+  );
   if (input.senseDark.length > 0) {
     // A dark sense is stated so the judgement is made knowing what it cannot
     // see, rather than reading absence as good news.
-    lines.push(`BLIND SPOTS THIS PASS: ${input.senseDark.join("; ")}`);
+    lines.push(`ALSO BLIND THIS PASS: ${input.senseDark.join("; ")}`);
   }
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// THE BOUND ON WHAT THE MODEL MAY SAY TO A FOUNDER
+// ---------------------------------------------------------------------------
+
+/**
+ * Vocabulary of the domains Nova has no source for. A judge line that reaches
+ * for one of these is talking about something nobody measured.
+ *
+ * Deliberately wide (a false positive costs a nice sentence; a false negative
+ * costs a fabricated cause in the founder's headline) and keyed by the same
+ * three domains {@link SENSE_GAPS} names, so a domain that gains a real read
+ * has exactly one place to be deleted from.
+ */
+const UNKNOWABLE_VOCABULARY: Record<(typeof SENSE_GAPS)[number]["domain"], RegExp> = {
+  ads: /\b(ads?|advert\w*|campaign\w*|roas|cpa|cpm|ctr|boost\w*|retarget\w*|ad[- ]?spend|facebook|meta|instagram)\b/i,
+  courier: /\b(courier\w*|deliver\w*|shipp?\w*|parcel\w*|rto|logistic\w*|pathao|steadfast|redx|consignment\w*)\b/i,
+  support: /\b(support|ticket\w*|complaint\w*|helpdesk|refund[- ]?request\w*)\b/i,
+};
+
+/** Every number in a string, comma-separators removed. */
+function numbersIn(text: string): string[] {
+  return (text.match(/\d[\d,]*(?:\.\d+)?/g) ?? []).map((n) => n.replace(/,/g, ""));
+}
+
+/** A line of model prose, after the check — and why it was replaced, if it was. */
+export interface BoundedText {
+  text: string;
+  /** `null` when the model's own words survived. */
+  rejected: string | null;
+}
+
+/**
+ * BOUND AND CHECK ONE LINE OF JUDGE PROSE against the card it was written from.
+ *
+ * ── WHY THIS EXISTS ────────────────────────────────────────────────────────
+ *
+ * The judge's `headline` used to become the report's TITLE verbatim — the one
+ * line a founder reads first — with no length bound, no vocabulary bound and no
+ * check against the observations. Probed live it produced *"⚠ Sales are down
+ * because your courier is losing parcels and ad spend is wasted"* on a report
+ * whose own footer says Nova makes no claim about courier or ads. The same
+ * string also lands on a Decision card as `receipt.expectedImpact`, where it
+ * reads as Nova's reason for a write.
+ *
+ * The title is no longer model text at all ({@link pulseTitle} derives it from
+ * the findings). This is the second wall, for the prose that remains:
+ *
+ *   1. it must be non-empty, single-line and within its length bound;
+ *   2. it may not name a domain Nova has no source for ({@link SENSE_GAPS});
+ *   3. every NUMBER in it must appear in the card it was judging.
+ *
+ * Rule 3 is strict on purpose: rounding "5.2 days" to "5 days" is rejected, and
+ * the cost of that is a slightly duller sentence — the deterministic
+ * measurement replaces it. The cost of the opposite mistake is a number in a
+ * founder's report that came from nowhere.
+ */
+export function boundJudgeText(
+  raw: string,
+  opts: { card: string; fallback: string; maxLen: number },
+): BoundedText {
+  const reject = (reason: string): BoundedText => ({ text: opts.fallback, rejected: reason });
+  const text = String(raw ?? "").replace(/\s+/g, " ").trim();
+  if (text.length === 0) return reject("empty");
+  if (text.length > opts.maxLen) return reject(`over ${opts.maxLen} characters`);
+
+  for (const gap of SENSE_GAPS) {
+    if (UNKNOWABLE_VOCABULARY[gap.domain].test(text)) {
+      return reject(`mentions ${gap.domain}, which Nova has no data source for`);
+    }
+  }
+
+  const known = new Set(numbersIn(opts.card));
+  for (const n of numbersIn(text)) {
+    if (!known.has(n)) return reject(`cites ${n}, which is not in the measurements it was given`);
+  }
+
+  return { text, rejected: null };
 }
 
 /** The default DECIDE: one structured call to {@link pulseJudgeAgent}. */
@@ -422,6 +583,53 @@ export function scopeJudgement(
   };
 }
 
+/**
+ * One department's judgement AFTER the bound — what the founder may actually be
+ * shown, plus a record of anything the model wrote that was set aside.
+ */
+export interface BoundedJudgement extends PulseJudgement {
+  department: NovaDepartment;
+  /** Wording the check refused, named so the founder is told it happened. */
+  rejections: string[];
+}
+
+/**
+ * Put the judge's two prose fields through {@link boundJudgeText}, falling back
+ * to the MEASUREMENT itself when they do not survive.
+ *
+ * The fallbacks are deterministic strings built from the findings, so a
+ * rejected line degrades to something a founder can still act on rather than to
+ * a blank.
+ */
+export function boundJudgement(
+  judgement: PulseJudgement,
+  input: { department: NovaDepartment; findings: PulseFinding[]; card: string },
+): BoundedJudgement {
+  const lead = input.findings[0];
+  const headline = boundJudgeText(judgement.headline, {
+    card: input.card,
+    fallback: lead?.title ?? `${input.department}: signals moved`,
+    maxLen: HEADLINE_MAX_CHARS,
+  });
+  const note = boundJudgeText(judgement.note, {
+    card: input.card,
+    fallback:
+      `Nova's own wording for this was set aside; the measurement stands: ` +
+      `${lead?.observation.evidence ?? "see the findings above"}`,
+    maxLen: NOTE_MAX_CHARS,
+  });
+  const rejections: string[] = [];
+  if (headline.rejected) rejections.push(`headline (${headline.rejected})`);
+  if (note.rejected) rejections.push(`note (${note.rejected})`);
+  return {
+    department: input.department,
+    worthWaking: judgement.worthWaking,
+    headline: headline.text,
+    note: note.text,
+    rejections,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // The pulse
 // ---------------------------------------------------------------------------
@@ -442,7 +650,16 @@ export interface PulseOptions {
 export interface PulseResult {
   storeId: string;
   at: string;
-  /** True = nothing crossed a threshold. The success case. */
+  /**
+   * True = nothing crossed a threshold AND Nova could see everything it is
+   * supposed to see. The success case.
+   *
+   * IT IS NOT REACHABLE WHILE A SENSE, OR A LOAD-BEARING FIELD INSIDE ONE, IS
+   * DARK AND UNREPORTED. Probed on the old build: four of five senses down
+   * answered `quiet: true, modelCalls: 0`, no report, job row completed — a
+   * store blind for a week was indistinguishable from a healthy one on the
+   * founder's board. See {@link PulseResult.blindSpots}.
+   */
   quiet: boolean;
   /** THE HEADLINE NUMBER. Zero on a quiet pulse, one per moved department otherwise. */
   modelCalls: number;
@@ -451,6 +668,21 @@ export interface PulseResult {
   capabilityGaps: CapabilityGap[];
   /** Senses that did not answer this pass, with their reasons. */
   senseFailures: string[];
+  /**
+   * EVERYTHING NOVA COULD NOT SEE — dark senses, load-bearing fields missing
+   * inside a healthy read, and pages that came back truncated. A superset of
+   * {@link PulseResult.senseFailures}, which only ever covered whole reads that
+   * threw.
+   */
+  blindSpots: BlindSpot[];
+  /** The blind spots this pass actually told the founder about. */
+  blindSpotsReported: string[];
+  /**
+   * Set when the consolidated report could NOT be filed. The findings are then
+   * left `announced: false`, so the next pulse raises them again instead of the
+   * snapshot recording them as told.
+   */
+  reportFailed?: string;
   /** Inbox events marked processed by code (never by a model step). */
   eventsProcessed: number;
   /**
@@ -482,6 +714,10 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
   // ── SENSE (code, free) ───────────────────────────────────────────────────
   const sense = await senseStore(storeId, client);
   const dark = senseFailures(sense);
+  // Everything Nova cannot see this pass, at whatever granularity it went dark:
+  // a read that threw, a field that came back unknown inside a read that did
+  // not, a page that stopped at the row cap.
+  const blind = blindSpots(sense);
 
   // ── The inbox bookkeeping, as CODE — A QUEUE DRAIN, OUTSIDE THE GATE ─────
   //
@@ -525,7 +761,11 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
   // row, tell the founder's board the pulse ran, and write a snapshot of
   // nothing over the last good one. Throwing releases the row with the reason
   // on it, spends an attempt, and lets the watchdog bring it back.
-  if (dark.length === 5) {
+  //
+  // The count is asked of the sense list itself (`allSensesDark`), not written
+  // down here: `dark.length === 5` was a hard-coded five, and a sixth sense
+  // would have switched this guard off without touching this line.
+  if (allSensesDark(sense)) {
     throw new Error(
       `pulse for ${storeId} could not read ANY sense this pass — ${dark.join("; ")}. A blind pulse is not a ` +
         `quiet one; refusing to complete the job or overwrite the last snapshot.`,
@@ -535,14 +775,36 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
   // ── COMPARE (code, free) ─────────────────────────────────────────────────
   const prior = await loadPulseState(storeId);
   const comparison = comparePulse(sense, prior);
-  const snapshot = nextSnapshot(sense, prior, comparison, cursor);
+  // Blindness is compared the same way findings are: news when it appears, news
+  // again once a day while it lasts, silent in between.
+  const blindNews = blindSpotNews(blind, prior, sense.at);
 
-  // ── STOP. Nothing crossed a threshold. ───────────────────────────────────
+  /** Write the snapshot with exactly what became of this pass's findings on it. */
+  const store = (outcome: {
+    announced?: ReadonlySet<string>;
+    dismissed?: ReadonlySet<string>;
+    blindAnnounced?: ReadonlySet<string>;
+  }) =>
+    writeSnapshot(
+      storeId,
+      nextSnapshot(sense, prior, comparison, cursor, {
+        announced: outcome.announced,
+        dismissed: outcome.dismissed,
+        blindSpots: nextBlindSpots(blind, prior, sense.at, outcome.blindAnnounced ?? new Set()),
+      }),
+    );
+
+  // ── STOP. Nothing crossed a threshold, and nothing new is dark. ──────────
   //
   // The snapshot is still written — that is what makes the NEXT pulse cheap
   // too — and nothing else happens. No report, no card, no model, no row.
-  if (comparison.quiet) {
-    const snapshotWritten = await writeSnapshot(storeId, snapshot);
+  //
+  // THE SECOND CLAUSE IS NOT DECORATION. Without it this branch was reachable
+  // with four of the five senses down: no findings can be derived from reads
+  // that never answered, so `comparison.quiet` was true and the pulse reported
+  // a healthy business it had not looked at.
+  if (comparison.quiet && blindNews.length === 0) {
+    const snapshotWritten = await store({});
     return {
       storeId,
       at: sense.at,
@@ -552,9 +814,11 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
       findings: [],
       capabilityGaps: [],
       senseFailures: dark,
+      blindSpots: blind,
+      blindSpotsReported: [],
       eventsProcessed,
       eventDrainFailures: drainFailures,
-      inboxCursor: snapshot.inboxCursor,
+      inboxCursor: nextInboxCursor(cursor, prior),
       snapshotWritten,
     };
   }
@@ -563,15 +827,23 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
   const settled: SettledFinding[] = [];
   const gaps: CapabilityGap[] = [];
   const departmentsWithFindings: NovaDepartment[] = [];
+  const reads: BoundedJudgement[] = [];
+  /** Findings the judge said were not worth waking the founder for — see below. */
+  const dismissed = new Set<string>();
 
   for (const department of comparison.departments) {
     const findings = comparison.findings.filter((f) => f.department === department);
-    const card = changeCard({ department, findings, eventsSeen: events.length, senseDark: dark });
+    const card = changeCard({
+      department,
+      findings,
+      eventsSeen: events.length,
+      senseDark: blind.map((b) => b.detail),
+    });
 
-    let judgement: PulseJudgement;
+    let raw: PulseJudgement;
     try {
       modelCalls += 1;
-      judgement = await decide({ storeId, department, findings, card });
+      raw = await decide({ storeId, department, findings, card });
     } catch (err) {
       // A DEAD MODEL MUST NOT LOSE A CRITICAL FINDING. The numbers were
       // measured by code and are already in hand; only the wording and the
@@ -580,19 +852,41 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
       // fail-open direction here is the safe one, because the alternative is a
       // silent watchdog.
       console.warn(`[pulse] judge failed for ${storeId}/${department} — falling back to the observation:`, err);
-      judgement = {
+      raw = {
         worthWaking: true,
         headline: findings[0]?.title ?? `${department}: signals moved`,
         note: "Judgement unavailable this pass (the model call failed); the measurements above stand on their own.",
       };
     }
 
+    // NOTHING THE MODEL WROTE REACHES A FOUNDER UNCHECKED. See
+    // {@link boundJudgeText}: length, vocabulary, and every number against the
+    // card it was judging.
+    const judgement = boundJudgement(raw, { department, findings, card });
+    if (judgement.rejections.length > 0) {
+      console.warn(
+        `[pulse] the judge's wording for ${storeId}/${department} was set aside — ` +
+          `${judgement.rejections.join("; ")}; using the measurement instead.`,
+      );
+    }
+
     // A CRITICAL FINDING IS NOT SUPPRESSIBLE. The model may judge whether a
     // warning or an info line deserves the founder's attention; it may not
     // decide that a stock-out that lands before the reorder does is fine.
+    //
+    // AND A DROPPED DEPARTMENT IS NO LONGER FORGOTTEN. Its conditions are
+    // recorded as DISMISSED, not as announced: nobody was told, so they cannot
+    // be retired, and `DISMISSAL_QUIET_MS` later they are news again. What this
+    // replaces marked them open — "the founder knows" — which silenced them for
+    // the life of the subject, because only stock-out conditions are ever
+    // critical and an open condition only returns by worsening 25%.
     const hasCritical = findings.some((f) => f.severity === "critical");
-    if (!judgement.worthWaking && !hasCritical) continue;
+    if (!judgement.worthWaking && !hasCritical) {
+      for (const finding of findings) dismissed.add(finding.key);
+      continue;
+    }
 
+    reads.push(judgement);
     departmentsWithFindings.push(department);
     // ONE judgement, N findings — carried as what it is (see
     // {@link scopeJudgement}), so finding B's receipt and Decision card cannot
@@ -605,11 +899,18 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
     }
   }
 
-  // Every department's findings were judged not worth waking: still silence,
-  // and still no report. The conditions stay OPEN in the snapshot, so they do
-  // not re-fire next hour unless they materially worsen.
-  if (settled.length === 0) {
-    const snapshotWritten = await writeSnapshot(storeId, snapshot);
+  // Every department's findings were judged not worth waking, and nothing is
+  // newly dark: silence, and no report.
+  //
+  // THE CONDITIONS ARE RECORDED AS DISMISSED, NOT AS ANNOUNCED. The snapshot
+  // used to mark them open — meaning "the founder knows" — so a single
+  // `worthWaking: false` retired a supplier delay, a revenue drop or a margin
+  // finding permanently (only a 25% worsening can raise an open condition
+  // again, and only stock-out conditions are ever critical). They are still
+  // true, nobody has been told, and `DISMISSAL_QUIET_MS` from now they are news
+  // again — sooner if they materially worsen.
+  if (settled.length === 0 && blindNews.length === 0) {
+    const snapshotWritten = await store({ dismissed });
     return {
       storeId,
       at: sense.at,
@@ -619,32 +920,63 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
       findings: [],
       capabilityGaps: [],
       senseFailures: dark,
+      blindSpots: blind,
+      blindSpotsReported: [],
       eventsProcessed,
       eventDrainFailures: drainFailures,
-      inboxCursor: snapshot.inboxCursor,
+      inboxCursor: nextInboxCursor(cursor, prior),
       snapshotWritten,
     };
   }
 
   // ── RECORD — ONE consolidated report, never one per finding ──────────────
+  //
+  // Filed when findings survived OR when something Nova cannot see is news. The
+  // second half is what makes blindness reportable at all: a store whose
+  // catalogue read has been failing all week has no findings to report BECAUSE
+  // of the failure, and that is the report.
   let reportId: string | undefined;
+  let reportFailed: string | undefined;
   try {
     const report = await client.addReport({
       kind: "pulse",
-      title: pulseTitle(settled),
-      body: pulseBody(settled, gaps, dark, drainFailures, opts.jobId),
+      // DERIVED FROM THE FINDINGS, never from model prose. See {@link pulseTitle}.
+      title: pulseTitle(settled, blindNews),
+      body: pulseBody({ settled, reads, gaps, blindNews, blind, drainFailures, jobId: opts.jobId }),
       // A re-leased rerun re-files the SAME row rather than a duplicate
       // (dakio-api returns the original on a dedupeKey collision).
       dedupeKey: opts.dedupeKey ?? null,
     });
     reportId = report.id;
   } catch (err) {
-    // The findings are already acted on or filed; losing the report is bad but
-    // not a reason to release the job and redo the gate work.
-    console.error(`[pulse] could not file the pulse report for ${storeId}:`, err);
+    // ── A LOST REPORT LOSES NOTHING PERMANENTLY ────────────────────────────
+    //
+    // It used to: the failure was logged, the snapshot was written anyway, and
+    // every condition in it was recorded as open. Probed, one 500 on /reports
+    // erased six findings including two critical stock-outs — for good. The
+    // work still stands (rows filed through the gate are on the ledger), so the
+    // job is not failed; what changes is that nothing here is marked announced,
+    // so the next pulse says it all again.
+    reportFailed = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[pulse] could not file the pulse report for ${storeId} — nothing is marked as told, so the next pulse ` +
+        `will raise these findings again:`,
+      err,
+    );
   }
 
-  const snapshotWritten = await writeSnapshot(storeId, snapshot);
+  // ── WHAT ACTUALLY REACHED THE FOUNDER ────────────────────────────────────
+  //
+  // The report is the main channel. When it fails, the only findings that still
+  // reached a person are the ones that put a card on the founder's desk — the
+  // gate's own artifacts, which are on the ledger whatever happened here.
+  const announced = new Set<string>();
+  for (const s of settled) {
+    if (reportId || reachedTheDesk(s.outcome)) announced.add(s.finding.key);
+  }
+  const blindAnnounced = new Set<string>(reportId ? blindNews.map((b: BlindSpot) => b.key) : []);
+
+  const snapshotWritten = await store({ announced, dismissed, blindAnnounced });
   return {
     storeId,
     at: sense.at,
@@ -654,12 +986,34 @@ export async function runPulse(storeId: string, opts: PulseOptions = {}): Promis
     findings: settled,
     capabilityGaps: gaps,
     senseFailures: dark,
+    blindSpots: blind,
+    blindSpotsReported: [...blindAnnounced],
     eventsProcessed,
     eventDrainFailures: drainFailures,
-    inboxCursor: snapshot.inboxCursor,
+    inboxCursor: nextInboxCursor(cursor, prior),
     snapshotWritten,
     ...(reportId ? { reportId } : {}),
+    ...(reportFailed ? { reportFailed } : {}),
   };
+}
+
+/** The cursor the snapshot will carry — forward-only, as `nextSnapshot` writes it. */
+function nextInboxCursor(cursor: string | null, prior: { inboxCursor: string | null } | null): string | null {
+  return cursor ?? prior?.inboxCursor ?? null;
+}
+
+/**
+ * Did this outcome put something in front of the founder ON ITS OWN, without
+ * the report?
+ *
+ * Only the gate's artifacts qualify: a Decision card on the desk (`prepared`,
+ * including the authorized-but-unexecuted case) or a card an earlier pulse
+ * already filed under the same key. A refused row and a capability gap are
+ * ledger and report material — real records, but not something anyone is shown
+ * — so they stay unannounced and come back next hour.
+ */
+function reachedTheDesk(outcome: FindingOutcome): boolean {
+  return outcome.kind === "decision_filed" || outcome.kind === "no_executor" || outcome.kind === "replayed";
 }
 
 /**
@@ -765,9 +1119,9 @@ export async function settleFinding(
     // had exactly one finding the note IS about it; otherwise it is labelled as
     // what it is.
     expectedImpact: judgement.scopedNote,
-    // Not the model's self-rated confidence: the finding is a measurement, and
-    // a measurement that crossed a threshold is not a guess.
-    confidence: finding.severity === "critical" ? 0.9 : 0.7,
+    // See {@link PULSE_RECEIPT_CONFIDENCE} — one constant, and an evidence row
+    // that says what it is, instead of 0.9/0.7 rendered as a measurement.
+    confidence: PULSE_RECEIPT_CONFIDENCE,
     evidence: [
       {
         source: `pulse:${finding.domain}`,
@@ -780,6 +1134,19 @@ export async function settleFinding(
         note: `${finding.trigger} since the last pulse`,
         metric: "priorValue",
         value: finding.observation.priorValue ?? "first sighting",
+      },
+      {
+        // The receipt's `confidence` field wants a number and the pulse has no
+        // honest one to put there: it estimates nothing. It used to write 0.9
+        // for critical findings and 0.7 otherwise — a severity re-badged as a
+        // probability, sitting on a Decision card next to real measurements.
+        // One constant, and this line so nobody reads it as a forecast.
+        source: "pulse:confidence",
+        note:
+          "Not a probability. The pulse does not estimate one — this row exists because a measured number " +
+          "crossed a fixed threshold, and the confidence field is a constant.",
+        metric: "confidence",
+        value: PULSE_RECEIPT_CONFIDENCE,
       },
       {
         source: "pulse:judgement",
@@ -890,19 +1257,57 @@ function novaActionIdFor(finding: PulseFinding, at: string): string {
 // The report — one, consolidated, only when something survived
 // ---------------------------------------------------------------------------
 
-function pulseTitle(settled: SettledFinding[]): string {
-  const critical = settled.filter((s) => s.finding.severity === "critical").length;
-  const head = settled[0]?.headline ?? "Pulse";
-  return critical > 0 ? `⚠ ${head}` : head;
+/** The report title's own length bound — a headline, not a paragraph. */
+const TITLE_MAX_CHARS = 120;
+
+/**
+ * THE ONE LINE THE FOUNDER READS FIRST — derived from the findings, never
+ * written by the model.
+ *
+ * ── WHAT THIS REPLACES ─────────────────────────────────────────────────────
+ *
+ * `settled[0].headline`: an unvalidated model string, prefixed with a `⚠` that
+ * was computed from a severity across ALL departments. Two defects in one line.
+ * Probed live, it titled a report *"⚠ Sales are down because your courier is
+ * losing parcels and ad spend is wasted"* — in a report whose own footer says
+ * Nova makes no claim about courier or ads. A model cannot be bounded into
+ * never doing that; the title simply must not be a place model prose can reach.
+ * (What the judge writes is still used, bounded, further down the body.)
+ *
+ * Every part of what comes out of here traces to a measurement: the lead is one
+ * finding's own code-generated title, the `⚠` and the count are arithmetic over
+ * the findings that carry it, and a blind pass says it is blind rather than
+ * borrowing a headline from findings it does not have.
+ */
+export function pulseTitle(settled: SettledFinding[], blindNews: BlindSpot[] = []): string {
+  if (settled.length === 0) {
+    // A report with no findings exists for exactly one reason.
+    return blindNews.length === 1
+      ? `Nova could not see part of your store this pass`
+      : `Nova could not see ${blindNews.length} parts of your store this pass`;
+  }
+  const criticals = settled.filter((s) => s.finding.severity === "critical");
+  // The `⚠` and the lead now come from the SAME finding, so the badge cannot
+  // belong to one department while the sentence belongs to another.
+  const lead = (criticals[0] ?? settled[0])!.finding.title;
+  const others = settled.length - 1;
+  const tail = others > 0 ? ` (+${others} more finding${others === 1 ? "" : "s"})` : "";
+  const head = criticals.length > 0 ? `⚠ ${lead}` : lead;
+  const full = `${head}${tail}`;
+  if (full.length <= TITLE_MAX_CHARS) return full;
+  return `${full.slice(0, TITLE_MAX_CHARS - 1).trimEnd()}…`;
 }
 
-function pulseBody(
-  settled: SettledFinding[],
-  gaps: CapabilityGap[],
-  dark: string[],
-  drainFailures: string[],
-  jobId?: string,
-): string {
+function pulseBody(input: {
+  settled: SettledFinding[];
+  reads: BoundedJudgement[];
+  gaps: CapabilityGap[];
+  blindNews: BlindSpot[];
+  blind: BlindSpot[];
+  drainFailures: string[];
+  jobId?: string;
+}): string {
+  const { settled, reads, gaps, blindNews, blind, drainFailures, jobId } = input;
   const lines: string[] = [];
   for (const s of settled) {
     lines.push(
@@ -911,6 +1316,26 @@ function pulseBody(
       `- ${outcomeLine(s.outcome)}`,
       "",
     );
+  }
+  // Nova's own wording, after the check, and labelled as wording — the numbers
+  // above are the measurement and this is a read of them.
+  if (reads.length > 0) {
+    lines.push(
+      "**Nova's read**",
+      ...reads.map((r) => `- ${r.department}: ${r.headline} — ${r.note}`),
+      "",
+    );
+    const setAside = reads.filter((r) => r.rejections.length > 0);
+    if (setAside.length > 0) {
+      lines.push(
+        ...setAside.map(
+          (r) =>
+            `_Nova's own wording for ${r.department} was set aside this pass (${r.rejections.join("; ")}) — ` +
+            `the measurements above are unchanged._`,
+        ),
+        "",
+      );
+    }
   }
   if (gaps.length > 0) {
     lines.push(
@@ -926,8 +1351,26 @@ function pulseBody(
       "",
     );
   }
-  if (dark.length > 0) {
-    lines.push("**Blind spots this pass**", ...dark.map((d) => `- ${d}`), "");
+  // WHAT NOVA COULD NOT SEE. `blindNews` is what is being REPORTED this pass
+  // (new, or dark long enough to say again); `blind` is everything still dark,
+  // so a founder reading one report sees the whole shape of the gap and not
+  // only this hour's edge.
+  if (blindNews.length > 0) {
+    lines.push(
+      "**Nova could not see this**",
+      ...blindNews.map((b) => `- ${b.detail}`),
+      "",
+      "_Silence about anything above is not good news — it is Nova having nothing to look at._",
+      "",
+    );
+  }
+  const stillDark = blind.filter((b) => !blindNews.some((n) => n.key === b.key));
+  if (stillDark.length > 0) {
+    lines.push(
+      "**Still dark, reported earlier**",
+      ...stillDark.map((b) => `- ${b.detail}`),
+      "",
+    );
   }
   if (drainFailures.length > 0) {
     // The inbox drain is the one write in this lane that does not pass the
@@ -996,10 +1439,15 @@ const pulseStep = createStep({
       }),
     ),
     senseFailures: z.array(z.string()),
+    blindSpots: z
+      .array(z.object({ key: z.string(), detail: z.string() }))
+      .describe("Everything Nova could not see — dark reads, dark fields, truncated pages"),
+    blindSpotsReported: z.array(z.string()),
     eventsProcessed: z.number(),
     eventDrainFailures: z.array(z.string()),
     snapshotWritten: z.boolean(),
     reportId: z.string().optional(),
+    reportFailed: z.string().optional().describe("Set when the report could not be filed — nothing was marked told"),
   }),
   execute: async ({ inputData }) => {
     const storeId = inputData.storeId || process.env.NOVA_DEV_STORE_ID;
@@ -1016,10 +1464,13 @@ const pulseStep = createStep({
       })),
       capabilityGaps: result.capabilityGaps.map((g) => ({ verb: g.verb, kind: g.kind, wantedDuty: g.wantedDuty })),
       senseFailures: result.senseFailures,
+      blindSpots: result.blindSpots,
+      blindSpotsReported: result.blindSpotsReported,
       eventsProcessed: result.eventsProcessed,
       eventDrainFailures: result.eventDrainFailures,
       snapshotWritten: result.snapshotWritten,
       ...(result.reportId ? { reportId: result.reportId } : {}),
+      ...(result.reportFailed ? { reportFailed: result.reportFailed } : {}),
     };
   },
 });

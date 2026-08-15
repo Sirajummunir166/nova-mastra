@@ -52,6 +52,69 @@ export interface ProductState {
 }
 
 /**
+ * One condition that is currently TRUE, as the last pulse left it.
+ *
+ * ── `announced` IS THE FIELD THE WHOLE EDGE-TRIGGER RESTS ON ───────────────
+ *
+ * It used to be absent, and every derived condition was written into the open
+ * set BEFORE anything was judged or filed. Two probed consequences: one
+ * `worthWaking: false` from the judge dropped a department's findings and — the
+ * conditions now counted as "open" — they never came back (only a ≥25% worsening
+ * can re-raise an open condition, and only stock-out conditions are ever
+ * critical, so every revenue drop, supplier delay, margin and cart finding was
+ * suppressible once and forever); and one 500 on `POST /reports` erased six
+ * findings including two critical stock-outs, permanently, because the snapshot
+ * was written anyway.
+ *
+ * So the open set is now written from WHAT ACTUALLY REACHED THE FOUNDER. A
+ * condition Nova derived but never told anyone about stays `announced: false`
+ * and is news again next hour; one that reached a report or a Decision card is
+ * `announced: true` and stays quiet until it materially worsens.
+ */
+export interface OpenCondition {
+  /** When this condition first became true (carried across passes). */
+  since: string;
+  /** The last MEASURED value of its metric. `null` = it was never measurable. */
+  metric: number | null;
+  /**
+   * When that metric was measured. NOT the same as the last pulse's `at`: a
+   * value survives passes where its domain (or its field) was dark, so
+   * "was X at the last pulse" could name a pulse that never observed X. The
+   * evidence line reads this instead of assuming.
+   */
+  measuredAt: string;
+  /** Did this condition actually reach the founder? See the type doc. */
+  announced: boolean;
+  /**
+   * When the JUDGE decided this was not worth waking the founder for.
+   *
+   * A dismissal is not an announcement — nobody was told — but it is also not
+   * an accident, and the two unreported cases deserve different answers. A lost
+   * report is re-raised on the very next pulse (nothing decided anything); a
+   * finding Nova looked at and judged "not today" is re-raised after
+   * `DISMISSAL_QUIET_MS`, so a department that keeps being judged unremarkable
+   * costs at most one judgement a day instead of one an hour — and, unlike
+   * before, it is never silenced for the life of the product.
+   */
+  dismissedAt: string | null;
+}
+
+/**
+ * A blind spot the last pulse carried, by {@link import("../lib/snapshot.js").BlindSpot} key.
+ *
+ * Blindness is edge-triggered like a finding — announced when it appears,
+ * re-announced daily while it lasts — so that "Nova cannot see your catalogue"
+ * is said once an hour after it starts and once a day after that, instead of
+ * either spamming or (the defect this replaces) being silently folded into a
+ * `quiet: true`.
+ */
+export interface BlindSpotState {
+  since: string;
+  /** When the founder was last told. `null` = derived but never reported. */
+  announcedAt: string | null;
+}
+
+/**
  * Everything the last pulse observed, in the shape COMPARE needs.
  *
  * `null` on a domain means THAT DOMAIN WAS NOT OBSERVED last time — a failed
@@ -63,7 +126,8 @@ export interface PulseSnapshot {
   /** When the sense that produced this ran (the store's clock). */
   at: string;
   products: Record<string, ProductState> | null;
-  supplierDelayDays: Record<string, number> | null;
+  /** Per-supplier delay. `null` inside the map = the supplier reported none. */
+  supplierDelayDays: Record<string, number | null> | null;
   revenue7d: number | null;
   revenuePrior7d: number | null;
   carts: { count: number; value: number } | null;
@@ -74,11 +138,46 @@ export interface PulseSnapshot {
    * makes findings EDGE-TRIGGERED: a stock-out risk that has been true for six
    * hours is not news six times. See `pulse-compare.ts`.
    */
-  openFindings: Record<string, { since: string; metric: number | null }> | null;
+  openFindings: Record<string, OpenCondition> | null;
+  /** Blind spots carried from the last pulse, by key. */
+  blindSpots: Record<string, BlindSpotState> | null;
 }
 
 function fileFor(storeId: string): string {
   return join(DATA_DIR, `${storeId.replace(/[^\w.-]/g, "_")}.json`);
+}
+
+/**
+ * Bring a stored snapshot up to the current shape.
+ *
+ * ONE PLACE, on the way IN, so `pulse-compare.ts` never has to guess whether a
+ * field is missing because the domain was dark or because an older build wrote
+ * the row. Both backends go through it.
+ *
+ * `announced` defaults to FALSE for a row written before the field existed —
+ * every condition in an old snapshot was recorded as open whether or not the
+ * founder was ever told, so the honest reading of those rows is "unknown, and
+ * unknown means say it once". The cost is bounded and self-clearing: the first
+ * pulse after an upgrade re-raises whatever is still true, in ONE report, and
+ * from then on the flag is real.
+ */
+export function normalizeSnapshot(raw: PulseSnapshot | null): PulseSnapshot | null {
+  if (!raw || typeof raw !== "object") return null;
+  const openFindings = raw.openFindings
+    ? Object.fromEntries(
+        Object.entries(raw.openFindings).map(([key, state]) => [
+          key,
+          {
+            since: state?.since ?? raw.at,
+            metric: state?.metric ?? null,
+            measuredAt: state?.measuredAt ?? state?.since ?? raw.at,
+            announced: state?.announced === true,
+            dismissedAt: state?.dismissedAt ?? null,
+          } satisfies OpenCondition,
+        ]),
+      )
+    : null;
+  return { ...raw, openFindings, blindSpots: raw.blindSpots ?? null };
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +236,7 @@ export async function loadPulseState(storeId: string): Promise<PulseSnapshot | n
         "SELECT state FROM nova_pulse_state WHERE store_id = $1",
         [storeId],
       );
-      return result.rows[0]?.state ?? null;
+      return normalizeSnapshot(result.rows[0]?.state ?? null);
     } catch (err) {
       console.warn(`[pulse-state] pg load failed for ${storeId} — treating as first sighting:`, err);
       return null;
@@ -146,7 +245,7 @@ export async function loadPulseState(storeId: string): Promise<PulseSnapshot | n
   const file = fileFor(storeId);
   if (!existsSync(file)) return null;
   try {
-    return JSON.parse(readFileSync(file, "utf8")) as PulseSnapshot;
+    return normalizeSnapshot(JSON.parse(readFileSync(file, "utf8")) as PulseSnapshot);
   } catch {
     // Corrupt file — same answer as no file. Deliberately not deleted: a
     // human may want to look at what was written.
