@@ -8,11 +8,9 @@
  * MEMO ≤ 60 tokens.
  */
 
-import { ageSec, computeMissing, type NovaLiveContext } from "./state.js";
-
-function maskPhone(phone: string): string {
-  return `···${phone.slice(-3)}`;
-}
+// maskPhone lives in state.ts so there is ONE masker: the card header and the
+// MEMO folding (pushMessage) can never drift apart on the last-3 convention.
+import { ageSec, computeMissing, maskPhone, type NovaLiveContext } from "./state.js";
 
 function shortAddr(addr: string): string {
   return addr.length > 28 ? `${addr.slice(0, 28)}…` : addr;

@@ -25,17 +25,21 @@ export interface DakioProduct {
   stock: number;
   status: string;
   variantNames?: string[];
-  variantStock?: number[];
-  variantIds?: string[];
+  /**
+   * Per-option stock BY NAME (`store/types.ts` Product) — absent or null when
+   * per-option truth does not exist (dropship stock is per product).
+   */
+  variantStock?: Record<string, number> | null;
+  /** Option name → variant id — the order write needs a real id from the read. */
+  variantIds?: Record<string, string>;
 }
 
 export async function listProducts(storeId: string): Promise<DakioProduct[]> {
   const products = await storeFor(storeId).listProducts({ status: "active" });
-  // Same `productOut` rows as before the StoreClient port. NOTE: at runtime
-  // `variantStock`/`variantIds` are name-keyed records (see `store/types.ts`
-  // Product), not the arrays this interface has always declared — the typing
-  // predates the port and is kept verbatim so callers (hydrate.ts) need no
-  // changes.
+  // Same `productOut` rows as before the StoreClient port. `variantStock`/
+  // `variantIds` are name-keyed records (`store/types.ts` Product) and the
+  // interface above now declares that truthfully — callers (hydrate.ts) look
+  // options up by variant name, never by position.
   return products as unknown as DakioProduct[];
 }
 

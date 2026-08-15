@@ -125,44 +125,51 @@ test("a product without variants exposes no options — nothing for ASK_SIZE to 
 // variant id must come from the read, never invention
 // ---------------------------------------------------------------------------
 
-test("variantStock over the declared array shape answers per option", () => {
-  const arr = p({
+test("variantStock over the name-keyed record shape answers per option, with honest fallbacks", () => {
+  const rec = p({
     id: "p-mat",
     name: "Eco Yoga Mat",
     stock: 12,
     variantNames: ["Green", "Purple", "Black"],
-    variantStock: [7, 0, 5],
-    variantIds: ["var-g", "var-p", "var-b"],
+    variantStock: { Green: 7, Purple: 0, Black: 5 },
+    variantIds: { Green: "var-g", Purple: "var-p", Black: "var-b" },
   });
-  assert.equal(variantStock(arr, "Green"), 7);
-  assert.equal(variantStock(arr, "purple"), 0, "a dead option reads 0 — case-blind");
-  assert.equal(variantStock(arr, undefined), 12, "no variant → product total");
-  assert.equal(variantStock(arr, "Nonexistent"), 12, "unknown option falls back to total");
-  assert.equal(variantIdFor(arr, "purple"), "var-p");
-  assert.equal(variantIdFor(arr, undefined), undefined);
+  assert.equal(variantStock(rec, "Green"), 7);
+  assert.equal(variantStock(rec, "purple"), 0, "a dead option reads 0 — case-blind");
+  assert.equal(variantStock(rec, undefined), 12, "no variant → product total");
+  assert.equal(variantStock(rec, "Nonexistent"), 12, "unknown option falls back to total");
+  assert.equal(variantIdFor(rec, "purple"), "var-p", "id lookup is case-blind too");
+  assert.equal(variantIdFor(rec, undefined), undefined);
+
+  // Dropship truth is per PRODUCT (variantStock null) — names exist, per-option
+  // stock does not, so the total is the only honest answer.
+  const dropship = p({ id: "p-ds", name: "Dropship Mat", stock: 9, variantNames: ["M", "L"], variantStock: null });
+  assert.equal(variantStock(dropship, "M"), 9);
 });
 
-test(
-  "SUSPECTED BUG: the runtime record shape makes every variant read the product total",
-  {
-    todo:
-      "listProducts really returns name-keyed records (src/store/types.ts Product, seed.ts; dakio.ts's own NOTE admits it) but variantStock/variantIdFor index numerically — so a DEAD variant reports the product total (order gate passes stock it does not have) and variantIdFor returns undefined (the order goes up without a variant id — the exact VARIANT_REQUIRED incident nova-ai's closing round 4 fixed)",
-  },
-  () => {
-    const runtime = p({
-      id: "p-mat",
-      name: "Eco Yoga Mat",
-      stock: 12,
-      variantNames: ["Green", "Purple", "Black"],
-      // The shape src/store/seed.ts actually ships and DakioStoreClient returns:
-      variantStock: { Green: 7, Purple: 0, Black: 5 } as unknown as number[],
-      variantIds: { Green: "var-g", Purple: "var-p", Black: "var-b" } as unknown as string[],
-    });
-    assert.equal(variantStock(runtime, "Purple"), 0, "a dead size must read 0, not the product total");
-    assert.equal(variantStock(runtime, "Green"), 7);
-    assert.equal(variantIdFor(runtime, "Green"), "var-g", "the order call needs a real variant id from the read");
-  },
-);
+test("the runtime record shape reads per-variant truth — dead variant 0, real ids from the read", () => {
+  // These lookups used to index the records NUMERICALLY (as if arrays): a DEAD
+  // variant reported the product total (the order gate passed stock it did not
+  // have) and variantIdFor returned undefined (the order went up without a
+  // variant id — the exact VARIANT_REQUIRED incident nova-ai's closing round 4
+  // fixed). listProducts returns name-keyed records (src/store/types.ts
+  // Product, seed.ts) and hydrate.ts now indexes them by name.
+  const runtime = p({
+    id: "p-mat",
+    name: "Eco Yoga Mat",
+    stock: 12,
+    variantNames: ["Green", "Purple", "Black"],
+    // The shape src/store/seed.ts actually ships and DakioStoreClient returns:
+    variantStock: { Green: 7, Purple: 0, Black: 5 },
+    variantIds: { Green: "var-g", Purple: "var-p", Black: "var-b" },
+  });
+  assert.equal(variantStock(runtime, "Purple"), 0, "a dead size reads its own 0, never the product total");
+  assert.equal(variantStock(runtime, "Green"), 7);
+  assert.equal(variantStock(runtime, "Black"), 5);
+  assert.equal(variantIdFor(runtime, "Green"), "var-g", "the order call gets the mapped id from the read");
+  assert.equal(variantIdFor(runtime, "Purple"), "var-p");
+  assert.equal(variantIdFor(runtime, "Nonexistent"), undefined, "undefined ONLY for names the read never returned");
+});
 
 // ---------------------------------------------------------------------------
 // Zone → fee — the two-rate delivery truth (knowledge.ts kn-2, re-anchored)

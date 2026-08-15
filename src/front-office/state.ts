@@ -202,6 +202,25 @@ export function newLiveContext(convId: string, storeId: string, channel = "chat"
 const RECENT_MAX = 8;
 const MEMO_MAX_CHARS = 320; // ≈ 60-80 tokens
 
+// ---------------------------------------------------------------------------
+// Phone masking — THE one masker. The card's contract is "never full
+// phone/address", and it holds for every consumer of this state: the card
+// header AND anything folded into MEMO mask through these same helpers.
+// ---------------------------------------------------------------------------
+
+/** A Bangladeshi mobile in any wire form (+880…, 880…, 0…). */
+const BD_PHONE_RE = /(?:\+?880|0)1[3-9]\d{8}/g;
+
+/** Mask to the last 3 digits — the card's confirmation convention ("ending 689?"). */
+export function maskPhone(phone: string): string {
+  return `···${phone.slice(-3)}`;
+}
+
+/** Replace every full BD phone in free text with its masked form. */
+export function maskPhonesIn(text: string): string {
+  return text.replace(BD_PHONE_RE, (m) => maskPhone(m));
+}
+
 export function computeMissing(ctx: NovaLiveContext): MissingField[] {
   const missing: MissingField[] = [];
   const focus = ctx.products.focusId ? ctx.hydrated.product?.value : undefined;
@@ -239,7 +258,9 @@ export function pushMessage(ctx: NovaLiveContext, msg: ChatTurnMessage): void {
     const old = ctx.recent.shift()!;
     // Never compress away: handled upstream — order details, promises, quoted
     // prices and corrections are written into MEMO explicitly by the reducer.
-    const line = `${old.role === "customer" ? "C" : "N"}: ${old.text.slice(0, 60)}`;
+    // Mask BEFORE folding: a phone that ages out of recent[] must ride MEMO
+    // masked, or the card leaks the full number on every later turn.
+    const line = `${old.role === "customer" ? "C" : "N"}: ${maskPhonesIn(old.text).slice(0, 60)}`;
     ctx.conversation.summary = `${ctx.conversation.summary} · ${line}`.slice(-MEMO_MAX_CHARS).replace(/^ · /, "");
   }
 }

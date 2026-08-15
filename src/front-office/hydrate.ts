@@ -76,17 +76,27 @@ export function focusProduct(ctx: NovaLiveContext, p: DakioProduct, source: "cus
   ctx.hydrated.price = fact(p.price, "tool:list_products", { ttlMs: TTL.price, at });
 }
 
-/** Stock for the currently selected variant (falls back to product total). */
-export function variantStock(p: DakioProduct, variant?: string): number {
-  if (!variant || !p.variantNames || !p.variantStock) return p.stock;
-  const i = p.variantNames.findIndex((v) => v.toLowerCase() === variant.toLowerCase());
-  return i >= 0 ? (p.variantStock[i] ?? p.stock) : p.stock;
+/** Case-blind key lookup into a name-keyed variant record. */
+function variantKey(record: Record<string, unknown>, variant: string): string | undefined {
+  return Object.keys(record).find((k) => k.toLowerCase() === variant.toLowerCase());
 }
 
+/**
+ * Stock for the currently selected variant (falls back to product total).
+ * `variantStock` is a NAME-KEYED record (`store/types.ts` Product) — a dead
+ * option must read its own 0, never the product total.
+ */
+export function variantStock(p: DakioProduct, variant?: string): number {
+  if (!variant || !p.variantStock) return p.stock;
+  const key = variantKey(p.variantStock, variant);
+  return key !== undefined ? (p.variantStock[key] ?? p.stock) : p.stock;
+}
+
+/** The variant id the order write needs — from the read's name→id map, never invented. */
 export function variantIdFor(p: DakioProduct, variant?: string): string | undefined {
-  if (!variant || !p.variantNames || !p.variantIds) return undefined;
-  const i = p.variantNames.findIndex((v) => v.toLowerCase() === variant.toLowerCase());
-  return i >= 0 ? p.variantIds[i] : undefined;
+  if (!variant || !p.variantIds) return undefined;
+  const key = variantKey(p.variantIds, variant);
+  return key !== undefined ? p.variantIds[key] : undefined;
 }
 
 /** Policies/fees through the cache; fee resolved from the zone (inside/outside Dhaka). */

@@ -8,9 +8,9 @@
  * verbatim. Assertions are re-anchored from eve's `detectLanguage` /
  * register-selection seams onto our lane's `detectLang` + `classifyL0`.
  *
- * Two SUSPECTED BUG blocks at the bottom are marked `todo` — they encode the
- * behavior classify.ts's own regexes ENUMERATE but cannot deliver. Do not
- * delete them; they go green the day the bugs are fixed.
+ * Two blocks below were once SUSPECTED-BUG `todo`s (the dead Bangla-script L0
+ * arm, the thin Banglish hint lexicon); both bugs are fixed and the blocks now
+ * assert the behavior classify.ts's regexes always enumerated.
  */
 
 import { test } from "node:test";
@@ -59,20 +59,22 @@ test("English in → en detected", () => {
   }
 });
 
-test(
-  "SUSPECTED BUG: common Banglish phrasings the hint lexicon misses read as English",
-  { todo: "BANGLISH_HINTS is too thin — these D12 corpus turns detect 'en' at conf 0.7, which is enough for turn.ts to flip lang.pref to English on a Banglish customer (mirror rule broken: Nova switches first)" },
-  () => {
-    const banglish = [
-      "amar order er ki obostha? 3 din age dilam", // Ex4 · Banglish order status
-      "apni ki robot? reply eto fast keno 😅", // Ex6 · Banglish 'are you a bot?'
-      "achha dekhi pore janai", // Ex8 · Banglish cart-recovery nudge reply
-    ];
-    for (const text of banglish) {
-      assert.equal(detectLang(text).detected, "banglish", `"${text}" should detect banglish`);
-    }
-  },
-);
+test("everyday Banglish phrasings detect banglish — never en@0.7, which would flip lang.pref", () => {
+  // These D12 corpus turns used to read as en at conf 0.7 — exactly enough for
+  // turn.ts to flip lang.pref to English on a Banglish customer (mirror rule
+  // broken: Nova switches first). BANGLISH_HINTS now carries the everyday
+  // tokens (amar, apni, ki, obostha, achha, dekhi, janai, keno, eto).
+  const banglish = [
+    "amar order er ki obostha? 3 din age dilam", // Ex4 · Banglish order status
+    "apni ki robot? reply eto fast keno 😅", // Ex6 · Banglish 'are you a bot?'
+    "achha dekhi pore janai", // Ex8 · Banglish cart-recovery nudge reply
+  ];
+  for (const text of banglish) {
+    const { detected, conf } = detectLang(text);
+    assert.equal(detected, "banglish", `"${text}" should detect banglish`);
+    assert.ok(conf >= 0.8, "banglish detection is confident enough to hold the mirror");
+  }
+});
 
 // ---------------------------------------------------------------------------
 // L0 rules — the deterministic rung. ~60% of turns must decide here at zero
@@ -216,34 +218,42 @@ test("rules miss → null, so the resolver (rung 1) gets the turn — never a gu
 });
 
 // ---------------------------------------------------------------------------
-// SUSPECTED BUG: the Bangla-script arm of L0 is dead.
+// The Bangla-script arm of L0 — alive since the Unicode-boundary fix.
 //
 // JS `\b` is ASCII-word-based; Bangla letters are not word characters, so a
-// `\b` on either side of a Bangla alternate NEVER matches. Every phrase below
-// is literally enumerated in classify.ts's own regexes (PRICE_RE has কত|দাম,
-// CONFIRM_RE has জি|হ্যাঁ, REJECT_RE has না, GREET_RE has আসসালামু, ZONE_RE has
-// ঢাকা, ORDER_STATUS_RE has আমার অর্ডার, CONFIRM_LOOSE_RE has ঠিক আছে) — and
-// none of them fire. Consequence: every pure-Bangla-script customer turn falls
-// to the paid resolver, defeating the "~60% decide at L0" design for exactly
-// the customers the Bangla alternates were written for.
-// Fix shape (do NOT fix in this unit): drop \b around Bangla alternates or use
-// Unicode-aware boundaries (e.g. /(?<![\p{L}\p{N}])…(?![\p{L}\p{N}])/u).
+// `\b` on either side of a Bangla alternate NEVER matched — every pure-Bangla
+// customer turn fell to the paid resolver, defeating the "~60% decide at L0"
+// design for exactly the customers the Bangla alternates were written for.
+// classify.ts now uses Unicode-aware boundaries
+// (/(?<![\p{L}\p{M}\p{N}_])…(?![\p{L}\p{M}\p{N}_])/u), which behave exactly
+// like \b on ASCII and extend it to any script.
 // ---------------------------------------------------------------------------
 
-test(
-  "SUSPECTED BUG: Bangla-script phrases the regexes enumerate never decide at L0",
-  { todo: "JS \\b never matches adjacent to Bangla letters — the entire Bangla-script arm of every L0 regex is unreachable" },
-  () => {
-    assert.equal(classifyL0("দাম কত")?.intent, "price_q");
-    assert.equal(classifyL0("এই শাড়িটার দাম কত?")?.intent, "price_q");
-    assert.equal(classifyL0("জি")?.intent, "confirm");
-    assert.equal(classifyL0("হ্যাঁ")?.intent, "confirm");
-    assert.equal(classifyL0("না")?.intent, "reject");
-    assert.equal(classifyL0("আসসালামু আলাইকুম")?.intent, "greeting");
-    assert.equal(classifyL0("ঢাকা")?.intent, "zone_pick");
-    assert.equal(classifyL0("আমার অর্ডার কোথায়")?.intent, "order_status_q");
-    // The most natural Bangla confirmation, answered to a pending summary —
-    // CONFIRM_LOOSE_RE contains this exact string.
-    assert.equal(classifyL0("ঠিক আছে", { awaiting: "confirm" })?.intent, "confirm");
-  },
-);
+test("Bangla-script phrases the regexes enumerate decide at rung 0", () => {
+  const cases: Array<[string, string]> = [
+    ["দাম কত", "price_q"],
+    ["এই শাড়িটার দাম কত?", "price_q"],
+    ["জি", "confirm"],
+    ["হ্যাঁ", "confirm"],
+    ["হুম", "confirm"],
+    ["না", "reject"],
+    ["আসসালামু আলাইকুম", "greeting"],
+    ["ঢাকা", "zone_pick"],
+    ["আমার অর্ডার কোথায়", "order_status_q"],
+  ];
+  for (const [text, intent] of cases) {
+    const r = classifyL0(text);
+    assert.ok(r, `"${text}" must not fall to the resolver`);
+    assert.equal(r.intent, intent, `"${text}" → ${intent}`);
+    assert.equal(r.rung, 0, `"${text}" decides at rung 0 — zero model cost`);
+  }
+  // The most natural Bangla confirmation, answered to a pending summary —
+  // CONFIRM_LOOSE_RE contains this exact string.
+  assert.equal(classifyL0("ঠিক আছে", { awaiting: "confirm" })?.intent, "confirm");
+});
+
+test("Unicode boundaries stay boundaries — a Bangla alternate cannot fire inside a longer word", () => {
+  // "নাকি" must not read as না-reject: the alternates are whole-word in every
+  // script, or "did it arrive or not?" becomes a rejection.
+  assert.notEqual(classifyL0("নাকি আসবে")?.intent, "reject");
+});

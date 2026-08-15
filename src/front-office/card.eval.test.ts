@@ -72,20 +72,28 @@ test("the address is truncated on the card — never the full doorstep line", ()
   assert.ok(card.includes("House 12, Road 5, Mirpur 2, …"), "enough of the address to confirm against");
 });
 
-test(
-  "SUSPECTED BUG: overflow folding can carry a full phone into the card's MEMO line",
-  {
-    todo:
-      "pushMessage folds overflowed messages verbatim (first 60 chars) into conversation.summary, and renderStateCard prints MEMO unmasked — so once a phone/address message ages out of recent[], the full number the card's own header promises never to show rides the MEMO line into every later turn packet",
-  },
-  () => {
-    const ctx = newLiveContext("conv-leak", "store-1");
-    pushMessage(ctx, { role: "customer", text: `amar number ${FULL_PHONE}`, at: 1 });
-    for (let i = 0; i < 9; i++) pushMessage(ctx, { role: "nova", text: `reply ${i}`, at: 2 + i });
-    const card = renderStateCard(ctx);
-    assert.ok(!BD_MOBILE.test(card), `full phone reached the card via MEMO:\n${card}`);
-  },
-);
+test("overflow folding masks phones BEFORE they ride the card's MEMO line", () => {
+  // pushMessage used to fold overflowed messages verbatim into
+  // conversation.summary, so a phone that aged out of recent[] rode the MEMO
+  // line unmasked into every later turn packet. The fold now masks through
+  // the SAME masker the card header uses (state.ts maskPhone).
+  const ctx = newLiveContext("conv-leak", "store-1");
+  pushMessage(ctx, { role: "customer", text: `amar number ${FULL_PHONE}`, at: 1 });
+  for (let i = 0; i < 9; i++) pushMessage(ctx, { role: "nova", text: `reply ${i}`, at: 2 + i });
+  const card = renderStateCard(ctx);
+  assert.ok(!BD_MOBILE.test(card), `full phone reached the card via MEMO:\n${card}`);
+  const memoLine = card.split("\n").find((l) => l.startsWith("MEMO"));
+  assert.ok(memoLine, "the folded turn still made it into MEMO — masking, not dropping");
+  assert.ok(memoLine.includes("···689"), "the masked tail rides MEMO — same last-3 convention as the header");
+
+  // The +880 wire form is masked by the same fold.
+  const ctx2 = newLiveContext("conv-leak-2", "store-1");
+  pushMessage(ctx2, { role: "customer", text: `+880${FULL_PHONE.slice(1)} ei number e call den`, at: 1 });
+  for (let i = 0; i < 9; i++) pushMessage(ctx2, { role: "nova", text: `reply ${i}`, at: 2 + i });
+  const card2 = renderStateCard(ctx2);
+  assert.ok(!BD_MOBILE.test(card2), `full +880 phone reached the card via MEMO:\n${card2}`);
+  assert.ok(card2.includes("···689"));
+});
 
 // ---------------------------------------------------------------------------
 // The token budget — ~120 tokens, rebuilt per turn (PRD §04)
