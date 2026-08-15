@@ -1,6 +1,11 @@
 /**
- * Order-gate suite (phase D unit 1) — the approval-gated live tier, hermetic
- * against the DEMO backend (deterministic, no network, no model).
+ * Customer-lane write-gate suite (phase D) — the approval-gated live tier,
+ * hermetic against the DEMO backend (deterministic, no network, no model).
+ *
+ * Part 1 (below) is the order gate. Part 2, further down, covers the other five
+ * verbs — offer_chat_discount, cancel_order_from_chat, update_order_contact,
+ * open_case and escalate_conversation — plus the turn wiring and the
+ * shadow-writes-nothing pin for each of them.
  *
  * What it pins, per the design as found in nova-ai (`performAction` +
  * `create_order_from_chat` tool/executor) and dakio-api (`novaExecutors.js`):
@@ -1236,5 +1241,33 @@ test("shadow: an address correction writes no update_order_contact row", async (
   await runCustomerTurn(AURORA, convId, `notun thikana: House 9, Road 4, Uttara. ${PHONE}`, { mode: "shadow" });
   assert.equal((await rowsOf(store, "update_order_contact")).length, 0);
   assert.equal(await cardsFor(store, "update_order_contact"), 0);
+  resetContext(AURORA, convId);
+});
+
+test("turn wiring, live: an order the gate BLOCKED becomes a guardrail_blocked hand-over, and the customer hears no rule", async () => {
+  const store = demo();
+  const convId = "conv-turn-blocked-order";
+  store.seedInboxConversation({ id: convId });
+  resetContext(AURORA, convId);
+  await seedConfirmableState(convId);
+  // A lock that bites the ORDER's target text ("… order sell cod") but not the
+  // hand-over's, so the refusal can be handed to a person rather than dying.
+  await store.setNoTouch(["COD"]);
+
+  const result = await runCustomerTurn(AURORA, convId, "hae", { mode: "live" });
+  assert.equal(result.action, "ESCALATE");
+  assert.ok(result.handoverActionId);
+  assert.equal(result.reply, "", "the server's holding line is what the customer gets");
+
+  assert.equal((await rowsOf(store, "create_order_from_chat", "blocked")).length, 1);
+  const [handed] = await rowsOf(store, "escalate_conversation", "executed");
+  assert.ok(handed);
+  const p = handed.payload as Record<string, unknown>;
+  assert.equal(p.reason, "guardrail_blocked", "not tool_failure — the FD-4 lesson");
+  assert.equal(p.department, "sales", "routed to whoever should pick it up");
+  // The model may never name a guardrail: the brief says a rule stopped it, the
+  // ledger row names WHICH, and the customer hears neither.
+  assert.doesNotMatch(String(p.summary), /no_touch|guardrail:|COD lock/i);
+  assert.match(String(p.summary), /shop's own rules/i);
   resetContext(AURORA, convId);
 });
