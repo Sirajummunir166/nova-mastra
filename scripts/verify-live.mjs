@@ -107,20 +107,52 @@ const EXPECTED_WORKFLOWS = [
   "brain-courier-intervention",
   "brain-restock-check",
 ];
+let authed = false;
 try {
   const agents = await get("/api/agents");
-  const names = Object.keys(agents.json ?? {});
-  if (names.length > 0) ok(`agents registered`, names.join(", "));
-  else bad("agents registered", `HTTP ${agents.status} — ${agents.text.slice(0, 160)}`);
 
-  const workflows = await get("/api/workflows");
-  const ids = Object.keys(workflows.json ?? {});
-  for (const want of EXPECTED_WORKFLOWS) {
-    if (ids.includes(want)) ok(`workflow ${want}`);
-    else bad(`workflow ${want}`, "not registered on this deployment");
+  // CHECK THE STATUS BEFORE READING THE BODY. This block used to go straight
+  // to Object.keys(json), which on a 401 reads {"ok":false,"error":"..."} as
+  // a TWO-AGENT LIST and prints a tick. A check that passes on an error is
+  // worse than no check — it was caught pointing at the real deployment,
+  // which answered 401 and was reported as healthy.
+  if (agents.status === 401) {
+    console.log("  🔒 /api/* is GUARDED — NOVA_STUDIO_TOKEN is set on this deployment.");
+    console.log("     That is the correct posture: unguarded, anyone with the URL could run");
+    console.log("     customer-turn, which creates real orders in a real store.");
+    console.log("");
+    console.log("     Re-run with the token to check the rest:");
+    console.log("       npm run verify:live -- --store <id> --token <NOVA_STUDIO_TOKEN>");
+    console.log("     (Railway → nova-mastra → Variables → NOVA_STUDIO_TOKEN)");
+    bad("cannot inspect workflows", "401 — no token supplied");
+  } else if (agents.status !== 200) {
+    bad("GET /api/agents", `HTTP ${agents.status} — ${agents.text.slice(0, 160)}`);
+  } else {
+    authed = true;
+    const names = Object.keys(agents.json ?? {});
+    if (names.length > 0) ok("agents registered", names.join(", "));
+    else bad("agents registered", "the deployment registered no agents");
+    if (!TOKEN) {
+      console.log("  ⚠ /api/* answered WITHOUT a token — this deployment is OPEN.");
+      console.log("    Anyone with the URL can run customer-turn, which creates real orders.");
+      console.log("    Set NOVA_STUDIO_TOKEN on the deployment.");
+    }
   }
-  const extra = ids.filter((id) => !EXPECTED_WORKFLOWS.includes(id));
-  if (extra.length) console.log(`  · also registered: ${extra.join(", ")}`);
+
+  if (authed) {
+    const workflows = await get("/api/workflows");
+    if (workflows.status !== 200) {
+      bad("GET /api/workflows", `HTTP ${workflows.status} — ${workflows.text.slice(0, 160)}`);
+    } else {
+      const ids = Object.keys(workflows.json ?? {});
+      for (const want of EXPECTED_WORKFLOWS) {
+        if (ids.includes(want)) ok(`workflow ${want}`);
+        else bad(`workflow ${want}`, "not registered on this deployment");
+      }
+      const extra = ids.filter((id) => !EXPECTED_WORKFLOWS.includes(id));
+      if (extra.length) console.log(`  · also registered: ${extra.join(", ")}`);
+    }
+  }
 } catch (err) {
   bad("Mastra server routes", err instanceof Error ? err.message : String(err));
 }
