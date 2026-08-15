@@ -2,7 +2,7 @@
   "name": "nova-mastra",
   "version": "0.1.0",
   "private": true,
-  "description": "Nova chat service on Mastra + Express — token-lean replacement for the eve chat lane",
+  "description": "Nova chat service on Mastra + Express \u2014 token-lean replacement for the eve chat lane",
   "type": "module",
   "engines": {
     "node": ">=22.13.0"
@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
-    "studio": "mastra dev",
+    "studio": "node scripts/studio.mjs",
     "studio:prod": "mastra studio --server-host nova-mastra-production.up.railway.app --server-protocol https --server-port 443 --server-api-prefix /api",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test"

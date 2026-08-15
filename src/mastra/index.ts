@@ -1,3 +1,17 @@
+// FIRST, and it must stay first — see src/boot.ts.
+//
+// This file has TWO entry points and only one of them is `src/index.ts`.
+// `mastra dev` (npm run studio) loads THIS module directly, so a bootstrap
+// that lives only in `src/index.ts` never runs under Studio: every model call
+// from the Studio playground then leaves without the proxy and comes back
+// "Host not in allowlist", which reads like a credential problem and is not.
+// Found by making a real agent call through Studio's own API after the
+// server-side path was already fixed.
+//
+// `installProxyFromEnv()` is idempotent, so both entry points importing this
+// is free.
+import "../boot.js";
+
 import { Mastra } from "@mastra/core";
 import {
   Observability,
