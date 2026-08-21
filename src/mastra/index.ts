@@ -22,6 +22,7 @@ import {
 import { novaAgent } from "./agents/nova.js";
 import { resolverAgent, writerAgent } from "../front-office/agents.js";
 import { customerTurnWorkflow } from "../front-office/workflow.js";
+import { inspectStateWorkflow, novaContextWorkflow } from "../front-office/inspect.js";
 import { brainDispatchWorkflow } from "../brain/dispatcher.js";
 import { pulseWorkflow } from "../brain/pulse.js";
 import { courierInterventionWorkflow } from "../brain/lanes/courier-intervention.js";
@@ -47,6 +48,11 @@ export const mastra = new Mastra({
   // demand and trace it; the dispatcher runs them through FOUNDER_PLANE_RUNNERS.
   workflows: {
     "customer-turn": customerTurnWorkflow,
+    // Read-only companions to customer-turn. Neither calls a model and neither
+    // writes, so they can be run between every message without disturbing the
+    // thing being observed.
+    "fo-inspect": inspectStateWorkflow,
+    "nova-context": novaContextWorkflow,
     "brain-dispatch": brainDispatchWorkflow,
     "brain-pulse": pulseWorkflow,
     "brain-courier-intervention": courierInterventionWorkflow,
