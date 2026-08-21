@@ -10,6 +10,8 @@ import { createWorkflow, createStep } from "@mastra/core/workflows";
 import { z } from "zod";
 import { runCustomerTurn } from "./turn.js";
 import { resetContext } from "./context-store.js";
+import { withTurnSpan, type TurnSpan } from "./trace.js";
+import { resolveCurrentSpan } from "@mastra/core/observability";
 
 const inputSchema = z.object({
   message: z.string().min(1).describe("The customer's chat message (bn / banglish / en)"),
@@ -43,7 +45,18 @@ const customerTurnStep = createStep({
   id: "run-turn",
   inputSchema,
   outputSchema,
-  execute: async ({ inputData }) => {
+  // Mastra hands the step its tracing context; older/newer shapes put it on
+  // the params object or a second argument, so read both rather than pin one.
+  execute: async (params: any, context?: any) => {
+    const inputData = params.inputData as z.infer<typeof inputSchema>;
+    // Mastra exposes the step's span three ways depending on version: on a
+    // second `context` argument, on the params object, or only through the
+    // AsyncLocalStorage the engine runs the step inside. Take whichever exists.
+    const span: TurnSpan | undefined =
+      context?.tracingContext?.currentSpan ??
+      params?.tracingContext?.currentSpan ??
+      (resolveCurrentSpan() as unknown as TurnSpan | undefined);
+
     const storeId = inputData.storeId || process.env.NOVA_DEV_STORE_ID;
     if (!storeId) throw new Error("storeId required (or set NOVA_DEV_STORE_ID)");
     if (inputData.reset) resetContext(storeId, inputData.convId);
@@ -60,10 +73,12 @@ const customerTurnStep = createStep({
     // Live is now a deliberate choice in the form, and the mode comes back in
     // the OUTPUT so a reader can never mistake a drafted order for a placed
     // one.
-    const result = await runCustomerTurn(storeId, inputData.convId, inputData.message, {
-      mode: inputData.mode,
+    return withTurnSpan(span, async () => {
+      const result = await runCustomerTurn(storeId, inputData.convId, inputData.message, {
+        mode: inputData.mode,
+      });
+      return { ...result, mode: inputData.mode };
     });
-    return { ...result, mode: inputData.mode };
   },
 });
 

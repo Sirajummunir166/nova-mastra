@@ -69,6 +69,41 @@ asserts that every `actions.requested` gets a matching `action.result`:
 NovaChat opens a narration row per tool call and closes it on that result, so
 an unmatched `callId` is a row that hangs on the founder's screen.
 
+## Tracing
+
+The delta loop makes **no LLM tool calls** — that is the design, and the reason
+a turn costs ~300 input tokens instead of ~26K. The app classifies with rules,
+decides the next action itself, and calls dakio-api directly; the model only
+words the reply. So Mastra's automatic instrumentation (which traces agent
+runs, workflow steps and LLM-issued tool calls) had nothing to show, and Studio
+showed an empty workflow run.
+
+`src/front-office/trace.ts` emits the spans instead. One turn now reads:
+
+```
+workflow run: 'customer-turn'
+  classify: qty_pick          rung=0 decidedBy="rules (no model)"
+  decide: ASK_ZONE            stage="checkout" missing=[...]
+  get_store_settings          [tool_call] cacheHit=false 13ms
+  list_products (cache hit)   [tool_call] cacheHit=true ageMs=41000
+  agent run: 'fo-writer'
+    llm: 'anthropic/claude-sonnet-5'
+```
+
+Two gotchas worth knowing if you extend it:
+
+- The span a step receives is a `workflow_step` span; anchoring children to it
+  is fine, but agent calls start their OWN trace unless you pass
+  `tracingOptions: { traceId, parentSpanId }` — that is what `modelTracing()`
+  does, and why the writer used to appear as an orphan trace.
+- `GET /api/observability/traces` lists **traces** (root spans only). The tree
+  lives at `GET /api/observability/traces/:traceId`. In Studio, click a trace
+  row to open it — the top-level list never shows children.
+
+The conversation's own audit trail is separate and survives restarts: every
+dakio-api call is appended to `toolLedger` in `.data/live-context/<store>__<conv>.json`
+with its raw payload and timestamp.
+
 ## Studio
 
 Mastra Studio (agents, workflows, traces) is served by this app at **`/studio`** —

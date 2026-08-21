@@ -38,6 +38,7 @@ import { getStoreProfile } from "../lib/store.js";
 import { storeFor } from "../store/resolve.js";
 import { resolverAgent, resolverSchema, writerAgent, writerSystem } from "./agents.js";
 import { withGatewayRetry } from "../lib/gateway-retry.js";
+import { modelTracing, traced, traceMoment } from "./trace.js";
 
 /**
  * SHADOW vs LIVE — the phase-C gate.
@@ -844,7 +845,7 @@ async function executeTurn(
       const res = await withGatewayRetry(() =>
         resolverAgent.generate(
           [{ role: "user", content: `STATE:\n${renderStateCard(ctx)}\n\nCUSTOMER MESSAGE: ${message}` }],
-          { structuredOutput: { schema: resolverSchema } },
+          { structuredOutput: { schema: resolverSchema }, ...modelTracing() },
         ),
       );
       const obj = res.object;
@@ -861,6 +862,15 @@ async function executeTurn(
     }
   }
   timings.resolvedMs = Date.now() - t0;
+  traceMoment(`classify: ${classified.intent}`, {
+    metadata: {
+      rung: classified.rung,
+      decidedBy: classified.rung === 0 ? "rules (no model)" : "resolver model",
+      confidence: classified.confidence,
+      entities: classified.entities,
+      lang: ctx.customer.lang.pref,
+    },
+  });
 
   // ---- Apply the delta ------------------------------------------------------
   //
@@ -920,6 +930,10 @@ async function executeTurn(
   let action: NextAction | InstructedAction = novaSpeaksFirst
     ? instructed!.action
     : nextBestAction(ctx, classified.intent);
+
+  traceMoment(`decide: ${action}`, {
+    metadata: { stage: ctx.conversation.stage, missing: computeMissing(ctx), focus: ctx.products.focusId ?? null },
+  });
 
   const needsFee = (action === "ASK_PHONE_ADDR" || action === "PRESENT_SUMMARY" || action === "CREATE_ORDER" || action === "ANSWER_DELIVERY_FAQ") && !!ctx.purchase.zone;
   if (needsFee || action === "ANSWER_DELIVERY_FAQ") {
@@ -1198,7 +1212,7 @@ async function executeTurn(
                 `\n\nACTION: ${actionLine}\nWrite the reply.`,
             },
           ],
-          { instructions: writerSystem({ name: store.name, currency: store.currency }) },
+          { instructions: writerSystem({ name: store.name, currency: store.currency }), ...modelTracing() },
         ),
       );
       reply = writeRes.text.trim();
@@ -1401,7 +1415,12 @@ async function hardValidateAndCreate(ctx: NovaLiveContext): Promise<GateResult> 
   }
 
   // Live product read — bypasses TTL by design (mutations are never cached).
-  const products = await listProducts(ctx.storeId);
+  const products = await traced("list_products (live revalidation)", {
+    type: "tool_call",
+    input: { status: "active", live: true },
+    metadata: { reason: "mutations are never served from cache" },
+    summarize: (out) => ({ rows: Array.isArray(out) ? out.length : 0 }),
+  }, () => listProducts(ctx.storeId));
   ctx.toolLedger.push({ tool: "list_products", args: { status: "active", live: true }, raw: products.length, calledAt: Date.now(), ok: true });
   const product = products.find((x) => x.id === focusId);
   if (!product) return { ok: false, reason: "product no longer available", fallback: "OFFER_ALTERNATIVE" };

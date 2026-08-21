@@ -8,6 +8,17 @@
  */
 
 import type { NovaLiveContext, ToolLedgerEntry } from "./state.js";
+import { traced, traceMoment } from "./trace.js";
+
+/** Trace output must stay readable: a row count, not eight product objects. */
+export function summarizeRaw(out: unknown): unknown {
+  if (Array.isArray(out)) return { rows: out.length };
+  if (out && typeof out === "object") {
+    const keys = Object.keys(out as Record<string, unknown>);
+    return keys.length <= 8 ? out : { keys: keys.slice(0, 8), totalKeys: keys.length };
+  }
+  return out;
+}
 
 function keyOf(tool: string, args: unknown): string {
   return `${tool}:${JSON.stringify(args ?? {})}`;
@@ -39,6 +50,13 @@ export async function observe<T>(
     if (!entry.ok) continue;
     if (keyOf(entry.tool, entry.args) !== key) continue;
     if (now - entry.calledAt <= ttlMs) {
+      // A reuse is the interesting event here — it is the refetch that did not
+      // happen. Show it in the trace, or "no tool calls" reads as "did nothing".
+      traceMoment(`${tool} (cache hit)`, {
+        type: "tool_call",
+        input: args,
+        metadata: { cacheHit: true, ageMs: now - entry.calledAt, ttlMs },
+      });
       return { raw: entry.raw as T, cacheHit: true, calledAt: entry.calledAt };
     }
     break; // newest matching entry is stale — refetch
@@ -46,7 +64,7 @@ export async function observe<T>(
 
   const calledAt = Date.now();
   try {
-    const raw = await fetcher();
+    const raw = await traced(tool, { type: "tool_call", input: args, metadata: { cacheHit: false, ttlMs }, summarize: summarizeRaw }, fetcher);
     ctx.toolLedger.push({ tool, args, raw, calledAt, ok: true });
     return { raw, cacheHit: false, calledAt };
   } catch (err) {
