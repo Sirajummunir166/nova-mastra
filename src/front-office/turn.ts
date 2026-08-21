@@ -735,9 +735,15 @@ async function executeTurn(
     // reason, and an EXPLICIT request locks it until another explicit request.
     // Nova's own directive is deliberately NOT run through this — a directive is
     // written in English and would flip a Bangla thread to English replies.
+    // The PREVIOUS turn's reading, captured before it is overwritten — one
+    // half of the two-signal rule below.
+    const previousDetected = ctx.customer.lang.detected;
     const lang = detectLang(message);
     ctx.customer.lang.detected = lang.detected;
     ctx.customer.lang.conf = lang.conf;
+    if (lang.detected !== "en") {
+      ctx.customer.lang.bnSignals = (ctx.customer.lang.bnSignals ?? 0) + 1;
+    }
     if (/\b(english please|in english|speak english|talk in english)\b/i.test(message)) {
       ctx.customer.lang.pref = "en";
       ctx.customer.lang.lockedByRequest = true;
@@ -746,8 +752,36 @@ async function executeTurn(
       ctx.customer.lang.lockedByRequest = true;
     } else if (!ctx.customer.lang.lockedByRequest && lang.detected !== "en") {
       ctx.customer.lang.pref = "bn";
-    } else if (!ctx.customer.lang.lockedByRequest && lang.detected === "en" && lang.conf >= 0.7) {
-      ctx.customer.lang.pref = "en";
+    } else if (!ctx.customer.lang.lockedByRequest && lang.detected === "en") {
+      // ── "en" IS A FALLBACK, NOT A DETECTION ─────────────────────────────
+      //
+      // `detectLang` returns "en" when it finds NEITHER Bangla script NOR a
+      // Banglish hint word. That is also exactly what these look like:
+      //
+      //   "Classic Polo T-Shirt ta, black"   a product name
+      //   "House 14, Road 7, Dhanmondi"      an address
+      //   "01712345678"                      a phone number
+      //
+      // Every product in a Dakio catalogue is named in English, so under the
+      // old rule ANY customer who named a product flipped to English replies
+      // mid-order. Measured in Studio: a customer opened in Banglish, got a
+      // Bangla reply, named a polo shirt, and turn 2 came back fully in
+      // English.
+      //
+      // What the old rule ALSO had was a check that could not fail:
+      // `lang.conf >= 0.7`, where 0.7 is the only value the "en" arm ever
+      // returns. It read like a guard against weak evidence and guarded
+      // nothing.
+      //
+      // So English now needs one of two real signals instead of an absence:
+      //   · this conversation has NEVER carried Bangla evidence — a genuinely
+      //     English customer, whose first message should be answered in kind
+      //     despite the bn default; or
+      //   · TWO consecutive turns with no Bangla signal — a real switch, not
+      //     one hint-less line inside a Bangla conversation.
+      const neverWroteBangla = (ctx.customer.lang.bnSignals ?? 0) === 0;
+      const previousAlsoEnglish = previousDetected === "en";
+      if (neverWroteBangla || previousAlsoEnglish) ctx.customer.lang.pref = "en";
     }
   }
 

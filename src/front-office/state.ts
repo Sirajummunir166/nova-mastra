@@ -139,7 +139,28 @@ export interface NovaLiveContext {
     name?: Fact<string>;
     phone?: Fact<string>;
     addr?: Fact<string>;
-    lang: { pref: Lang; detected: DetectedLang; conf: number; lockedByRequest?: boolean };
+    lang: {
+      pref: Lang;
+      detected: DetectedLang;
+      conf: number;
+      lockedByRequest?: boolean;
+      /**
+       * How many turns in this conversation carried REAL Bangla evidence
+       * (Bangla script, or a Banglish hint word).
+       *
+       * It exists because `detectLang`'s "en" arm is a FALLBACK, not a
+       * detection: it means "no Bangla signal found", which is also what a
+       * bare product name, an address or a phone number looks like. Without
+       * this counter there is no way to tell a customer who writes English
+       * from a Bangla customer who typed "Classic Polo T-Shirt ta, black" —
+       * and the second one was getting flipped to English replies mid-order.
+       *
+       * Optional: state persisted before this shipped simply has no count,
+       * which reads as "no Bangla seen yet" and is the safe direction for an
+       * unknown history.
+       */
+      bnSignals?: number;
+    };
     sentiment: "positive" | "neutral" | "negative";
     channel: string;
   };
